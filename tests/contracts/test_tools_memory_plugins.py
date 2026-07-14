@@ -1,5 +1,5 @@
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -84,19 +84,33 @@ def test_tool_and_plugin_json_fields_are_deeply_immutable() -> None:
         )
     )
 
+    assert isinstance(spec.input_schema, Mapping)
+    properties = spec.input_schema["properties"]
+    assert isinstance(properties, Mapping)
+    required = spec.input_schema["required"]
+    assert isinstance(required, tuple)
+    assert isinstance(manifest.config_schema, Mapping)
+    manifest_properties = manifest.config_schema["properties"]
+    assert isinstance(manifest_properties, Mapping)
+    assert success.data is not None
+    items = success.data["items"]
+    assert isinstance(items, tuple)
+    first_item = items[0]
+    assert isinstance(first_item, Mapping)
+    assert failure.error is not None
+    attempt = failure.error.details["attempt"]
+    assert isinstance(attempt, Mapping)
+    delays = attempt["delays"]
+    assert isinstance(delays, tuple)
+
     with pytest.raises(TypeError):
-        cast(dict[str, Any], spec.input_schema["properties"])["other"] = {}
-    with pytest.raises((AttributeError, TypeError)):
-        cast(list[str], spec.input_schema["required"]).append("other")
+        properties["other"] = {}  # type: ignore[index]
+    assert not hasattr(required, "append")
     with pytest.raises(TypeError):
-        cast(dict[str, Any], manifest.config_schema["properties"])["other"] = {}
+        manifest_properties["other"] = {}  # type: ignore[index]
     with pytest.raises(TypeError):
-        cast(dict[str, Any], cast(list[Any], success.data["items"])[0])["title"] = "changed"  # type: ignore[index]
-    with pytest.raises((AttributeError, TypeError)):
-        cast(
-            list[int],
-            cast(dict[str, Any], failure.error.details["attempt"])["delays"],  # type: ignore[union-attr]
-        ).append(3)
+        first_item["title"] = "changed"  # type: ignore[index]
+    assert not hasattr(delays, "append")
 
     assert spec.model_dump(mode="json")["input_schema"] == schema
     assert success.model_dump(mode="json")["data"] == {"items": [{"title": "result"}]}

@@ -5,7 +5,7 @@ import re
 from pydantic import Field, field_validator
 
 from mybot.contracts.common import FrozenModel, NonEmptyStr
-from mybot.contracts.json import FrozenJsonObjectValue
+from mybot.contracts.json import FrozenJsonObject, FrozenJsonObjectValue, freeze_json_object
 from mybot.contracts.messages import Platform
 from mybot.contracts.tools import ToolSpec
 
@@ -14,6 +14,10 @@ SEMVER_PATTERN = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+
+
+def default_config_schema() -> FrozenJsonObject:
+    return freeze_json_object({"type": "object", "additionalProperties": False})
 
 
 class PluginManifest(FrozenModel):
@@ -26,7 +30,8 @@ class PluginManifest(FrozenModel):
     tools: tuple[ToolSpec, ...] = ()
     tasks: tuple[NonEmptyStr, ...] = ()
     config_schema: FrozenJsonObjectValue = Field(
-        default_factory=lambda: {"type": "object", "additionalProperties": False}
+        default_factory=default_config_schema,
+        validate_default=False,
     )
     platforms: frozenset[Platform] = frozenset()
     requested_capabilities: tuple[NonEmptyStr, ...] = ()

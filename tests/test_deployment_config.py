@@ -121,6 +121,22 @@ def test_ci_builds_images_and_exercises_migrations_and_health() -> None:
     assert "curl --fail --silent --show-error http://127.0.0.1:8000/health/ready" in integration
 
 
+def test_ci_smoke_runs_the_hardened_web_image_and_always_removes_it() -> None:
+    workflow = source(".github/workflows/ci.yml")
+    images = indented_block(workflow, "  images:")
+
+    build = images.index("docker build --tag mybot-web:ci web")
+    run = images.index("docker run --detach", build + 1)
+    assert build < run
+    assert "--read-only" in images
+    assert "--cap-drop ALL" in images
+    assert "--tmpfs /tmp:rw,noexec,nosuid,size=16m" in images
+    assert "--publish 127.0.0.1:18080:8080" in images
+    assert "http://127.0.0.1:18080/static-health" in images
+    assert "trap cleanup EXIT" in images
+    assert "docker rm --force mybot-web-smoke" in images
+
+
 def test_operator_docs_describe_the_new_isolation_and_health_boundaries() -> None:
     readme = source("README.md")
     normalized = " ".join(readme.split())

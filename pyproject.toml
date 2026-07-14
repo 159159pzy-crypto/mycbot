@@ -59,6 +59,6 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "tests/typing_contracts.py"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"

@@ -1,5 +1,5 @@
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any, cast
 
 import pytest
 from hypothesis import given
@@ -60,14 +60,18 @@ def test_message_raw_reference_is_deeply_immutable_and_json_serializable() -> No
         segments=(TextSegment(text="hello"),),
         raw_ref=raw_ref,
     )
-    frozen = cast(dict[str, Any], envelope.raw_ref)
+    frozen = envelope.raw_ref
+    assert isinstance(frozen, Mapping)
+    event = frozen["event"]
+    assert isinstance(event, Mapping)
+    tags = event["tags"]
+    assert isinstance(tags, tuple)
 
     with pytest.raises(TypeError):
-        frozen["new"] = "value"
+        frozen["new"] = "value"  # type: ignore[index]
     with pytest.raises(TypeError):
-        cast(dict[str, Any], frozen["event"])["new"] = "value"
-    with pytest.raises((AttributeError, TypeError)):
-        cast(list[str], cast(dict[str, Any], frozen["event"])["tags"]).append("gamma")
+        event["new"] = "value"  # type: ignore[index]
+    assert not hasattr(tags, "append")
 
     assert envelope.model_dump(mode="json")["raw_ref"] == raw_ref
 

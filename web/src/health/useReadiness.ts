@@ -8,23 +8,39 @@ export const READINESS_MAX_RETRY_MS = 60_000;
 export const READINESS_FETCH_TIMEOUT_MS = 5_000;
 export const READINESS_STALE_AFTER_MS = 60_000;
 
-function isDependency(value: unknown): boolean {
+function hasOnlyKeys(value: object, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function isDependency(value: unknown): value is ReadinessPayload['dependencies']['database'] {
   if (typeof value !== 'object' || value === null) return false;
   const status = Reflect.get(value, 'status');
-  return status === 'up' || status === 'down';
+  const detail = Reflect.get(value, 'detail');
+  return (
+    hasOnlyKeys(value, ['status', 'detail']) &&
+    (status === 'up' || status === 'down') &&
+    (detail === undefined || typeof detail === 'string')
+  );
 }
 
 function isReadinessPayload(value: unknown): value is ReadinessPayload {
   if (typeof value !== 'object' || value === null) return false;
   const status = Reflect.get(value, 'status');
   const dependencies = Reflect.get(value, 'dependencies');
-  return (
-    (status === 'ready' || status === 'not_ready') &&
-    typeof dependencies === 'object' &&
-    dependencies !== null &&
-    isDependency(Reflect.get(dependencies, 'database')) &&
-    isDependency(Reflect.get(dependencies, 'redis'))
-  );
+  if (
+    !hasOnlyKeys(value, ['status', 'dependencies']) ||
+    (status !== 'ready' && status !== 'not_ready') ||
+    typeof dependencies !== 'object' ||
+    dependencies === null ||
+    !hasOnlyKeys(dependencies, ['database', 'redis'])
+  ) {
+    return false;
+  }
+  const database = Reflect.get(dependencies, 'database');
+  const redis = Reflect.get(dependencies, 'redis');
+  if (!isDependency(database) || !isDependency(redis)) return false;
+  const aggregateStatus = database.status === 'up' && redis.status === 'up' ? 'ready' : 'not_ready';
+  return status === aggregateStatus;
 }
 
 async function requestReadiness(controller: AbortController): Promise<ReadinessPayload> {

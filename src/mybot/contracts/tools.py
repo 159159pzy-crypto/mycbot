@@ -8,7 +8,10 @@ from pydantic import Field, JsonValue, model_validator
 
 from mybot.contracts.common import FrozenModel, NonEmptyStr
 from mybot.contracts.conversation import ConversationKey
-from mybot.contracts.json import FrozenJsonObjectValue
+from mybot.contracts.json import (
+    FrozenJsonObjectValue,
+    empty_frozen_json_object,
+)
 
 
 class ToolRisk(StrEnum):
@@ -42,7 +45,10 @@ class ToolError(FrozenModel):
     code: NonEmptyStr
     message: NonEmptyStr
     retryable: bool = False
-    details: FrozenJsonObjectValue = Field(default_factory=dict)
+    details: FrozenJsonObjectValue = Field(
+        default_factory=empty_frozen_json_object,
+        validate_default=False,
+    )
 
 
 class ToolResult(FrozenModel):
@@ -60,7 +66,7 @@ class ToolResult(FrozenModel):
 
     @classmethod
     def success(cls, data: dict[str, JsonValue]) -> Self:
-        return cls(ok=True, data=data)
+        return cls.model_validate({"ok": True, "data": data})
 
     @classmethod
     def failure(cls, error: ToolError) -> Self:

@@ -104,6 +104,32 @@ jobs:
       - name: Build web image
         run: docker build --tag mybot-web:ci web
 
+      - name: Smoke-test hardened web image
+        run: |
+          cleanup() {
+            docker rm --force mybot-web-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run --detach --rm \
+            --name mybot-web-smoke \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --publish 127.0.0.1:18080:8080 \
+            mybot-web:ci
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/static-health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs mybot-web-smoke
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:18080/static-health
+
   integration:
     name: Database migrations and API health
     runs-on: ubuntu-latest

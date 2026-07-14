@@ -32,6 +32,13 @@ const responseWith = (payload: ReadinessPayload, status = 200) =>
     json: async () => payload,
   } as Response);
 
+const responseWithUnknown = (payload: unknown) =>
+  Promise.resolve({
+    ok: true,
+    status: 200,
+    json: async () => payload,
+  } as Response);
+
 const dependency = (name: 'Database' | 'Redis') =>
   screen.getByRole('listitem', { name: `${name} dependency` });
 
@@ -135,6 +142,37 @@ describe('App', () => {
     });
     expect(within(dependency('Database')).getByText('Unknown')).toBeInTheDocument();
     expect(within(dependency('Redis')).getByText('Unknown')).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      label: 'non-string dependency detail',
+      payload: {
+        status: 'ready',
+        dependencies: {
+          database: { status: 'up', detail: 42 },
+          redis: { status: 'up' },
+        },
+      },
+    },
+    {
+      label: 'aggregate status inconsistent with dependencies',
+      payload: {
+        status: 'ready',
+        dependencies: {
+          database: { status: 'down', detail: 'TimeoutError' },
+          redis: { status: 'up' },
+        },
+      },
+    },
+  ])('rejects malformed readiness payload: $label', async ({ payload }) => {
+    fetchMock.mockReturnValueOnce(responseWithUnknown(payload));
+
+    render(<App />);
+
+    expect(
+      await screen.findByText(/readiness signal unavailable/i),
+    ).toBeInTheDocument();
   });
 
   it('bounds a readiness request that never settles', async () => {
