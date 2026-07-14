@@ -40,3 +40,6 @@ Thumbs.db
 *.pid
 *.tmp
 tmp/
+
+# Local feature worktrees
+.worktrees/
