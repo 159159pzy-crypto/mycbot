@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -51,6 +52,54 @@ def test_tool_contracts_express_policy_context_and_structured_outcomes() -> None
     assert context.correlation_id == "trace-123"
     assert success.ok is True and success.data is not None and success.error is None
     assert failure.ok is False and failure.data is None and failure.error is not None
+
+
+def test_tool_and_plugin_json_fields_are_deeply_immutable() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+    spec = ToolSpec(
+        id="web.search",
+        description="Search the web",
+        input_schema=schema,
+        read_only=True,
+        idempotent=True,
+        risk=ToolRisk.LOW,
+        approval_required=False,
+    )
+    manifest = PluginManifest(
+        id="com.example.search",
+        version="1.0.0",
+        entrypoint="example.plugin:create",
+        config_schema={"type": "object", "properties": {"limit": {"type": "integer"}}},
+    )
+    success = ToolResult.success({"items": [{"title": "result"}]})
+    failure = ToolResult.failure(
+        ToolError(
+            code="upstream",
+            message="failed",
+            details={"attempt": {"delays": [1, 2]}},
+        )
+    )
+
+    with pytest.raises(TypeError):
+        cast(dict[str, Any], spec.input_schema["properties"])["other"] = {}
+    with pytest.raises((AttributeError, TypeError)):
+        cast(list[str], spec.input_schema["required"]).append("other")
+    with pytest.raises(TypeError):
+        cast(dict[str, Any], manifest.config_schema["properties"])["other"] = {}
+    with pytest.raises(TypeError):
+        cast(dict[str, Any], cast(list[Any], success.data["items"])[0])["title"] = "changed"  # type: ignore[index]
+    with pytest.raises((AttributeError, TypeError)):
+        cast(
+            list[int],
+            cast(dict[str, Any], failure.error.details["attempt"])["delays"],  # type: ignore[union-attr]
+        ).append(3)
+
+    assert spec.model_dump(mode="json")["input_schema"] == schema
+    assert success.model_dump(mode="json")["data"] == {"items": [{"title": "result"}]}
 
 
 @pytest.mark.parametrize(

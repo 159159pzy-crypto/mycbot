@@ -19,7 +19,10 @@ def configure_telemetry(app: FastAPI, settings: Settings, *, service_name: str) 
     global _configured
     if not _configured:
         provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-        if settings.otel_exporter_otlp_endpoint is not None:
+        if (
+            settings.otel_exporter_otlp_endpoint is not None
+            and settings.otel_exporter_otlp_endpoint.get_secret_value().strip()
+        ):
             exporter = OTLPSpanExporter(
                 endpoint=settings.otel_exporter_otlp_endpoint.get_secret_value()
             )

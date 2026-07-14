@@ -2,9 +2,10 @@
 
 import re
 
-from pydantic import Field, JsonValue, field_validator
+from pydantic import Field, field_validator
 
 from mybot.contracts.common import FrozenModel, NonEmptyStr
+from mybot.contracts.json import FrozenJsonObjectValue
 from mybot.contracts.messages import Platform
 from mybot.contracts.tools import ToolSpec
 
@@ -24,7 +25,7 @@ class PluginManifest(FrozenModel):
     event_hooks: tuple[NonEmptyStr, ...] = ()
     tools: tuple[ToolSpec, ...] = ()
     tasks: tuple[NonEmptyStr, ...] = ()
-    config_schema: dict[str, JsonValue] = Field(
+    config_schema: FrozenJsonObjectValue = Field(
         default_factory=lambda: {"type": "object", "additionalProperties": False}
     )
     platforms: frozenset[Platform] = frozenset()

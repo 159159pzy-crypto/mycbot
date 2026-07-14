@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any, cast
 
 import pytest
 from hypothesis import given
@@ -44,6 +45,31 @@ def test_message_envelope_is_immutable_and_preserves_typed_segments() -> None:
     )
     with pytest.raises(ValidationError):
         envelope.chat_id = "different"  # type: ignore[misc]
+
+
+def test_message_raw_reference_is_deeply_immutable_and_json_serializable() -> None:
+    raw_ref = {"event": {"tags": ["alpha", "beta"]}}
+    envelope = MessageEnvelope(
+        id="message-immutable",
+        connection_id="qq-primary",
+        platform=Platform.QQ,
+        chat_kind=ChatKind.GROUP,
+        chat_id="group-1",
+        sender_identity_id="identity-7",
+        occurred_at=datetime(2026, 7, 14, 12, 30, tzinfo=UTC),
+        segments=(TextSegment(text="hello"),),
+        raw_ref=raw_ref,
+    )
+    frozen = cast(dict[str, Any], envelope.raw_ref)
+
+    with pytest.raises(TypeError):
+        frozen["new"] = "value"
+    with pytest.raises(TypeError):
+        cast(dict[str, Any], frozen["event"])["new"] = "value"
+    with pytest.raises((AttributeError, TypeError)):
+        cast(list[str], cast(dict[str, Any], frozen["event"])["tags"]).append("gamma")
+
+    assert envelope.model_dump(mode="json")["raw_ref"] == raw_ref
 
 
 @pytest.mark.parametrize(

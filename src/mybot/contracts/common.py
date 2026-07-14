@@ -11,7 +11,12 @@ NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 class FrozenModel(BaseModel):
     """A strict immutable base for values crossing process boundaries."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        str_strip_whitespace=True,
+        validate_default=True,
+    )
 
 
 def require_utc(value: datetime | None, *, field_name: str) -> datetime | None:

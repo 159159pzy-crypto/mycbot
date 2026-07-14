@@ -86,3 +86,109 @@ jobs:
 
       - name: Validate configuration
         run: docker compose --env-file .env.example config --quiet
+
+  images:
+    name: Container image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - python
+      - frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Python image
+        run: docker build --tag mybot-python:ci .
+
+      - name: Build web image
+        run: docker build --tag mybot-web:ci web
+
+  integration:
+    name: Database migrations and API health
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - python
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: mybot
+          POSTGRES_PASSWORD: mybot-ci
+          POSTGRES_USER: mybot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mybot -d mybot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      MYBOT_API_HOST: 127.0.0.1
+      MYBOT_API_PORT: "8000"
+      MYBOT_DATABASE_URL: postgresql+psycopg://mybot:mybot-ci@127.0.0.1:5432/mybot
+      MYBOT_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          version: "0.11.24"
+
+      - name: Install dependencies
+        run: uv sync --all-groups --locked
+
+      - name: Exercise migrations in both directions
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+      - name: Start API
+        run: |
+          uv run python -m mybot api >"$RUNNER_TEMP/mybot-api.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/mybot-api.pid"
+
+      - name: Check liveness and readiness
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health/live >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "$RUNNER_TEMP/mybot-api.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:8000/health/live
+          curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
+
+      - name: Show API log after failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/mybot-api.log"
+
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/mybot-api.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/mybot-api.pid")" || true
+          fi

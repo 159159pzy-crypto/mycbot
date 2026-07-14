@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from uuid import uuid4
 
 import structlog
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
@@ -22,7 +23,14 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception:
+                structlog.get_logger("mybot.http").exception("unhandled_request_error")
+                response = JSONResponse(
+                    status_code=500,
+                    content={"detail": "Internal Server Error"},
+                )
             response.headers[CORRELATION_HEADER] = correlation_id
             return response
         finally:

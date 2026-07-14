@@ -393,6 +393,11 @@ h1 span {
   animation: amber-pulse 1.8s ease-in-out infinite;
 }
 
+.status-module[data-state="stale"] .beacon-ring--inner {
+  border-color: var(--amber);
+  animation: rotate 18s linear infinite;
+}
+
 .status-module[data-state="ready"] .beacon-core {
   border-color: var(--cyan);
   color: var(--cyan);

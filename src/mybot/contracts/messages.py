@@ -4,9 +4,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, JsonValue, field_validator
+from pydantic import Field, field_validator
 
 from mybot.contracts.common import FrozenModel, NonEmptyStr, require_utc
+from mybot.contracts.json import FrozenJsonValue
 
 
 class Platform(StrEnum):
@@ -61,7 +62,7 @@ class MessageEnvelope(FrozenModel):
     occurred_at: datetime
     segments: Annotated[tuple[MessageSegment, ...], Field(min_length=1)]
     reply_to_message_id: NonEmptyStr | None = None
-    raw_ref: JsonValue | None = None
+    raw_ref: FrozenJsonValue | None = None
 
     @field_validator("occurred_at")
     @classmethod

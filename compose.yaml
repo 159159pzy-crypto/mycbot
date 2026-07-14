@@ -3,10 +3,15 @@ name: ${COMPOSE_PROJECT_NAME:-mybot}
 x-app-environment: &app-environment
   MYBOT_API_HOST: "0.0.0.0"
   MYBOT_API_PORT: "8000"
+  MYBOT_HEALTH_PROBE_TIMEOUT_SECONDS: ${MYBOT_HEALTH_PROBE_TIMEOUT_SECONDS:-2}
+  MYBOT_DATABASE_CONNECT_TIMEOUT_SECONDS: ${MYBOT_DATABASE_CONNECT_TIMEOUT_SECONDS:-3}
+  MYBOT_DATABASE_READ_TIMEOUT_SECONDS: ${MYBOT_DATABASE_READ_TIMEOUT_SECONDS:-3}
   MYBOT_DATABASE_URL: >-
     postgresql+psycopg://${POSTGRES_USER:-mybot}:${POSTGRES_PASSWORD:-mybot-local-change-me}@postgres:5432/${POSTGRES_DB:-mybot}
   MYBOT_LOG_LEVEL: ${MYBOT_LOG_LEVEL:-INFO}
   MYBOT_OTEL_EXPORTER_OTLP_ENDPOINT: ${MYBOT_OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  MYBOT_REDIS_CONNECT_TIMEOUT_SECONDS: ${MYBOT_REDIS_CONNECT_TIMEOUT_SECONDS:-2}
+  MYBOT_REDIS_READ_TIMEOUT_SECONDS: ${MYBOT_REDIS_READ_TIMEOUT_SECONDS:-2}
   MYBOT_REDIS_URL: redis://redis:6379/0
 
 x-app-service: &app-service
@@ -131,6 +136,9 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+    networks:
+      - backend
+      - plugin-control
 
   gateway:
     <<: *app-service
@@ -171,12 +179,32 @@ services:
       - maintenance-worker
 
   plugin-runner:
-    <<: *app-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mybot-python:${MYBOT_IMAGE_TAG:-dev}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     command:
       - python
       - -m
       - mybot
       - plugin-runner
+    environment:
+      MYBOT_PLUGIN_BROKER_URL: ${MYBOT_PLUGIN_BROKER_URL:-http://api:8000}
+      MYBOT_PLUGIN_CONFIG: ${MYBOT_PLUGIN_CONFIG:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - plugin-control
 
   web:
     build:
@@ -187,19 +215,16 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
-      - /var/cache/nginx:size=16m,mode=0755
-      - /var/run:size=1m,mode=0755
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
-    depends_on:
-      api:
-        condition: service_healthy
     ports:
-      - "127.0.0.1:${WEB_PORT:-4173}:80"
+      - "127.0.0.1:${WEB_PORT:-4173}:8080"
     healthcheck:
       test:
         - CMD-SHELL
-        - wget -qO- http://127.0.0.1/health/live >/dev/null || exit 1
+        - wget -qO- http://127.0.0.1:8080/static-health >/dev/null || exit 1
       interval: 10s
       timeout: 5s
       retries: 12
@@ -215,3 +240,6 @@ volumes:
 networks:
   backend:
     driver: bridge
+  plugin-control:
+    driver: bridge
+    internal: true

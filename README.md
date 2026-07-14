@@ -78,7 +78,10 @@ pnpm --dir web dev
 The Vite server proxies relative `/health` requests to the API at
 `http://127.0.0.1:8000`. The production web container uses the same relative
 path and proxies it to the Compose service `api:8000`, avoiding a cross-origin
-browser dependency.
+browser dependency. It runs as an unprivileged nginx user on container port
+8080. `GET /static-health` checks only the static web server, so the web
+container does not wait for API readiness and remains observable while the API
+or its dependencies recover.
 
 ## Process roles
 
@@ -95,6 +98,9 @@ same image:
 
 The non-API modes are deliberately idle lifecycle services until later
 milestones add platform and agent behavior; they are not print-only stubs.
+In Compose, `plugin-runner` receives only `MYBOT_PLUGIN_BROKER_URL` and
+`MYBOT_PLUGIN_CONFIG`. It shares the internal-only `plugin-control` network with
+the API and is not attached to the general backend network.
 
 ## Health and migrations
 
@@ -103,6 +109,7 @@ milestones add platform and agent behavior; they are not print-only stubs.
 - `GET /health/ready` reports PostgreSQL and Redis separately. It returns HTTP
   200 only when both probes pass, otherwise HTTP 503.
 - Both endpoints return or preserve `X-Correlation-ID`.
+- Web `GET /static-health` returns independently of API and database readiness.
 
 Try them from PowerShell:
 
@@ -114,6 +121,17 @@ Invoke-RestMethod http://127.0.0.1:8000/health/ready
 Apply pending migrations locally with `uv run alembic upgrade head`, or against
 Compose with `docker compose run --rm api alembic upgrade head`. The initial
 migration enables pgvector and creates the foundation system table.
+
+Dependency probes use bounded fail-fast defaults that can be overridden in
+`.env`:
+
+| Setting | Default seconds | Purpose |
+| --- | ---: | --- |
+| `MYBOT_HEALTH_PROBE_TIMEOUT_SECONDS` | 2 | Overall timeout for each readiness probe |
+| `MYBOT_DATABASE_CONNECT_TIMEOUT_SECONDS` | 3 | PostgreSQL connection timeout |
+| `MYBOT_DATABASE_READ_TIMEOUT_SECONDS` | 3 | PostgreSQL statement timeout |
+| `MYBOT_REDIS_CONNECT_TIMEOUT_SECONDS` | 2 | Redis connection timeout |
+| `MYBOT_REDIS_READ_TIMEOUT_SECONDS` | 2 | Redis command timeout |
 
 ## Optional external NapCat connection
 
@@ -141,8 +159,10 @@ pnpm --dir web build
 docker compose --env-file .env.example config --quiet
 ```
 
-CI runs the Python lint/type/test checks, frontend test/build checks, and Docker
-Compose configuration validation as independent jobs.
+CI runs Python lint/type/tests, frontend tests/build, Compose validation, both
+container image builds, and an integration job backed by pgvector PostgreSQL
+and Redis. The integration job applies an Alembic upgrade, downgrade, and
+re-upgrade before starting the API and checking liveness and readiness.
 
 ## Deployment notes
 
@@ -154,6 +174,8 @@ Compose configuration validation as independent jobs.
 - Put TLS and authentication in a reverse proxy before exposing the API, web,
   or SearXNG surfaces beyond loopback.
 - `plugin-runner` drops Linux capabilities, uses a read-only root filesystem,
-  and enables `no-new-privileges`, but a container is not a complete hostile
-  code sandbox. Add stronger isolation before accepting untrusted plugins.
+  enables `no-new-privileges`, receives no database or Redis credentials, and
+  has only the internal `plugin-control` network. A container is still not a
+  complete hostile code sandbox; add stronger isolation before accepting
+  untrusted plugins.
 - Back up the named PostgreSQL volume before migrations or upgrades.

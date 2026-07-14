@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mybot.settings import Settings
 
 
@@ -21,3 +23,21 @@ def test_settings_redact_secrets_from_repr_and_log_serialization(monkeypatch) ->
         assert secret not in serialized
         assert secret not in json_dump
     assert settings.database_url.get_secret_value() == database_secret
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "otel_exporter_otlp_endpoint",
+        "telegram_bot_token",
+        "qq_access_token",
+    ],
+)
+def test_blank_optional_secret_environment_values_become_none(
+    monkeypatch: pytest.MonkeyPatch, field_name: str
+) -> None:
+    monkeypatch.setenv(f"MYBOT_{field_name.upper()}", "   ")
+
+    settings = Settings()
+
+    assert getattr(settings, field_name) is None

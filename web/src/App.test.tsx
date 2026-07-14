@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
@@ -35,6 +35,18 @@ const responseWith = (payload: ReadinessPayload, status = 200) =>
 const dependency = (name: 'Database' | 'Redis') =>
   screen.getByRole('listitem', { name: `${name} dependency` });
 
+const POLL_INTERVAL_MS = 30_000;
+const ERROR_RETRY_MS = 5_000;
+const FETCH_TIMEOUT_MS = 5_000;
+const STALE_AFTER_MS = 60_000;
+
+async function flushRequest() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 describe('App', () => {
   const fetchMock = vi.fn<typeof fetch>();
 
@@ -43,6 +55,8 @@ describe('App', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     fetchMock.mockReset();
   });
@@ -121,5 +135,110 @@ describe('App', () => {
     });
     expect(within(dependency('Database')).getByText('Unknown')).toBeInTheDocument();
     expect(within(dependency('Redis')).getByText('Unknown')).toBeInTheDocument();
+  });
+
+  it('bounds a readiness request that never settles', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => undefined));
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS);
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      /readiness signal unavailable/i,
+    );
+  });
+
+  it('updates from healthy to degraded on the next poll', async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockReturnValueOnce(responseWith(healthyPayload))
+      .mockReturnValueOnce(
+        responseWith(
+          {
+            status: 'not_ready',
+            dependencies: {
+              database: { status: 'down', detail: 'TimeoutError' },
+              redis: { status: 'up' },
+            },
+          },
+          503,
+        ),
+      );
+
+    render(<App />);
+    await flushRequest();
+    expect(screen.getByRole('status')).toHaveTextContent(/all systems ready/i);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS);
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent(/readiness degraded/i);
+    expect(within(dependency('Database')).getByText('Offline')).toBeInTheDocument();
+  });
+
+  it('recovers from an initial network error on backoff retry', async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockRejectedValueOnce(new TypeError('Network request failed'))
+      .mockReturnValueOnce(responseWith(healthyPayload));
+
+    render(<App />);
+    await flushRequest();
+    expect(screen.getByRole('status')).toHaveTextContent(
+      /readiness signal unavailable/i,
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ERROR_RETRY_MS);
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent(/all systems ready/i);
+  });
+
+  it('pauses polling while hidden and refreshes when visible again', async () => {
+    vi.useFakeTimers();
+    let visibility: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    fetchMock
+      .mockReturnValueOnce(responseWith(healthyPayload))
+      .mockReturnValueOnce(responseWith(healthyPayload));
+
+    render(<App />);
+    await flushRequest();
+    visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 3);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushRequest();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('announces when the last successful readiness data becomes stale', async () => {
+    vi.useFakeTimers();
+    let visibility: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    fetchMock.mockReturnValueOnce(responseWith(healthyPayload));
+
+    render(<App />);
+    await flushRequest();
+    visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STALE_AFTER_MS);
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent(/readiness data stale/i);
   });
 });

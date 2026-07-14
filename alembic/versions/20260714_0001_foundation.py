@@ -36,4 +36,3 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("system_kv")
-    op.execute("DROP EXTENSION IF EXISTS vector")
