@@ -1,0 +1,42 @@
+:root {
+  font-family: Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
+  color: #e7e0d5;
+  background: #080c0e;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: #080c0e;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+a {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+code {
+  font-family: "Cascadia Mono", "IBM Plex Mono", Consolas, monospace;
+}
+
+::selection {
+  color: #080c0e;
+  background: #e7a84d;
+}

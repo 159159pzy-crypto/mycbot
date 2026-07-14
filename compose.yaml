@@ -1,0 +1,217 @@
+name: ${COMPOSE_PROJECT_NAME:-mybot}
+
+x-app-environment: &app-environment
+  MYBOT_API_HOST: "0.0.0.0"
+  MYBOT_API_PORT: "8000"
+  MYBOT_DATABASE_URL: >-
+    postgresql+psycopg://${POSTGRES_USER:-mybot}:${POSTGRES_PASSWORD:-mybot-local-change-me}@postgres:5432/${POSTGRES_DB:-mybot}
+  MYBOT_LOG_LEVEL: ${MYBOT_LOG_LEVEL:-INFO}
+  MYBOT_OTEL_EXPORTER_OTLP_ENDPOINT: ${MYBOT_OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  MYBOT_REDIS_URL: redis://redis:6379/0
+
+x-app-service: &app-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: mybot-python:${MYBOT_IMAGE_TAG:-dev}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  environment: *app-environment
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - backend
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mybot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mybot-local-change-me}
+      POSTGRES_USER: ${POSTGRES_USER:-mybot}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - backend
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - backend
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8080}/
+      SEARXNG_BIND_ADDRESS: "0.0.0.0"
+      SEARXNG_IMAGE_PROXY: "true"
+      SEARXNG_LIMITER: "false"
+      SEARXNG_PORT: "8080"
+      SEARXNG_SECRET: ${SEARXNG_SECRET_KEY:-mybot-searxng-local-change-me}
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8080}:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - backend
+
+  api:
+    <<: *app-service
+    command:
+      - python
+      - -m
+      - mybot
+      - api
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  gateway:
+    <<: *app-service
+    command:
+      - python
+      - -m
+      - mybot
+      - gateway
+    environment:
+      <<: *app-environment
+      MYBOT_QQ_ACCESS_TOKEN: ${MYBOT_QQ_ACCESS_TOKEN:-}
+      MYBOT_TELEGRAM_BOT_TOKEN: ${MYBOT_TELEGRAM_BOT_TOKEN:-}
+      NAPCAT_WS_URL: ${NAPCAT_WS_URL:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  agent-worker:
+    <<: *app-service
+    command:
+      - python
+      - -m
+      - mybot
+      - agent-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+
+  maintenance-worker:
+    <<: *app-service
+    command:
+      - python
+      - -m
+      - mybot
+      - maintenance-worker
+
+  plugin-runner:
+    <<: *app-service
+    command:
+      - python
+      - -m
+      - mybot
+      - plugin-runner
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: mybot-web:${MYBOT_IMAGE_TAG:-dev}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m,mode=0755
+      - /var/run:size=1m,mode=0755
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEB_PORT:-4173}:80"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1/health/live >/dev/null || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - backend
+
+volumes:
+  postgres-data:
+  redis-data:
+  searxng-cache:
+
+networks:
+  backend:
+    driver: bridge

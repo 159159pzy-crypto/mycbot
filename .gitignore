@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Python tooling
+.coverage
+.coverage.*
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+htmlcov/
+
+# Frontend
+node_modules/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.secrets/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.pid
+*.tmp
+tmp/

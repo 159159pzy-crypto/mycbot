@@ -1,0 +1,64 @@
+[project]
+name = "mybot"
+version = "0.1.0"
+description = "Self-hosted QQ and Telegram agent bot foundation"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.13.3,<2",
+  "fastapi>=0.115.0,<1",
+  "httpx>=0.27.2,<1",
+  "opentelemetry-api>=1.27.0,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.27.0,<2",
+  "opentelemetry-instrumentation-fastapi>=0.48b0,<1",
+  "opentelemetry-sdk>=1.27.0,<2",
+  "psycopg[binary]>=3.2.3,<4",
+  "pydantic>=2.9.2,<3",
+  "pydantic-settings>=2.5.2,<3",
+  "redis>=5.1.1,<6",
+  "sqlalchemy[asyncio]>=2.0.35,<3",
+  "structlog>=24.4.0,<26",
+  "uvicorn[standard]>=0.31.1,<1",
+]
+
+[project.scripts]
+mybot = "mybot.cli:main"
+mybot-api = "mybot.cli:api_main"
+mybot-gateway = "mybot.cli:gateway_main"
+mybot-agent-worker = "mybot.cli:agent_worker_main"
+mybot-maintenance-worker = "mybot.cli:maintenance_worker_main"
+mybot-plugin-runner = "mybot.cli:plugin_runner_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.115.3,<7",
+  "pyright>=1.1.386,<2",
+  "pytest>=8.3.3,<9",
+  "pytest-asyncio>=0.24.0,<1",
+  "ruff>=0.7.0,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mybot"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
