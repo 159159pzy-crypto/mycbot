@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
@@ -39,8 +39,8 @@ const responseWithUnknown = (payload: unknown) =>
     json: async () => payload,
   } as Response);
 
-const dependency = (name: 'Database' | 'Redis') =>
-  screen.getByRole('listitem', { name: `${name} dependency` });
+const dependency = (name: '数据库依赖' | 'Redis 依赖') =>
+  screen.getByRole('region', { name });
 
 const POLL_INTERVAL_MS = 30_000;
 const ERROR_RETRY_MS = 5_000;
@@ -52,6 +52,13 @@ async function flushRequest() {
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+function unlock() {
+  fireEvent.change(screen.getByLabelText('操作员令牌'), {
+    target: { value: 's3cret' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: '解锁控制台' }));
 }
 
 describe('App', () => {
@@ -68,30 +75,39 @@ describe('App', () => {
     fetchMock.mockReset();
   });
 
-  it('provides an accessible operations page structure', () => {
+  it('gates the console behind the operator token', () => {
     fetchMock.mockReturnValueOnce(new Promise<Response>(() => undefined));
 
     render(<App />);
 
+    expect(screen.getByLabelText('操作员令牌')).toBeInTheDocument();
+    expect(screen.queryByRole('main')).not.toBeInTheDocument();
+  });
+
+  it('provides an accessible console structure after unlocking', () => {
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => undefined));
+
+    render(<App />);
+    unlock();
+
     expect(screen.getByRole('banner')).toBeInTheDocument();
     expect(screen.getByRole('main')).toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: '控制台导航' })).toBeInTheDocument();
     expect(
-      screen.getByRole('heading', { level: 1, name: /operations readiness/i }),
+      screen.getByRole('heading', { level: 1, name: '系统状态' }),
     ).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
-    expect(screen.getByRole('contentinfo')).toBeInTheDocument();
   });
 
   it('announces loading while requesting the readiness endpoint', () => {
     fetchMock.mockReturnValueOnce(new Promise<Response>(() => undefined));
 
     render(<App />);
+    unlock();
 
-    expect(screen.getByRole('status')).toHaveTextContent(
-      /establishing telemetry link/i,
-    );
-    expect(within(dependency('Database')).getByText(/awaiting signal/i)).toBeInTheDocument();
-    expect(within(dependency('Redis')).getByText(/awaiting signal/i)).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('正在建立遥测链路');
+    expect(within(dependency('数据库依赖')).getByText('等待信号')).toBeInTheDocument();
+    expect(within(dependency('Redis 依赖')).getByText('等待信号')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/health/ready');
   });
@@ -100,11 +116,12 @@ describe('App', () => {
     fetchMock.mockReturnValueOnce(responseWith(healthyPayload));
 
     render(<App />);
+    unlock();
 
-    expect(await screen.findByText(/all systems ready/i)).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(/all systems ready/i);
-    expect(within(dependency('Database')).getByText('Online')).toBeInTheDocument();
-    expect(within(dependency('Redis')).getByText('Online')).toBeInTheDocument();
+    expect(await screen.findByText('一切正常')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('一切正常');
+    expect(within(dependency('数据库依赖')).getByText('在线')).toBeInTheDocument();
+    expect(within(dependency('Redis 依赖')).getByText('在线')).toBeInTheDocument();
   });
 
   it('renders dependency detail from a degraded readiness response', async () => {
@@ -122,26 +139,28 @@ describe('App', () => {
     );
 
     render(<App />);
+    unlock();
 
-    expect(await screen.findByText(/readiness degraded/i)).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(/readiness degraded/i);
-    expect(within(dependency('Database')).getByText('Offline')).toBeInTheDocument();
-    expect(within(dependency('Database')).getByText('Probe timed out')).toBeInTheDocument();
-    expect(within(dependency('Redis')).getByText('Online')).toBeInTheDocument();
+    expect(await screen.findByText('服务已降级')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('服务已降级');
+    expect(within(dependency('数据库依赖')).getByText('离线')).toBeInTheDocument();
+    expect(
+      within(dependency('数据库依赖')).getByText(/Probe timed out/),
+    ).toBeInTheDocument();
+    expect(within(dependency('Redis 依赖')).getByText('在线')).toBeInTheDocument();
   });
 
   it('announces a network error without reporting stale health', async () => {
     fetchMock.mockRejectedValueOnce(new TypeError('Network request failed'));
 
     render(<App />);
+    unlock();
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent(
-        /readiness signal unavailable/i,
-      );
+      expect(screen.getByRole('status')).toHaveTextContent('无法获取就绪信号');
     });
-    expect(within(dependency('Database')).getByText('Unknown')).toBeInTheDocument();
-    expect(within(dependency('Redis')).getByText('Unknown')).toBeInTheDocument();
+    expect(within(dependency('数据库依赖')).getByText('未知')).toBeInTheDocument();
+    expect(within(dependency('Redis 依赖')).getByText('未知')).toBeInTheDocument();
   });
 
   it.each([
@@ -169,10 +188,9 @@ describe('App', () => {
     fetchMock.mockReturnValueOnce(responseWithUnknown(payload));
 
     render(<App />);
+    unlock();
 
-    expect(
-      await screen.findByText(/readiness signal unavailable/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText('无法获取就绪信号')).toBeInTheDocument();
   });
 
   it('bounds a readiness request that never settles', async () => {
@@ -180,13 +198,12 @@ describe('App', () => {
     fetchMock.mockReturnValueOnce(new Promise<Response>(() => undefined));
 
     render(<App />);
+    unlock();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS);
     });
 
-    expect(screen.getByRole('status')).toHaveTextContent(
-      /readiness signal unavailable/i,
-    );
+    expect(screen.getByRole('status')).toHaveTextContent('无法获取就绪信号');
   });
 
   it('updates from healthy to degraded on the next poll', async () => {
@@ -207,15 +224,16 @@ describe('App', () => {
       );
 
     render(<App />);
+    unlock();
     await flushRequest();
-    expect(screen.getByRole('status')).toHaveTextContent(/all systems ready/i);
+    expect(screen.getByRole('status')).toHaveTextContent('一切正常');
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS);
     });
 
-    expect(screen.getByRole('status')).toHaveTextContent(/readiness degraded/i);
-    expect(within(dependency('Database')).getByText('Offline')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('服务已降级');
+    expect(within(dependency('数据库依赖')).getByText('离线')).toBeInTheDocument();
   });
 
   it('recovers from an initial network error on backoff retry', async () => {
@@ -225,16 +243,15 @@ describe('App', () => {
       .mockReturnValueOnce(responseWith(healthyPayload));
 
     render(<App />);
+    unlock();
     await flushRequest();
-    expect(screen.getByRole('status')).toHaveTextContent(
-      /readiness signal unavailable/i,
-    );
+    expect(screen.getByRole('status')).toHaveTextContent('无法获取就绪信号');
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(ERROR_RETRY_MS);
     });
 
-    expect(screen.getByRole('status')).toHaveTextContent(/all systems ready/i);
+    expect(screen.getByRole('status')).toHaveTextContent('一切正常');
   });
 
   it('pauses polling while hidden and refreshes when visible again', async () => {
@@ -269,6 +286,7 @@ describe('App', () => {
     fetchMock.mockReturnValueOnce(responseWith(healthyPayload));
 
     render(<App />);
+    unlock();
     await flushRequest();
     visibility = 'hidden';
     document.dispatchEvent(new Event('visibilitychange'));
@@ -277,6 +295,6 @@ describe('App', () => {
       await vi.advanceTimersByTimeAsync(STALE_AFTER_MS);
     });
 
-    expect(screen.getByRole('status')).toHaveTextContent(/readiness data stale/i);
+    expect(screen.getByRole('status')).toHaveTextContent('就绪数据已过期');
   });
 });

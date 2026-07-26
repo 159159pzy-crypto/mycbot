@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { OperatorClient } from '../api';
@@ -28,7 +28,7 @@ function stubClient(routes: Record<string, unknown>): OperatorClient & {
 }
 
 describe('OverviewPanel', () => {
-  it('renders usage totals, sparkline, queues, and outcomes', async () => {
+  it('renders usage totals, chart, queues, and outcomes', async () => {
     const client = stubClient({
       '/operator/usage': {
         usage: [
@@ -45,10 +45,15 @@ describe('OverviewPanel', () => {
     render(<OverviewPanel client={client} />);
 
     await waitFor(() => expect(screen.getByText('440')).toBeInTheDocument());
-    expect(screen.getByText('750ms / 1900ms')).toBeInTheDocument();
-    expect(screen.getByRole('img', { name: /Token usage over 2 days/ })).toBeInTheDocument();
+    expect(
+      screen.getByText('延迟 平均 / P95').closest('.stat-tile'),
+    ).toHaveTextContent('750 ms / 1900 ms');
+    expect(
+      screen.getByRole('img', { name: /Token 用量趋势，07-25 至 07-26/ }),
+    ).toBeInTheDocument();
     expect(screen.getByText('outbound_dead_letter')).toBeInTheDocument();
-    expect(screen.getByText('replied')).toBeInTheDocument();
+    expect(screen.getByText('已回复')).toBeInTheDocument();
+    expect(screen.getByText('失败')).toBeInTheDocument();
   });
 });
 
@@ -102,12 +107,15 @@ describe('ConversationsPanel', () => {
 
     render(<ConversationsPanel client={client} />);
 
-    const row = await screen.findByRole('button', { name: /TELEGRAM \/ DIRECT \/ 777/ });
+    const row = await screen.findByRole('button', { name: /Telegram.*777/ });
+    expect(row).toHaveTextContent('私聊');
     fireEvent.click(row);
 
     await waitFor(() => expect(screen.getByText('讲个笑话')).toBeInTheDocument());
-    expect(screen.getByText(/replied \/ DIRECT_MESSAGE/)).toBeInTheDocument();
-    expect(screen.getByText(/web_search\(timeout\)/)).toBeInTheDocument();
+    expect(screen.getByText('已回复')).toBeInTheDocument();
+    expect(screen.getByText(/私聊触发/)).toBeInTheDocument();
+    expect(screen.getByText(/工具: web_search\(timeout\)/)).toBeInTheDocument();
+    expect(screen.getByText(/140 tok · 900 ms/)).toBeInTheDocument();
   });
 });
 
@@ -143,10 +151,14 @@ describe('MemoriesPanel', () => {
     render(<MemoriesPanel client={client} />);
 
     await screen.findByText('喜欢美式咖啡');
-    fireEvent.click(screen.getByRole('button', { name: 'Revoke' }));
+    const memList = within(screen.getByRole('list', { name: '记忆列表' }));
+    expect(memList.getByText('主体')).toBeInTheDocument();
+    expect(memList.getByText('私人')).toBeInTheDocument();
+    expect(memList.getByText('偏好')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }));
 
     await waitFor(() =>
-      expect(screen.getByText('No memories match the current filters.')).toBeInTheDocument(),
+      expect(screen.getByText('没有符合当前筛选的记忆。')).toBeInTheDocument(),
     );
     expect(client.sent[0]).toMatchObject({
       method: 'POST',
@@ -176,13 +188,14 @@ describe('PluginsPanel', () => {
 
     render(<PluginsPanel client={client} />);
 
-    await screen.findByText('example.dice v1.0.0');
-    expect(screen.getByText(/tools: roll_dice/)).toBeInTheDocument();
+    await screen.findByText('example.dice');
+    expect(screen.getByText('v1.0.0')).toBeInTheDocument();
+    expect(screen.getByText(/roll_dice/)).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('Approve tool id'), {
+    fireEvent.change(screen.getByLabelText('批准工具 ID'), {
       target: { value: 'new_tool' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    fireEvent.click(screen.getByRole('button', { name: '批准' }));
 
     await waitFor(() =>
       expect(client.sent[0]).toMatchObject({
@@ -203,13 +216,15 @@ describe('PersonaPanel', () => {
 
     render(<PersonaPanel client={client} />);
 
-    const textarea = await screen.findByLabelText('System prompt');
+    const textarea = await screen.findByLabelText('系统提示词');
     expect(textarea).toHaveValue('You are MyBot.');
 
     fireEvent.change(textarea, { target: { value: '你是高冷的猫娘助手。' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save persona' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
 
-    await waitFor(() => expect(screen.getByText('Persona saved.')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText('已保存，下一轮对话生效。')).toBeInTheDocument(),
+    );
     expect(sendSpy).toHaveBeenCalledWith('PUT', '/operator/config/persona', {
       system_prompt: '你是高冷的猫娘助手。',
     });
