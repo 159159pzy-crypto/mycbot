@@ -149,6 +149,49 @@ def test_operator_docs_describe_the_new_isolation_and_health_boundaries() -> Non
     assert "upgrade, downgrade, and re-upgrade" in normalized
 
 
+def test_log_rotation_resource_limits_and_graceful_stop_are_configured() -> None:
+    compose = source("compose.yaml")
+    app_service = indented_block(compose, "x-app-service: &app-service")
+    logging_anchor = indented_block(compose, "x-service-logging: &service-logging")
+    plugin = indented_block(compose, "  plugin-runner:")
+
+    assert 'max-size: "10m"' in logging_anchor
+    assert 'max-file: "3"' in logging_anchor
+    assert "logging: *service-logging" in app_service
+    assert "stop_grace_period: 30s" in app_service
+    assert "mem_limit:" in app_service
+    assert "cpus:" in app_service
+    assert "logging: *service-logging" in plugin
+    assert "mem_limit:" in plugin
+    assert "stop_grace_period: 30s" in plugin
+    for service in ("postgres", "redis", "searxng", "web"):
+        block = indented_block(compose, f"  {service}:")
+        assert "logging: *service-logging" in block, service
+        assert "mem_limit:" in block, service
+
+
+def test_third_party_images_are_version_pinned_or_operator_pinnable() -> None:
+    compose = source("compose.yaml")
+    environment = source(".env.example")
+    readme = source("README.md")
+
+    assert "pgvector/pgvector:pg16" in compose
+    assert "redis:7.4-alpine" in compose
+    assert "searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}" in compose
+    assert "SEARXNG_IMAGE_TAG=" in environment
+    assert "RepoDigests" in environment
+    assert "digest" in " ".join(readme.split()).lower()
+
+
+def test_ci_audits_production_dependencies() -> None:
+    workflow = source(".github/workflows/ci.yml")
+    audit = indented_block(workflow, "  audit:")
+
+    assert "uv export --no-emit-project --no-dev --locked" in audit
+    assert "pip-audit" in audit
+    assert "--strict" in audit
+
+
 def test_dependency_timeout_defaults_are_exposed_to_operators() -> None:
     compose = source("compose.yaml")
     environment = source(".env.example")

@@ -18,6 +18,7 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.35,<3",
   "structlog>=24.4.0,<26",
   "uvicorn[standard]>=0.31.1,<1",
+  "websockets>=14,<17",
 ]
 
 [project.scripts]
@@ -48,6 +49,9 @@ packages = ["src/mybot"]
 addopts = "--strict-config --strict-markers"
 asyncio_default_fixture_loop_scope = "function"
 asyncio_mode = "auto"
+markers = [
+  "integration: exercises real PostgreSQL/Redis endpoints from MYBOT_TEST_* URLs",
+]
 pythonpath = ["src"]
 testpaths = ["tests"]
 

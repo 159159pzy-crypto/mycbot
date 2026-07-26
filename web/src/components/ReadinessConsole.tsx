@@ -1,3 +1,5 @@
+import type { ReactNode } from 'react';
+
 import type { HealthState } from '../health/types';
 import { DependencyRail } from './DependencyRail';
 import { StatusModule } from './StatusModule';
@@ -54,7 +56,13 @@ function viewState(health: HealthState) {
   };
 }
 
-export function ReadinessConsole({ health }: { health: HealthState }) {
+export function ReadinessConsole({
+  health,
+  children,
+}: {
+  health: HealthState;
+  children?: ReactNode;
+}) {
   const view = viewState(health);
 
   return (
@@ -131,6 +139,8 @@ export function ReadinessConsole({ health }: { health: HealthState }) {
             ))}
           </div>
         </section>
+
+        {children}
       </main>
 
       <footer>

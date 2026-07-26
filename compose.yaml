@@ -1,5 +1,11 @@
 name: ${COMPOSE_PROJECT_NAME:-mybot}
 
+x-service-logging: &service-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-app-environment: &app-environment
   MYBOT_API_HOST: "0.0.0.0"
   MYBOT_API_PORT: "8000"
@@ -21,6 +27,10 @@ x-app-service: &app-service
   image: mybot-python:${MYBOT_IMAGE_TAG:-dev}
   restart: unless-stopped
   init: true
+  stop_grace_period: 30s
+  logging: *service-logging
+  mem_limit: 512m
+  cpus: 1.0
   read_only: true
   tmpfs:
     - /tmp:size=64m,mode=1777
@@ -41,6 +51,8 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    logging: *service-logging
+    mem_limit: 1g
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mybot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mybot-local-change-me}
@@ -63,6 +75,8 @@ services:
   redis:
     image: redis:7.4-alpine
     restart: unless-stopped
+    logging: *service-logging
+    mem_limit: 256m
     command:
       - redis-server
       - --appendonly
@@ -86,8 +100,10 @@ services:
       - backend
 
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
     restart: unless-stopped
+    logging: *service-logging
+    mem_limit: 512m
     environment:
       SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8080}/
       SEARXNG_BIND_ADDRESS: "0.0.0.0"
@@ -122,6 +138,12 @@ services:
       - -m
       - mybot
       - api
+    environment:
+      <<: *app-environment
+      MYBOT_OPERATOR_TOKEN: ${MYBOT_OPERATOR_TOKEN:-}
+      # An empty grants value falls back to the application default of {}.
+      MYBOT_PLUGIN_CAPABILITY_GRANTS: ${MYBOT_PLUGIN_CAPABILITY_GRANTS:-}
+      MYBOT_PLUGIN_INVOKE_TIMEOUT_SECONDS: ${MYBOT_PLUGIN_INVOKE_TIMEOUT_SECONDS:-20}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     healthcheck:
@@ -150,7 +172,11 @@ services:
     environment:
       <<: *app-environment
       MYBOT_QQ_ACCESS_TOKEN: ${MYBOT_QQ_ACCESS_TOKEN:-}
+      MYBOT_QQ_CONNECTION_ID: ${MYBOT_QQ_CONNECTION_ID:-qq-main}
+      MYBOT_TELEGRAM_API_BASE_URL: ${MYBOT_TELEGRAM_API_BASE_URL:-https://api.telegram.org}
       MYBOT_TELEGRAM_BOT_TOKEN: ${MYBOT_TELEGRAM_BOT_TOKEN:-}
+      MYBOT_TELEGRAM_CONNECTION_ID: ${MYBOT_TELEGRAM_CONNECTION_ID:-telegram-main}
+      MYBOT_TELEGRAM_POLL_TIMEOUT_SECONDS: ${MYBOT_TELEGRAM_POLL_TIMEOUT_SECONDS:-50}
       NAPCAT_WS_URL: ${NAPCAT_WS_URL:-}
     extra_hosts:
       - host.docker.internal:host-gateway
@@ -162,6 +188,19 @@ services:
       - -m
       - mybot
       - agent-worker
+    environment:
+      <<: *app-environment
+      MYBOT_AGENT_CONVERSATION_DAILY_TOKEN_CEILING: ${MYBOT_AGENT_CONVERSATION_DAILY_TOKEN_CEILING:-20000}
+      MYBOT_AGENT_DAILY_TOKEN_CEILING: ${MYBOT_AGENT_DAILY_TOKEN_CEILING:-200000}
+      MYBOT_EMBEDDING_API_KEY: ${MYBOT_EMBEDDING_API_KEY:-}
+      MYBOT_EMBEDDING_BASE_URL: ${MYBOT_EMBEDDING_BASE_URL:-}
+      MYBOT_EMBEDDING_MODEL: ${MYBOT_EMBEDDING_MODEL:-text-embedding-3-small}
+      MYBOT_LLM_API_KEY: ${MYBOT_LLM_API_KEY:-}
+      MYBOT_LLM_BASE_URL: ${MYBOT_LLM_BASE_URL:-}
+      MYBOT_LLM_MODEL: ${MYBOT_LLM_MODEL:-deepseek-chat}
+      MYBOT_MEMORY_ENABLED: ${MYBOT_MEMORY_ENABLED:-true}
+      MYBOT_PLUGIN_BROKER_URL: ${MYBOT_WORKER_PLUGIN_BROKER_URL:-http://api:8000}
+      MYBOT_SEARXNG_URL: ${MYBOT_SEARXNG_URL:-http://searxng:8080}
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,6 +216,12 @@ services:
       - -m
       - mybot
       - maintenance-worker
+    environment:
+      <<: *app-environment
+      MYBOT_PROACTIVE_ENABLED: ${MYBOT_PROACTIVE_ENABLED:-false}
+      MYBOT_PROACTIVE_MIN_INTERVAL_HOURS: ${MYBOT_PROACTIVE_MIN_INTERVAL_HOURS:-24}
+      MYBOT_PROACTIVE_QUIET_END_HOUR: ${MYBOT_PROACTIVE_QUIET_END_HOUR:-8}
+      MYBOT_PROACTIVE_QUIET_START_HOUR: ${MYBOT_PROACTIVE_QUIET_START_HOUR:-22}
 
   plugin-runner:
     build:
@@ -185,6 +230,10 @@ services:
     image: mybot-python:${MYBOT_IMAGE_TAG:-dev}
     restart: unless-stopped
     init: true
+    stop_grace_period: 30s
+    logging: *service-logging
+    mem_limit: 256m
+    cpus: 0.5
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -212,6 +261,8 @@ services:
       dockerfile: Dockerfile
     image: mybot-web:${MYBOT_IMAGE_TAG:-dev}
     restart: unless-stopped
+    logging: *service-logging
+    mem_limit: 128m
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

@@ -45,7 +45,7 @@ async def run_mode(
     await (service or IdleLifecycleService()).run(mode, resolved_event)
 
 
-async def run_process(mode: ProcessMode) -> None:
+async def run_process(mode: ProcessMode, *, service: LifecycleService | None = None) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -61,4 +61,4 @@ async def run_process(mode: ProcessMode) -> None:
         except (NotImplementedError, RuntimeError):
             signal.signal(signal_name, handle_signal)
 
-    await run_mode(mode, stop_event=stop_event)
+    await run_mode(mode, service=service, stop_event=stop_event)

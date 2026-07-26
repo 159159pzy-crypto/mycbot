@@ -22,7 +22,9 @@ def _run_api(settings: Settings) -> None:
 
 def _run_non_api(mode: ProcessMode, settings: Settings) -> None:
     configure_logging(settings.log_level)
-    asyncio.run(run_process(mode))
+    from mybot.services import create_service
+
+    asyncio.run(run_process(mode, service=create_service(mode, settings)))
 
 
 def main(argv: Sequence[str] | None = None) -> None:

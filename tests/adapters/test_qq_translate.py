@@ -1,0 +1,145 @@
+from datetime import UTC, datetime
+
+import pytest
+from platform_payloads import onebot_group_message, onebot_private_message
+
+from mybot.adapters import InboundEvent
+from mybot.adapters.qq.translate import QQ_CAPABILITIES, translate_qq_event
+from mybot.contracts import ChatKind, FileSegment, ImageSegment, Platform, TextSegment
+
+CONNECTION = "qq-main"
+SELF_ID = 10000
+
+
+def translate(payload: dict[str, object]) -> InboundEvent:
+    event = translate_qq_event(payload, connection_id=CONNECTION, self_id=SELF_ID)
+    assert event is not None
+    return event
+
+
+def test_private_text_message_maps_to_direct_envelope() -> None:
+    event = translate(onebot_private_message())
+    envelope = event.envelope
+
+    assert envelope.platform is Platform.QQ
+    assert envelope.chat_kind is ChatKind.DIRECT
+    assert envelope.connection_id == CONNECTION
+    assert envelope.chat_id == "10001"
+    assert envelope.sender_identity_id == "qq:10001"
+    assert envelope.id == "qq:qq-main:901"
+    assert envelope.occurred_at == datetime.fromtimestamp(1_784_000_000, tz=UTC)
+    assert envelope.occurred_at.tzinfo is not None
+    assert envelope.segments == (TextSegment(text="hello bot"),)
+    assert event.mentions_self is False
+    assert event.replies_to_self is False
+
+
+def test_group_message_maps_group_chat_and_deterministic_id() -> None:
+    envelope = translate(onebot_group_message(message_id=77, group_id=333)).envelope
+
+    assert envelope.chat_kind is ChatKind.GROUP
+    assert envelope.chat_id == "333"
+    assert envelope.id == "qq:qq-main:77"
+
+
+def test_at_self_segment_sets_mention_without_leaking_segment_noise() -> None:
+    payload = onebot_group_message(
+        message=[
+            {"type": "at", "data": {"qq": str(SELF_ID)}},
+            {"type": "text", "data": {"text": " ping"}},
+        ]
+    )
+    event = translate(payload)
+
+    assert event.mentions_self is True
+    assert event.envelope.segments == (TextSegment(text="ping"),)
+
+
+def test_at_other_users_do_not_mention_self() -> None:
+    payload = onebot_group_message(
+        message=[
+            {"type": "at", "data": {"qq": "555"}},
+            {"type": "text", "data": {"text": "hi"}},
+        ]
+    )
+    event = translate(payload)
+
+    assert event.mentions_self is False
+
+
+def test_at_only_mention_still_produces_a_placeholder_segment() -> None:
+    payload = onebot_group_message(message=[{"type": "at", "data": {"qq": str(SELF_ID)}}])
+    event = translate(payload)
+
+    assert event.mentions_self is True
+    assert len(event.envelope.segments) == 1
+    assert isinstance(event.envelope.segments[0], TextSegment)
+
+
+def test_image_and_file_segments_map_with_locators() -> None:
+    payload = onebot_private_message(
+        message=[
+            {"type": "text", "data": {"text": "look"}},
+            {"type": "image", "data": {"file": "abc.image", "url": "https://img.example/x"}},
+            {"type": "file", "data": {"name": "notes.txt", "file": "file-id-1"}},
+        ]
+    )
+    segments = translate(payload).envelope.segments
+
+    assert segments[0] == TextSegment(text="look")
+    assert segments[1] == ImageSegment(url="https://img.example/x")
+    file_segment = segments[2]
+    assert isinstance(file_segment, FileSegment)
+    assert file_segment.name == "notes.txt"
+    assert file_segment.url == "file-id-1"
+
+
+def test_reply_segment_sets_reply_to_message_id() -> None:
+    payload = onebot_group_message(
+        message=[
+            {"type": "reply", "data": {"id": "888"}},
+            {"type": "text", "data": {"text": "agreed"}},
+        ]
+    )
+    envelope = translate(payload).envelope
+
+    assert envelope.reply_to_message_id == "888"
+    assert envelope.segments == (TextSegment(text="agreed"),)
+
+
+def test_unsupported_segment_degrades_to_placeholder() -> None:
+    payload = onebot_private_message(
+        message=[{"type": "face", "data": {"id": "14"}}]
+    )
+    segments = translate(payload).envelope.segments
+
+    assert len(segments) == 1
+    assert isinstance(segments[0], TextSegment)
+    assert "face" in segments[0].text
+
+
+def test_non_message_events_return_none() -> None:
+    heartbeat = {"post_type": "meta_event", "meta_event_type": "heartbeat", "time": 1}
+    notice = {"post_type": "notice", "notice_type": "group_increase", "time": 1}
+
+    assert translate_qq_event(heartbeat, connection_id=CONNECTION, self_id=SELF_ID) is None
+    assert translate_qq_event(notice, connection_id=CONNECTION, self_id=SELF_ID) is None
+
+
+def test_contentless_message_returns_none() -> None:
+    payload = onebot_private_message(message=[])
+    assert translate_qq_event(payload, connection_id=CONNECTION, self_id=SELF_ID) is None
+
+
+def test_raw_ref_is_frozen_against_mutation() -> None:
+    envelope = translate(onebot_private_message()).envelope
+
+    assert envelope.raw_ref is not None
+    with pytest.raises(TypeError):
+        envelope.raw_ref["message_type"] = "group"  # type: ignore[index]
+
+
+def test_qq_capabilities_reflect_onebot_v11() -> None:
+    assert QQ_CAPABILITIES.replies is True
+    assert QQ_CAPABILITIES.typing is False
+    assert QQ_CAPABILITIES.editing is False

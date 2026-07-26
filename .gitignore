@@ -29,6 +29,11 @@ web/dist/
 !.env.example
 .secrets/
 
+# Database backups and local data stores — never push a dump
+backups/
+*.dump
+dump.rdb
+
 # Editors and operating systems
 .idea/
 .vscode/

@@ -3,7 +3,9 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from mybot.runtime import ProcessMode, run_mode
+from mybot.runtime import ProcessMode, run_mode, run_process
+from mybot.services import create_service
+from mybot.settings import Settings
 
 
 @dataclass
@@ -39,3 +41,51 @@ async def test_non_api_modes_run_through_cancellable_lifecycle(mode: ProcessMode
     await asyncio.wait_for(running, timeout=0.5)
 
     assert lifecycle.modes == [mode]
+
+
+@pytest.mark.asyncio
+async def test_run_process_passes_the_injected_service_through() -> None:
+    lifecycle = RecordingLifecycle()
+
+    running = asyncio.create_task(
+        run_process(ProcessMode.MAINTENANCE_WORKER, service=lifecycle)
+    )
+    await asyncio.wait_for(lifecycle.started.wait(), timeout=0.5)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert lifecycle.modes == [ProcessMode.MAINTENANCE_WORKER]
+
+
+def test_worker_gateway_and_maintenance_modes_get_real_services() -> None:
+    from mybot.services.agent_worker import AgentWorkerService
+    from mybot.services.gateway import GatewayService
+    from mybot.services.maintenance import MaintenanceWorkerService
+
+    settings = Settings()
+
+    assert isinstance(create_service(ProcessMode.AGENT_WORKER, settings), AgentWorkerService)
+    gateway = create_service(ProcessMode.GATEWAY, settings)
+    assert isinstance(gateway, GatewayService)
+    assert gateway.qq is None  # no NAPCAT_WS_URL configured in tests
+    assert isinstance(
+        create_service(ProcessMode.MAINTENANCE_WORKER, settings), MaintenanceWorkerService
+    )
+    assert create_service(ProcessMode.PLUGIN_RUNNER, settings) is None
+
+
+def test_plugin_runner_mode_gets_a_real_service_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mybot.plugins.runner import PluginRunnerService
+
+    monkeypatch.setenv("MYBOT_PLUGIN_BROKER_URL", "http://api:8000")
+    monkeypatch.setenv(
+        "MYBOT_PLUGIN_CONFIG",
+        '{"plugins": ["mybot.plugins.examples.dice:PLUGIN"]}',
+    )
+    service = create_service(ProcessMode.PLUGIN_RUNNER, Settings())
+
+    assert isinstance(service, PluginRunnerService)
+    assert [plugin.manifest.id for plugin in service.plugins] == ["example.dice"]

@@ -837,3 +837,305 @@ footer {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Operator console (Milestone 7)
+--------------------------------------------------------------------------- */
+
+.operator-console {
+  border: 1px solid var(--line);
+  background: var(--graphite);
+  padding: 1.4rem 1.5rem 1.7rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.op-token-gate {
+  display: grid;
+  gap: 0.8rem;
+  max-width: 30rem;
+}
+
+.op-token-gate label,
+.op-persona label,
+.op-inline-form label,
+.op-filters label {
+  display: grid;
+  gap: 0.35rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.op-token-gate input,
+.op-inline-form input,
+.op-filters select,
+.op-persona textarea {
+  background: var(--ink);
+  border: 1px solid var(--line-strong);
+  color: var(--paper);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  padding: 0.55rem 0.65rem;
+}
+
+.op-token-gate input:focus-visible,
+.op-inline-form input:focus-visible,
+.op-filters select:focus-visible,
+.op-persona textarea:focus-visible,
+.op-tabs button:focus-visible,
+.op-list button:focus-visible,
+.op-inline-form button:focus-visible,
+.op-persona button:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.op-token-gate button,
+.op-inline-form button,
+.op-persona button,
+.op-list button {
+  background: var(--amber-soft);
+  border: 1px solid var(--amber);
+  color: var(--paper);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  justify-self: start;
+}
+
+.op-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.op-tabs button {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.45rem 0.85rem;
+  cursor: pointer;
+}
+
+.op-tabs button[aria-pressed='true'] {
+  border-color: var(--amber);
+  color: var(--paper);
+  background: var(--amber-soft);
+}
+
+.op-tabs .op-lock {
+  margin-left: auto;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.op-panel {
+  border-top: 1px solid var(--line);
+  padding-top: 1rem;
+  display: grid;
+  gap: 0.9rem;
+}
+
+.op-panel h3 {
+  font-family: var(--display);
+  font-size: 1rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--paper);
+  margin: 0.4rem 0 0;
+}
+
+.op-empty,
+.op-hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.op-error {
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.op-tile-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.7rem;
+}
+
+.op-tile {
+  border: 1px solid var(--line);
+  background: var(--graphite-raised);
+  padding: 0.75rem 0.9rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.op-tile span {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.op-tile strong {
+  font-family: var(--display);
+  font-size: 1.35rem;
+  color: var(--paper);
+}
+
+.op-sparkline {
+  width: 100%;
+  max-width: 26rem;
+  height: 3.2rem;
+  border: 1px solid var(--line);
+  background: var(--ink);
+}
+
+.op-sparkline polyline {
+  stroke: var(--cyan);
+  stroke-width: 1.6;
+}
+
+.op-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.op-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  border: 1px solid var(--line);
+  background: var(--graphite-raised);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.84rem;
+  color: var(--paper);
+}
+
+.op-list code {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--cyan);
+}
+
+.op-list--select button {
+  all: unset;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  width: 100%;
+  cursor: pointer;
+}
+
+.op-list--memories li {
+  align-items: flex-start;
+}
+
+.op-list--memories li[data-revoked='true'] {
+  opacity: 0.55;
+}
+
+.op-list--memories div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.op-list--memories small {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+}
+
+.op-split {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(14rem, 1fr) 2fr;
+}
+
+@media (max-width: 56rem) {
+  .op-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.op-detail {
+  display: grid;
+  gap: 0.7rem;
+  align-content: start;
+}
+
+.op-transcript {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.op-transcript li {
+  display: grid;
+  gap: 0.15rem;
+  border-left: 2px solid var(--line-strong);
+  padding: 0.25rem 0 0.25rem 0.7rem;
+  font-size: 0.85rem;
+  color: var(--paper);
+}
+
+.op-transcript li[data-direction='outbound'] {
+  border-left-color: var(--amber);
+}
+
+.op-transcript code {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.op-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: end;
+}
+
+.op-filters label:has(input[type='checkbox']) {
+  grid-auto-flow: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.op-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  align-items: end;
+}
+
+.op-persona {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.op-persona textarea {
+  resize: vertical;
+  min-height: 8rem;
+  line-height: 1.5;
+}
