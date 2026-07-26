@@ -1,10 +1,12 @@
 :root {
-  font-family: Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
-  color: #e7e0d5;
-  background: #080c0e;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  color: #1d1d1f;
+  background: #f5f5f7;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  color-scheme: light;
 }
 
 * {
@@ -14,7 +16,7 @@
 html {
   min-width: 320px;
   min-height: 100%;
-  background: #080c0e;
+  background: #f5f5f7;
 }
 
 body {
@@ -24,19 +26,27 @@ body {
 }
 
 button,
-a {
+a,
+input,
+textarea,
+select {
   font: inherit;
 }
 
 a {
-  color: inherit;
+  color: #0071e3;
+  text-decoration: none;
+}
+
+a:hover {
+  color: #0077ed;
+  text-decoration: underline;
 }
 
 code {
-  font-family: "Cascadia Mono", "IBM Plex Mono", Consolas, monospace;
+  font-family: 'SF Mono', ui-monospace, 'Cascadia Mono', Menlo, Consolas, monospace;
 }
 
 ::selection {
-  color: #080c0e;
-  background: #e7a84d;
+  background: rgba(0, 113, 227, 0.18);
 }

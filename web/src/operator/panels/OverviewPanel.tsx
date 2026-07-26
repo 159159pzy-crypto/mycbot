@@ -1,35 +1,64 @@
 import { useEffect, useState } from 'react';
 
 import type { MetricsView, OperatorClient, UsagePoint } from '../api';
+import { outcomeMeta } from '../labels';
 
 type OverviewState =
   | { kind: 'loading' }
   | { kind: 'error'; message: string }
   | { kind: 'ready'; usage: UsagePoint[]; metrics: MetricsView };
 
-function Sparkline({ points }: { points: UsagePoint[] }) {
+const CHART_WIDTH = 720;
+const CHART_HEIGHT = 160;
+const CHART_PAD = 8;
+
+export function shortDay(day: string): string {
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day.slice(5) : day;
+}
+
+function UsageChart({ points }: { points: UsagePoint[] }) {
   if (points.length === 0) {
-    return <p className="op-empty">No turns recorded yet.</p>;
+    return <p className="panel-empty">暂无轮次记录。</p>;
   }
-  const width = 240;
-  const height = 48;
   const peak = Math.max(...points.map((point) => point.tokens), 1);
-  const step = points.length > 1 ? width / (points.length - 1) : width;
-  const path = points
-    .map((point, index) => {
-      const x = points.length > 1 ? index * step : width / 2;
-      const y = height - (point.tokens / peak) * (height - 4) - 2;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(' ');
+  const first = shortDay(points[0].day);
+  const last = shortDay(points[points.length - 1].day);
+  const coords = points.map((point, index) => {
+    const x =
+      points.length > 1
+        ? CHART_PAD + (index * (CHART_WIDTH - CHART_PAD * 2)) / (points.length - 1)
+        : CHART_WIDTH / 2;
+    const y =
+      CHART_HEIGHT -
+      CHART_PAD -
+      (point.tokens / peak) * (CHART_HEIGHT - CHART_PAD * 2 - 14);
+    return [x, y] as const;
+  });
+  let line = `M ${coords[0][0].toFixed(1)} ${coords[0][1].toFixed(1)}`;
+  for (let index = 1; index < coords.length; index += 1) {
+    const [x0, y0] = coords[index - 1];
+    const [x1, y1] = coords[index];
+    const mid = ((x0 + x1) / 2).toFixed(1);
+    line += ` C ${mid} ${y0.toFixed(1)}, ${mid} ${y1.toFixed(1)}, ${x1.toFixed(1)} ${y1.toFixed(1)}`;
+  }
+  const [lastX, lastY] = coords[coords.length - 1];
+  const area = `${line} L ${lastX.toFixed(1)} ${CHART_HEIGHT} L ${coords[0][0].toFixed(1)} ${CHART_HEIGHT} Z`;
   return (
     <svg
-      className="op-sparkline"
-      viewBox={`0 0 ${width} ${height}`}
+      className="usage-chart"
+      viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
       role="img"
-      aria-label={`Token usage over ${points.length} days, peaking at ${peak} tokens`}
+      aria-label={`Token 用量趋势，${first} 至 ${last}，峰值 ${peak}`}
     >
-      <polyline points={path} fill="none" />
+      <defs>
+        <linearGradient id="usage-gradient" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="rgba(0, 113, 227, 0.22)" />
+          <stop offset="1" stopColor="rgba(0, 113, 227, 0)" />
+        </linearGradient>
+      </defs>
+      <path d={area} fill="url(#usage-gradient)" />
+      <path d={line} className="usage-line" fill="none" />
+      <circle className="usage-dot" cx={lastX} cy={lastY} r="4" />
     </svg>
   );
 }
@@ -60,57 +89,112 @@ export function OverviewPanel({ client }: { client: OperatorClient }) {
   }, [client]);
 
   if (state.kind === 'loading') {
-    return <p className="op-empty">Loading usage…</p>;
+    return (
+      <section className="card view-enter">
+        <p className="panel-empty">正在加载用量数据…</p>
+      </section>
+    );
   }
   if (state.kind === 'error') {
-    return <p className="op-error">{state.message}</p>;
+    return (
+      <section className="card view-enter">
+        <p className="panel-error" role="alert">
+          {state.message}
+        </p>
+      </section>
+    );
   }
+
   const totalTokens = state.usage.reduce((sum, point) => sum + point.tokens, 0);
   const totalTurns = state.usage.reduce((sum, point) => sum + point.turns, 0);
   const outcomes = Object.entries(state.metrics.turns.by_outcome);
+  const maxOutcome = Math.max(...outcomes.map(([, count]) => count), 1);
+  const queues = Object.entries(state.metrics.queues);
+
   return (
-    <div className="op-overview">
-      <div className="op-tile-row">
-        <div className="op-tile">
-          <span>Tokens / 14d</span>
+    <div className="overview-view view-enter">
+      <div className="tile-row">
+        <section className="card stat-tile">
+          <small>Token 用量 · 14 天</small>
           <strong>{totalTokens.toLocaleString()}</strong>
-        </div>
-        <div className="op-tile">
-          <span>Turns / 14d</span>
+        </section>
+        <section className="card stat-tile">
+          <small>对话轮次 · 14 天</small>
           <strong>{totalTurns.toLocaleString()}</strong>
-        </div>
-        <div className="op-tile">
-          <span>Latency avg / p95</span>
+        </section>
+        <section className="card stat-tile">
+          <small>延迟 平均 / P95</small>
           <strong>
-            {state.metrics.turns.avg_latency_ms}ms / {state.metrics.turns.p95_latency_ms}ms
+            {state.metrics.turns.avg_latency_ms}
+            <span className="stat-unit"> ms</span> / {state.metrics.turns.p95_latency_ms}
+            <span className="stat-unit"> ms</span>
           </strong>
-        </div>
+        </section>
       </div>
-      <Sparkline points={state.usage} />
-      <h3>Queues</h3>
-      <ul className="op-list" aria-label="Queue depths">
-        {Object.entries(state.metrics.queues).map(([name, depth]) => (
-          <li key={name}>
-            <code>{name}</code>
-            <span>{depth}</span>
-          </li>
-        ))}
-      </ul>
-      <h3>Turn outcomes / 24h</h3>
-      <ul className="op-list" aria-label="Turn outcomes">
-        {outcomes.length === 0 ? (
-          <li>
-            <span>No turns in the last 24 hours.</span>
-          </li>
-        ) : (
-          outcomes.map(([outcome, count]) => (
-            <li key={outcome}>
-              <code>{outcome}</code>
-              <span>{count}</span>
-            </li>
-          ))
+      <section className="card chart-card" aria-label="Token 用量趋势">
+        <div className="card-heading">
+          <h2>Token 用量趋势</h2>
+          <small>最近 14 天 · 每日合计</small>
+        </div>
+        <UsageChart points={state.usage} />
+        {state.usage.length > 0 && (
+          <div className="chart-axis" aria-hidden="true">
+            <small>{shortDay(state.usage[0].day)}</small>
+            <small>{shortDay(state.usage[state.usage.length - 1].day)}</small>
+          </div>
         )}
-      </ul>
+      </section>
+      <div className="overview-split">
+        <section className="card" aria-label="消息队列">
+          <div className="card-heading">
+            <h2>消息队列</h2>
+          </div>
+          {queues.length === 0 ? (
+            <p className="panel-empty">暂无队列数据。</p>
+          ) : (
+            <ul className="queue-list">
+              {queues.map(([name, depth]) => (
+                <li key={name}>
+                  <code>{name}</code>
+                  <span className="queue-badge" data-active={depth > 0}>
+                    {depth}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="card-note">积压深度，来自 Redis Streams 消费者组。</p>
+        </section>
+        <section className="card" aria-label="轮次结果">
+          <div className="card-heading">
+            <h2>轮次结果 · 24 小时</h2>
+          </div>
+          {outcomes.length === 0 ? (
+            <p className="panel-empty">最近 24 小时没有轮次。</p>
+          ) : (
+            <ul className="outcome-list">
+              {outcomes.map(([outcome, count]) => {
+                const meta = outcomeMeta(outcome);
+                return (
+                  <li key={outcome}>
+                    <div className="outcome-row">
+                      <span>{meta.label}</span>
+                      <strong>{count}</strong>
+                    </div>
+                    <div className="outcome-track" aria-hidden="true">
+                      <div
+                        className="outcome-bar"
+                        data-tone={meta.tone}
+                        style={{ width: `${Math.max((count / maxOutcome) * 100, 2)}%` }}
+                      />
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
