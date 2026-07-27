@@ -43,76 +43,103 @@ export function PluginsPanel({ client }: { client: OperatorClient }) {
     }
   };
 
-  if (error) return <p className="op-error">{error}</p>;
+  if (error) {
+    return (
+      <section className="card view-enter">
+        <p className="panel-error" role="alert">
+          {error}
+        </p>
+      </section>
+    );
+  }
   if (plugins === null || approved === null) {
-    return <p className="op-empty">Loading plugins…</p>;
+    return (
+      <section className="card view-enter">
+        <p className="panel-empty">正在加载插件…</p>
+      </section>
+    );
   }
 
   return (
-    <div>
-      <h3>Registered plugins</h3>
-      {plugins.length === 0 ? (
-        <p className="op-empty">No plugins registered with the broker.</p>
-      ) : (
-        <ul className="op-list" aria-label="Plugins">
-          {plugins.map((plugin) => (
-            <li key={plugin.id}>
-              <code>
-                {plugin.id} v{plugin.version}
-              </code>
-              <span>
-                tools: {plugin.tools.join(', ') || 'none'} · hooks:{' '}
-                {plugin.event_hooks.join(', ') || 'none'} · grants:{' '}
-                {plugin.granted_capabilities.join(', ') || 'none'}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-      <h3>Approved tools</h3>
-      <p className="op-hint">
-        Tools marked approval-required run only when their id is listed here.
-      </p>
-      <ul className="op-list" aria-label="Approved tools">
-        {approved.length === 0 ? (
-          <li>
-            <span>No standing approvals.</span>
-          </li>
+    <div className="plugin-view view-enter">
+      <section className="card" aria-label="已注册插件">
+        <div className="card-heading card-heading--stacked">
+          <h2>已注册插件</h2>
+          <small>通过内部代理接入，运行在隔离的 plugin-runner 进程中。</small>
+        </div>
+        {plugins.length === 0 ? (
+          <p className="panel-empty">尚无插件注册到代理。</p>
         ) : (
-          approved.map((toolId) => (
-            <li key={toolId}>
-              <code>{toolId}</code>
-              <button
-                type="button"
-                onClick={() => void save(approved.filter((item) => item !== toolId))}
-              >
-                Remove
-              </button>
-            </li>
-          ))
+          <div className="plugin-grid">
+            {plugins.map((plugin) => (
+              <div className="plugin-card" key={plugin.id}>
+                <div className="plugin-name">
+                  <strong>{plugin.id}</strong>
+                  <code>v{plugin.version}</code>
+                </div>
+                <div className="plugin-rows">
+                  <small>
+                    <span>工具</span> {plugin.tools.join(', ') || '无'}
+                  </small>
+                  <small>
+                    <span>钩子</span> {plugin.event_hooks.join(', ') || '无'}
+                  </small>
+                  <small>
+                    <span>权限</span> {plugin.granted_capabilities.join(', ') || '无'}
+                  </small>
+                </div>
+              </div>
+            ))}
+          </div>
         )}
-      </ul>
-      <form
-        className="op-inline-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (newToolId.trim()) {
-            void save([...approved, newToolId.trim()]);
-            setNewToolId('');
-          }
-        }}
-      >
-        <label>
-          Approve tool id
+      </section>
+      <section className="card" aria-label="已批准工具">
+        <div className="card-heading card-heading--stacked">
+          <h2>已批准工具</h2>
+          <small>标记为需审批的工具，仅当其 ID 出现在此列表时才会运行。</small>
+        </div>
+        {approved.length === 0 ? (
+          <p className="panel-empty">暂无长期批准。</p>
+        ) : (
+          <ul className="approval-list">
+            {approved.map((toolId) => (
+              <li key={toolId}>
+                <code>{toolId}</code>
+                <button
+                  type="button"
+                  className="pill-button pill-button--danger"
+                  onClick={() => void save(approved.filter((item) => item !== toolId))}
+                >
+                  移除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <form
+          className="approval-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (newToolId.trim()) {
+              void save([...approved, newToolId.trim()]);
+              setNewToolId('');
+            }
+          }}
+        >
           <input
             value={newToolId}
             onChange={(event) => setNewToolId(event.target.value)}
-            placeholder="tool_id"
+            placeholder="输入工具 ID，如 get_weather"
+            aria-label="批准工具 ID"
           />
-        </label>
-        <button type="submit">Approve</button>
-      </form>
-      {saved && <p className="op-hint">Approvals saved.</p>}
+          <button type="submit" className="pill-button pill-button--primary">
+            批准
+          </button>
+        </form>
+        <p className="panel-saved" role="status">
+          {saved ? '批准列表已保存。' : ''}
+        </p>
+      </section>
     </div>
   );
 }

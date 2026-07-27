@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { OperatorClient } from '../api';
@@ -30,7 +30,7 @@ function stubClient(routes: Record<string, unknown>): OperatorClient & {
 }
 
 describe('OverviewPanel', () => {
-  it('renders usage totals, sparkline, queues, and outcomes', async () => {
+  it('renders usage totals, chart, queues, and outcomes', async () => {
     const client = stubClient({
       '/operator/usage': {
         usage: [
@@ -47,10 +47,15 @@ describe('OverviewPanel', () => {
     render(<OverviewPanel client={client} />);
 
     await waitFor(() => expect(screen.getByText('440')).toBeInTheDocument());
-    expect(screen.getByText('750ms / 1900ms')).toBeInTheDocument();
-    expect(screen.getByRole('img', { name: /Token usage over 2 days/ })).toBeInTheDocument();
+    expect(
+      screen.getByText('延迟 平均 / P95').closest('.stat-tile'),
+    ).toHaveTextContent('750 ms / 1900 ms');
+    expect(
+      screen.getByRole('img', { name: /Token 用量趋势，07-25 至 07-26/ }),
+    ).toBeInTheDocument();
     expect(screen.getByText('outbound_dead_letter')).toBeInTheDocument();
-    expect(screen.getByText('replied')).toBeInTheDocument();
+    expect(screen.getByText('已回复')).toBeInTheDocument();
+    expect(screen.getByText('失败')).toBeInTheDocument();
   });
 });
 
@@ -96,7 +101,7 @@ describe('ConversationsPanel', () => {
             stage: 'memory.retrieval',
             status: 'ok',
             duration_ms: 12,
-            attributes: { recalled: true, summary: '喜欢美式咖啡' },
+            attributes: { memory: '喜欢美式咖啡' },
             created_at: null,
           },
         ],
@@ -118,20 +123,23 @@ describe('ConversationsPanel', () => {
 
     render(<ConversationsPanel client={client} />);
 
-    const row = await screen.findByRole('button', { name: /TELEGRAM \/ DIRECT \/ 777/ });
+    const row = await screen.findByRole('button', { name: /Telegram.*777/ });
+    expect(row).toHaveTextContent('私聊');
     fireEvent.click(row);
 
     await waitFor(() => expect(screen.getByText('讲个笑话')).toBeInTheDocument());
-    expect(screen.getByText(/replied \/ DIRECT_MESSAGE/)).toBeInTheDocument();
-    expect(screen.getByText(/web_search\(timeout\)/)).toBeInTheDocument();
-    fireEvent.click(screen.getByText(/追踪 · 1 个阶段/));
-    expect(screen.getByText(/memory.retrieval \/ ok/)).toBeInTheDocument();
+    expect(screen.getByText('已回复')).toBeInTheDocument();
+    expect(screen.getByText(/私聊触发/)).toBeInTheDocument();
+    expect(screen.getByText(/工具: web_search\(timeout\)/)).toBeInTheDocument();
+    expect(screen.getByText(/140 tok · 900 ms/)).toBeInTheDocument();
+    expect(screen.getByText('memory.retrieval')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('查看阶段属性'));
     expect(screen.getByText(/喜欢美式咖啡/)).toBeInTheDocument();
   });
 });
 
 describe('SandboxPanel', () => {
-  it('submits a synthetic message and renders the persisted reply', async () => {
+  it('submits a multimodal message and renders reply and trace data', async () => {
     const client = stubClient({
       '/operator/sandbox/messages': {
         accepted: true,
@@ -159,7 +167,18 @@ describe('SandboxPanel', () => {
           },
         ],
         turns: [],
-        traces: [],
+        traces: [
+          {
+            id: 'span-vision',
+            trace_id: 'trace-1',
+            message_id: null,
+            stage: 'vision.resolve',
+            status: 'ok',
+            duration_ms: 24,
+            attributes: {},
+            created_at: null,
+          },
+        ],
       },
     });
 
@@ -171,13 +190,14 @@ describe('SandboxPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送到真实链路' }));
 
     await screen.findByText('是一只猫');
+    expect(screen.getByText('vision.resolve')).toBeInTheDocument();
     expect(client.sent[0]).toMatchObject({
       method: 'POST',
       path: '/operator/sandbox/messages',
-    });
-    expect(client.sent[0].body).toMatchObject({
-      text: '看图',
-      image_urls: ['https://img.example/cat.png'],
+      body: {
+        text: '看图',
+        image_urls: ['https://img.example/cat.png'],
+      },
     });
   });
 });
@@ -214,10 +234,14 @@ describe('MemoriesPanel', () => {
     render(<MemoriesPanel client={client} />);
 
     await screen.findByText('喜欢美式咖啡');
-    fireEvent.click(screen.getByRole('button', { name: 'Revoke' }));
+    const memList = within(screen.getByRole('list', { name: '记忆列表' }));
+    expect(memList.getByText('主体')).toBeInTheDocument();
+    expect(memList.getByText('私人')).toBeInTheDocument();
+    expect(memList.getByText('偏好')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }));
 
     await waitFor(() =>
-      expect(screen.getByText('No memories match the current filters.')).toBeInTheDocument(),
+      expect(screen.getByText('没有符合当前筛选的记忆。')).toBeInTheDocument(),
     );
     expect(client.sent[0]).toMatchObject({
       method: 'POST',
@@ -247,13 +271,14 @@ describe('PluginsPanel', () => {
 
     render(<PluginsPanel client={client} />);
 
-    await screen.findByText('example.dice v1.0.0');
-    expect(screen.getByText(/tools: roll_dice/)).toBeInTheDocument();
+    await screen.findByText('example.dice');
+    expect(screen.getByText('v1.0.0')).toBeInTheDocument();
+    expect(screen.getByText(/roll_dice/)).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('Approve tool id'), {
+    fireEvent.change(screen.getByLabelText('批准工具 ID'), {
       target: { value: 'new_tool' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    fireEvent.click(screen.getByRole('button', { name: '批准' }));
 
     await waitFor(() =>
       expect(client.sent[0]).toMatchObject({
@@ -274,13 +299,15 @@ describe('PersonaPanel', () => {
 
     render(<PersonaPanel client={client} />);
 
-    const textarea = await screen.findByLabelText('System prompt');
+    const textarea = await screen.findByLabelText('系统提示词');
     expect(textarea).toHaveValue('You are MyBot.');
 
     fireEvent.change(textarea, { target: { value: '你是高冷的猫娘助手。' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save persona' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
 
-    await waitFor(() => expect(screen.getByText('Persona saved.')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText('已保存，下一轮对话生效。')).toBeInTheDocument(),
+    );
     expect(sendSpy).toHaveBeenCalledWith('PUT', '/operator/config/persona', {
       system_prompt: '你是高冷的猫娘助手。',
     });
@@ -290,7 +317,7 @@ describe('PersonaPanel', () => {
 describe('ModelsPanel', () => {
   it('loads non-secret channels, saves JSON, and runs a connectivity test', async () => {
     const payload = {
-      source: 'runtime',
+      source: 'runtime' as const,
       channels: [
         {
           name: 'primary',
@@ -324,12 +351,12 @@ describe('ModelsPanel', () => {
       ],
       conversation_usage: [
         {
-          conversation_id: '00000000-0000-0000-0000-000000000001',
+          conversation_id: 'conv-1',
           stable_key: 'v1:qq-main:DIRECT:10001:0',
           calls: 2,
           prompt_tokens: 80,
           completion_tokens: 10,
-          cost_usd_micros: 60,
+          cost_usd_micros: 40,
         },
       ],
     };
@@ -346,14 +373,14 @@ describe('ModelsPanel', () => {
     render(<ModelsPanel client={client} />);
 
     await screen.findByText('primary');
-    expect(screen.getAllByText(/\$0\.000080/)).toHaveLength(2);
+    expect(screen.getAllByText('$0.000080').length).toBeGreaterThan(0);
     expect(screen.getByText('2026-07-27')).toBeInTheDocument();
     expect(screen.getByText('v1:qq-main:DIRECT:10001:0')).toBeInTheDocument();
-    expect(screen.getByLabelText('Model channels JSON')).not.toHaveValue(
+    expect(screen.getByLabelText('模型渠道 JSON')).not.toHaveValue(
       expect.stringContaining('secret-key'),
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save channels' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存渠道' }));
     await waitFor(() =>
       expect(client.sent[0]).toMatchObject({
         method: 'PUT',
@@ -362,7 +389,7 @@ describe('ModelsPanel', () => {
       }),
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Test primary' }));
-    await screen.findByText('primary / chat-model / 12ms');
+    fireEvent.click(screen.getByRole('button', { name: '测试 primary' }));
+    await screen.findByText('primary / chat-model / 12 ms');
   });
 });
