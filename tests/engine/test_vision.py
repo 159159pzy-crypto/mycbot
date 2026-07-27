@@ -4,7 +4,7 @@ import pytest
 
 from mybot.contracts import ChatKind, ImageSegment, MessageEnvelope, Platform, TextSegment
 from mybot.engine.vision import VisionMode, VisionService
-from mybot.infrastructure.llm import ImageContentPart, LlmError, LlmReply
+from mybot.infrastructure.llm import ImageContentPart, ImageUrl, LlmError, LlmReply
 
 
 class FakeVisionLlm:
@@ -21,6 +21,17 @@ class FakeVisionLlm:
             model="vision",
             prompt_tokens=12,
             completion_tokens=8,
+        )
+
+
+class TelegramImageResolver:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def resolve(self, segment: ImageSegment) -> ImageSegment:
+        self.urls.append(segment.url)
+        return segment.model_copy(
+            update={"url": "data:image/jpeg;base64,dGVsZWdyYW0taW1hZ2U="}
         )
 
 
@@ -66,6 +77,54 @@ async def test_direct_mode_preserves_image_part_without_extra_vision_call() -> N
     assert not llm.calls
     assert not isinstance(prepared.content, str)
     assert any(isinstance(part, ImageContentPart) for part in prepared.content)
+
+
+@pytest.mark.asyncio
+async def test_telegram_internal_image_is_resolved_before_direct_vision_call() -> None:
+    llm = FakeVisionLlm()
+    resolver = TelegramImageResolver()
+    envelope = image_envelope().model_copy(
+        update={
+            "platform": Platform.TELEGRAM,
+            "segments": (
+                TextSegment(text="这是什么"),
+                ImageSegment(url="tg-file://photo-1"),
+            ),
+        }
+    )
+    service = VisionService(
+        llm=llm,
+        mode=VisionMode.DIRECT,
+        image_resolver=resolver,
+    )
+
+    prepared = await service.prepare(envelope)
+
+    assert resolver.urls == ["tg-file://photo-1"]
+    assert envelope.segments[-1] == ImageSegment(url="tg-file://photo-1")
+    assert not isinstance(prepared.content, str)
+    image_parts = [part for part in prepared.content if isinstance(part, ImageContentPart)]
+    assert image_parts == [
+        ImageContentPart(
+            image_url=ImageUrl(url="data:image/jpeg;base64,dGVsZWdyYW0taW1hZ2U=")
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unresolved_telegram_image_degrades_without_leaking_file_id() -> None:
+    envelope = image_envelope().model_copy(
+        update={
+            "platform": Platform.TELEGRAM,
+            "segments": (ImageSegment(url="tg-file://sensitive-file-id"),),
+        }
+    )
+
+    prepared = await VisionService(llm=None, mode=VisionMode.DIRECT).prepare(envelope)
+
+    assert isinstance(prepared.content, str)
+    assert "tg-file://" not in prepared.content
+    assert "sensitive-file-id" not in prepared.content
 
 
 @pytest.mark.asyncio

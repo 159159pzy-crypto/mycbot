@@ -79,6 +79,8 @@ def test_llm_settings_default_to_a_disabled_agent_with_bounded_knobs() -> None:
     assert "MyBot" in settings.agent_system_prompt
     assert settings.vision_mode == "describe"
     assert settings.vision_max_description_chars >= 100
+    assert settings.vision_max_image_bytes == 10_000_000
+    assert settings.vision_image_download_timeout_seconds == 30.0
     assert settings.fallback_llm_failure == "语言模型暂时不可用, 请稍后再试。"
 
 

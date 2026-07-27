@@ -580,6 +580,17 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         return settings.model_secret(name)
 
     model_http = httpx.AsyncClient()
+    telegram_image_resolver = None
+    if settings.telegram_bot_token is not None:
+        from mybot.adapters.telegram.files import TelegramImageResolver
+
+        telegram_image_resolver = TelegramImageResolver(
+            token=settings.telegram_bot_token.get_secret_value(),
+            client=model_http,
+            api_base_url=settings.telegram_api_base_url,
+            max_bytes=settings.vision_max_image_bytes,
+            timeout_seconds=settings.vision_image_download_timeout_seconds,
+        )
     from redis.asyncio import Redis
 
     model_router = ModelRouter(
@@ -671,6 +682,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             llm=model_router.for_purpose(ModelPurpose.VISION),
             mode=VisionMode(settings.vision_mode),
             max_description_chars=settings.vision_max_description_chars,
+            image_resolver=telegram_image_resolver,
         ),
         not_configured_fallback=settings.fallback_not_configured,
         llm_failure_fallback=settings.fallback_llm_failure,

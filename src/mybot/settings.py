@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(default=2, ge=0, le=5)
     vision_mode: Literal["off", "describe", "direct"] = "describe"
     vision_max_description_chars: int = Field(default=2_000, ge=100, le=20_000)
+    vision_max_image_bytes: int = Field(default=10_000_000, ge=65_536, le=20_000_000)
+    vision_image_download_timeout_seconds: float = Field(default=30.0, gt=0.0, le=120.0)
     model_api_keys: SecretStr | None = None
     model_channel_cooldown_seconds: int = Field(default=60, ge=1, le=3_600)
     model_channels_cache_ttl_seconds: float = Field(default=30.0, ge=1.0, le=600.0)

@@ -41,6 +41,10 @@ chat channel itself accepts OpenAI `image_url` content parts; only then use
 `direct`. The channel configuration must expose a `vision` model purpose for
 descriptor mode. The five `MYBOT_FALLBACK_*` values are operator-controlled
 Chinese degraded-mode replies and contain no secrets.
+Telegram image resolution additionally uses `MYBOT_VISION_MAX_IMAGE_BYTES`
+(default 10 MB) and `MYBOT_VISION_IMAGE_DOWNLOAD_TIMEOUT_SECONDS` (default 30
+seconds). The agent worker therefore needs the same `MYBOT_TELEGRAM_BOT_TOKEN`
+as the gateway; the token is used only for Bot API `getFile`/download requests.
 
 ## 3. External NapCat (QQ only)
 

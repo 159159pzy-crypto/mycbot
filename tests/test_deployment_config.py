@@ -209,3 +209,16 @@ def test_dependency_timeout_defaults_are_exposed_to_operators() -> None:
         assert f"{name}: ${{{name}:-{value}}}" in app_environment
         assert f"{name}={value}" in environment
         assert name in readme
+
+
+def test_agent_worker_receives_telegram_image_resolution_settings() -> None:
+    compose = source("compose.yaml")
+    environment = source(".env.example")
+    worker = indented_block(compose, "  agent-worker:")
+
+    assert "MYBOT_TELEGRAM_BOT_TOKEN:" in worker
+    assert "MYBOT_TELEGRAM_API_BASE_URL:" in worker
+    assert "MYBOT_VISION_MAX_IMAGE_BYTES:" in worker
+    assert "MYBOT_VISION_IMAGE_DOWNLOAD_TIMEOUT_SECONDS:" in worker
+    assert "MYBOT_VISION_MAX_IMAGE_BYTES=10000000" in environment
+    assert "MYBOT_VISION_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=30" in environment
