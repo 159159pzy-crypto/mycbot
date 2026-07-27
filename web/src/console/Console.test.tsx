@@ -1,7 +1,10 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { OperatorConsole } from './OperatorConsole';
+import type { HealthState } from '../health/types';
+import { Console } from './Console';
+
+const loadingHealth: HealthState = { kind: 'loading' };
 
 const jsonResponse = (payload: unknown, status = 200) =>
   Promise.resolve({
@@ -10,7 +13,7 @@ const jsonResponse = (payload: unknown, status = 200) =>
     json: async () => payload,
   } as Response);
 
-describe('OperatorConsole', () => {
+describe('Console', () => {
   const fetchMock = vi.fn<typeof fetch>();
 
   beforeEach(() => {
@@ -23,20 +26,33 @@ describe('OperatorConsole', () => {
   });
 
   function unlock(token = 's3cret') {
-    fireEvent.change(screen.getByLabelText('Operator token'), {
+    fireEvent.change(screen.getByLabelText('操作员令牌'), {
       target: { value: token },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Unlock console' }));
+    fireEvent.click(screen.getByRole('button', { name: '解锁控制台' }));
   }
 
   it('renders the token gate and performs no fetch before unlocking', () => {
-    render(<OperatorConsole />);
+    render(<Console health={loadingHealth} />);
 
-    expect(screen.getByLabelText('Operator token')).toBeInTheDocument();
+    expect(screen.getByLabelText('操作员令牌')).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('unlocking loads the overview with the bearer token attached', async () => {
+  it('unlocking opens the status view without operator fetches', () => {
+    render(<Console health={loadingHealth} />);
+    unlock();
+
+    expect(
+      screen.getByRole('heading', { level: 1, name: '系统状态' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '记忆' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '沙盒' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '模型' })).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('navigating to the overview loads it with the bearer token attached', async () => {
     fetchMock.mockImplementation((input) => {
       const url = String(input);
       if (url.includes('/operator/usage')) {
@@ -48,49 +64,41 @@ describe('OperatorConsole', () => {
       });
     });
 
-    render(<OperatorConsole />);
+    render(<Console health={loadingHealth} />);
     unlock();
+    fireEvent.click(screen.getByRole('button', { name: '数据总览' }));
 
     await waitFor(() => expect(screen.getByText('420')).toBeInTheDocument());
     const requests = fetchMock.mock.calls.map(([input, init]) => ({
       url: String(input),
       auth: new Headers((init as RequestInit).headers).get('Authorization'),
     }));
+    expect(requests.length).toBeGreaterThan(0);
     expect(requests.every((request) => request.auth === 'Bearer s3cret')).toBe(true);
-    expect(screen.getByRole('button', { name: 'Memories' })).toBeInTheDocument();
   });
 
   it('a rejected token drops back to the gate with a notice', async () => {
     fetchMock.mockImplementation(() => jsonResponse({ detail: 'nope' }, 401));
 
-    render(<OperatorConsole />);
+    render(<Console health={loadingHealth} />);
     unlock('wrong');
+    fireEvent.click(screen.getByRole('button', { name: '数据总览' }));
 
     await waitFor(() =>
       expect(
-        screen.getByText('The operator token was rejected. Enter it again.'),
+        screen.getByText('操作员令牌被拒绝，请重新输入。'),
       ).toBeInTheDocument(),
     );
-    expect(screen.getByLabelText('Operator token')).toBeInTheDocument();
+    expect(screen.getByLabelText('操作员令牌')).toBeInTheDocument();
   });
 
-  it('locking returns to the gate without fetching further', async () => {
-    fetchMock.mockImplementation(() =>
-      jsonResponse({
-        usage: [],
-        turns: { by_outcome: {}, avg_latency_ms: 0, p95_latency_ms: 0 },
-        queues: {},
-      }),
-    );
-
-    render(<OperatorConsole />);
+  it('locking returns to the gate without fetching further', () => {
+    render(<Console health={loadingHealth} />);
     unlock();
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Lock' })).toBeInTheDocument(),
-    );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Lock' }));
+    fireEvent.click(screen.getByRole('button', { name: '锁定控制台' }));
 
-    expect(screen.getByLabelText('Operator token')).toBeInTheDocument();
+    expect(screen.getByLabelText('操作员令牌')).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

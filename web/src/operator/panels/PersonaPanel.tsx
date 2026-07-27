@@ -37,42 +37,69 @@ export function PersonaPanel({ client }: { client: OperatorClient }) {
     }
   };
 
-  if (error && text === null) return <p className="op-error">{error}</p>;
-  if (text === null) return <p className="op-empty">Loading persona…</p>;
+  if (error && text === null) {
+    return (
+      <section className="card view-enter">
+        <p className="panel-error" role="alert">
+          {error}
+        </p>
+      </section>
+    );
+  }
+  if (text === null) {
+    return (
+      <section className="card view-enter">
+        <p className="panel-empty">正在加载人设…</p>
+      </section>
+    );
+  }
 
   return (
-    <div className="op-persona">
-      <p className="op-hint">
-        The agent's system prompt. Saving writes the runtime override; workers pick it
-        up on their next turn without a restart.
-      </p>
-      <label>
-        System prompt
+    <div className="persona-view view-enter">
+      <section className="card persona-card">
+        <div className="card-heading card-heading--stacked">
+          <h2>系统提示词</h2>
+          <small>
+            智能体的系统提示词。保存后写入运行时覆盖，工作进程在下一轮对话自动生效，无需重启。
+          </small>
+        </div>
         <textarea
+          rows={9}
           value={text}
-          rows={8}
+          aria-label="系统提示词"
           onChange={(event) => {
             setText(event.target.value);
             setSaved(false);
           }}
         />
-      </label>
-      <div className="op-inline-form">
-        <button type="button" onClick={() => void save()}>
-          Save persona
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            setText(defaultPrompt);
-            setSaved(false);
-          }}
-        >
-          Reset to default
-        </button>
-      </div>
-      {saved && <p className="op-hint">Persona saved.</p>}
-      {error && <p className="op-error">{error}</p>}
+        <div className="persona-actions">
+          <button
+            type="button"
+            className="pill-button pill-button--primary"
+            onClick={() => void save()}
+          >
+            保存人设
+          </button>
+          <button
+            type="button"
+            className="pill-button pill-button--neutral"
+            onClick={() => {
+              setText(defaultPrompt);
+              setSaved(false);
+            }}
+          >
+            恢复默认
+          </button>
+          <span className="panel-saved" role="status">
+            {saved ? '已保存，下一轮对话生效。' : ''}
+          </span>
+        </div>
+        {error && (
+          <p className="panel-error" role="alert">
+            {error}
+          </p>
+        )}
+      </section>
     </div>
   );
 }

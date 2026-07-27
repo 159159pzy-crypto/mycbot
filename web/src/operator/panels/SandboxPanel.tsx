@@ -1,6 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 
 import type { OperatorClient, SandboxSessionView } from '../api';
+import { TraceTimeline } from '../components/TraceTimeline';
+import { outcomeMeta, triggerLabel } from '../labels';
 
 function newSessionId() {
   return `sandbox-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -76,45 +78,112 @@ export function SandboxPanel({ client }: { client: OperatorClient }) {
   };
 
   return (
-    <div className="op-sandbox">
-      <div className="op-sandbox__bar">
-        <div>
-          <h3>WebChat 沙盒</h3>
-          <p className="op-hint">会走真实 Streams 与 Agent 流程，但不会写入记忆或主动消息策略。</p>
+    <div className="sandbox-view view-enter">
+      <section className="card sandbox-session-card">
+        <div className="sandbox-session-heading">
+          <div>
+            <span className="tone-chip" data-tone={waiting ? 'orange' : session.status === 'ready' ? 'green' : 'gray'}>
+              {waiting ? '处理中' : session.status === 'ready' ? '链路就绪' : '等待消息'}
+            </span>
+            <h2>WebChat 多模态沙盒</h2>
+            <p>消息会经过真实 Streams、Agent、模型路由和出站链路，但不会写入长期记忆或触发主动消息。</p>
+          </div>
+          <button type="button" className="pill-button pill-button--neutral" onClick={reset}>
+            新建会话
+          </button>
         </div>
-        <button type="button" onClick={reset}>新会话</button>
+        <code className="sandbox-session-id">{sessionId}</code>
+      </section>
+
+      <div className="sandbox-grid">
+        <section className="card sandbox-transcript-card" aria-label="沙盒消息记录">
+          <div className="card-heading">
+            <h2>消息记录</h2>
+            <small>{session.messages?.length ?? 0} 条</small>
+          </div>
+          {(session.messages?.length ?? 0) === 0 ? (
+            <p className="panel-empty">发送文本或图片 URL 后，真实链路的回复会显示在这里。</p>
+          ) : (
+            <div className="transcript">
+              {session.messages?.map((message, index) => {
+                const outbound = message.direction === 'outbound';
+                return (
+                  <div
+                    key={`${message.trace_id ?? index}-${index}`}
+                    className="transcript-row"
+                    data-direction={outbound ? 'out' : 'in'}
+                  >
+                    <div className="transcript-group">
+                      <small>{outbound ? 'bot' : 'operator'}</small>
+                      <div className="bubble">{message.text || '[富媒体消息]'}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {waiting && <p className="sandbox-progress">正在经过消息队列、Agent 与出站链路…</p>}
+          {error && <p className="panel-error" role="alert">{error}</p>}
+        </section>
+
+        <section className="card sandbox-turn-card" aria-label="沙盒轮次">
+          <div className="card-heading">
+            <h2>轮次结果</h2>
+            <small>{session.turns?.length ?? 0} 轮</small>
+          </div>
+          {(session.turns?.length ?? 0) === 0 ? (
+            <p className="panel-empty">完成一次回复后显示模型、触发方式、Token 与延迟。</p>
+          ) : (
+            <ul className="turn-list">
+              {session.turns?.map((turn) => {
+                const meta = outcomeMeta(turn.outcome);
+                return (
+                  <li key={turn.id}>
+                    <span className="tone-chip" data-tone={meta.tone}>{meta.label}</span>
+                    <span className="turn-trigger">{triggerLabel(turn.trigger)} · {turn.model ?? '无模型'}</span>
+                    <span className="turn-meta">
+                      {turn.prompt_tokens + turn.completion_tokens} tok · {turn.latency_ms} ms
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
       </div>
-      <code className="op-session-id">{sessionId}</code>
-      <ul className="op-transcript" aria-label="Sandbox transcript">
-        {(session.messages ?? []).map((message, index) => (
-          <li key={`${message.trace_id ?? index}-${index}`} data-direction={message.direction}>
-            <code>{message.direction === 'inbound' ? 'operator' : 'bot'}</code>
-            <span>{message.text || '[富媒体消息]'}</span>
-          </li>
-        ))}
-      </ul>
-      {waiting && <p className="op-hint">正在经过消息队列、Agent 和出站链路…</p>}
-      {error && <p className="op-error">{error}</p>}
-      <form className="op-sandbox__composer" onSubmit={(event) => void submit(event)}>
-        <label>
-          消息
-          <textarea
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            placeholder="输入要测试的消息"
-          />
-        </label>
-        <label>
-          图片 URL（可选）
-          <input
-            type="url"
-            value={imageUrl}
-            onChange={(event) => setImageUrl(event.target.value)}
-            placeholder="https://…"
-          />
-        </label>
-        <button type="submit" disabled={waiting || (!text.trim() && !imageUrl.trim())}>
-          发送到真实链路
+
+      <TraceTimeline traces={session.traces ?? []} title="沙盒链路追踪" />
+
+      <form className="card sandbox-composer" onSubmit={(event) => void submit(event)}>
+        <div className="card-heading card-heading--stacked">
+          <h2>发送测试消息</h2>
+          <small>可单独发送文本或图片，也可以同时发送以验证视觉模型链路。</small>
+        </div>
+        <div className="sandbox-fields">
+          <label>
+            消息
+            <textarea
+              value={text}
+              onChange={(event) => setText(event.target.value)}
+              placeholder="输入要测试的消息"
+            />
+          </label>
+          <label>
+            图片 URL（可选）
+            <input
+              type="url"
+              value={imageUrl}
+              onChange={(event) => setImageUrl(event.target.value)}
+              placeholder="https://…"
+            />
+          </label>
+        </div>
+        <button
+          type="submit"
+          className="pill-button pill-button--primary sandbox-submit"
+          disabled={waiting || (!text.trim() && !imageUrl.trim())}
+        >
+          {waiting ? '正在发送…' : '发送到真实链路'}
         </button>
       </form>
     </div>
