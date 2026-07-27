@@ -92,7 +92,10 @@ def envelope_prompt(envelope: MessageEnvelope, *, include_images: bool) -> Envel
                     ImageContentPart(image_url=ImageUrl(url=segment.url))
                 )
             else:
-                pending_text.append(f"[图片: {label}; 引用: {segment.url}]")
+                reference = (
+                    "Telegram 图片" if segment.url.startswith("tg-file://") else segment.url
+                )
+                pending_text.append(f"[图片: {label}; 引用: {reference}]")
         else:
             readable = _segment_reference(segment)
             if readable:

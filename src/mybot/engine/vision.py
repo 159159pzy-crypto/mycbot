@@ -9,6 +9,7 @@ from typing import Protocol
 import structlog
 
 from mybot.contracts import ImageSegment, MessageEnvelope
+from mybot.contracts.messages import MessageSegment
 from mybot.engine.prompt import EnvelopePrompt, envelope_prompt
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply
 
@@ -35,18 +36,26 @@ class VisionLlm(Protocol):
     ) -> LlmReply: ...
 
 
+class ImageResolver(Protocol):
+    async def resolve(self, segment: ImageSegment) -> ImageSegment: ...
+
+
 @dataclass(slots=True)
 class VisionService:
     llm: VisionLlm | None
     mode: VisionMode = VisionMode.DESCRIBE
     max_description_chars: int = 2_000
+    image_resolver: ImageResolver | None = None
 
     async def prepare(self, envelope: MessageEnvelope) -> EnvelopePrompt:
         has_images = any(isinstance(segment, ImageSegment) for segment in envelope.segments)
         if not has_images or self.mode is VisionMode.OFF:
             return envelope_prompt(envelope, include_images=False)
 
-        multimodal = envelope_prompt(envelope, include_images=True)
+        resolved = await self._resolve_images(envelope)
+        if resolved is None:
+            return self._fallback(envelope)
+        multimodal = envelope_prompt(resolved, include_images=True)
         if self.mode is VisionMode.DIRECT:
             return multimodal
         if self.llm is None:
@@ -72,6 +81,35 @@ class VisionService:
             return self._fallback(envelope)
         summary = f"{multimodal.summary}\n图片理解: {description}"
         return EnvelopePrompt(summary=summary, content=summary)
+
+    async def _resolve_images(self, envelope: MessageEnvelope) -> MessageEnvelope | None:
+        images = [
+            segment for segment in envelope.segments if isinstance(segment, ImageSegment)
+        ]
+        if not any(segment.url.startswith("tg-file://") for segment in images):
+            return envelope
+        if self.image_resolver is None:
+            logger.warning(
+                "vision_image_resolution_failed",
+                error_code="resolver_not_configured",
+            )
+            return None
+        try:
+            resolved_segments: list[MessageSegment] = []
+            for segment in envelope.segments:
+                if isinstance(segment, ImageSegment):
+                    resolved_segments.append(await self.image_resolver.resolve(segment))
+                else:
+                    resolved_segments.append(segment)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "vision_image_resolution_failed",
+                error_code=getattr(error, "code", type(error).__name__),
+            )
+            return None
+        return envelope.model_copy(update={"segments": tuple(resolved_segments)})
 
     @staticmethod
     def _fallback(envelope: MessageEnvelope) -> EnvelopePrompt:

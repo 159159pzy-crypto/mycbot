@@ -208,6 +208,11 @@ missing stage.
 - `vision.prepare` degraded: test the `vision` purpose in Models, then inspect
   `llm_call_log` for its stable status/error code. Raw upstream bodies and image
   URLs are deliberately absent from trace errors.
+- Telegram-only degradation: confirm the agent worker has
+  `MYBOT_TELEGRAM_BOT_TOKEN`, can reach `MYBOT_TELEGRAM_API_BASE_URL`, and that
+  the image is below `MYBOT_VISION_MAX_IMAGE_BYTES`. The stored `tg-file://`
+  reference is expected; a token-bearing download URL must never appear in the
+  database or logs.
 - `outbound.publish` exists but `outbound.delivery` does not: inspect the
   gateway consumer and `mybot:outbound` pending/dead-letter state. Sandbox uses
   the in-process virtual sender, so this isolates queue/gateway failures from

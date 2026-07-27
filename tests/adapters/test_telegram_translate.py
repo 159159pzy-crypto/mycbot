@@ -161,6 +161,23 @@ def test_document_maps_to_file_segment() -> None:
     )
 
 
+def test_image_document_maps_to_image_segment_for_vision() -> None:
+    message = telegram_private_message(
+        text=None,
+        document={
+            "file_id": "image-doc-1",
+            "file_name": "original.png",
+            "mime_type": "image/png",
+        },
+    )
+
+    segments = translate(telegram_update(message)).envelope.segments
+
+    assert segments == (
+        ImageSegment(url="tg-file://image-doc-1", alt_text="original.png"),
+    )
+
+
 def test_service_message_returns_none() -> None:
     message = telegram_private_message(text=None, new_chat_members=[telegram_user(user_id=1)])
     update = telegram_update(message)

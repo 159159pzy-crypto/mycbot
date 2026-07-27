@@ -118,13 +118,20 @@ def translate_telegram_update(
     if document is not None:
         file_id = get_str(document, "file_id")
         if file_id:
-            segments.append(
-                FileSegment(
-                    name=get_str(document, "file_name") or "file",
-                    url=f"tg-file://{file_id}",
-                    mime_type=get_str(document, "mime_type"),
+            file_name = get_str(document, "file_name") or "file"
+            mime_type = get_str(document, "mime_type")
+            if mime_type is not None and mime_type.casefold().startswith("image/"):
+                segments.append(
+                    ImageSegment(url=f"tg-file://{file_id}", alt_text=file_name)
                 )
-            )
+            else:
+                segments.append(
+                    FileSegment(
+                        name=file_name,
+                        url=f"tg-file://{file_id}",
+                        mime_type=mime_type,
+                    )
+                )
 
     sticker = get_mapping(message, "sticker")
     if sticker is not None:

@@ -482,6 +482,13 @@ readable image reference without making a vision call. A vision failure never
 drops the turn: it degrades to the configured Chinese reference text. ASR/TTS
 and video understanding remain outside M2.
 
+Telegram photos and image documents retain a secret-free `tg-file://` reference
+in Streams and PostgreSQL. Immediately before a vision request, the agent uses
+the configured bot token to call `getFile`, downloads the image with bounded
+size/time limits, and sends a temporary `data:image/...;base64` part to the
+model. Bot tokens and token-bearing Telegram download URLs are never persisted
+or included in trace attributes.
+
 The authenticated console now has a **Sandbox** tab. A submitted text and
 optional HTTP(S) image URL becomes a normal `InboundEvent` on `mybot:ingest`,
 is consumed by the production agent worker, and leaves through the normal
