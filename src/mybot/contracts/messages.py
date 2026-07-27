@@ -3,6 +3,7 @@
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from pydantic import Field, field_validator
 
@@ -13,6 +14,7 @@ from mybot.contracts.json import FrozenJsonValueField
 class Platform(StrEnum):
     QQ = "QQ"
     TELEGRAM = "TELEGRAM"
+    SANDBOX = "SANDBOX"
 
 
 class ChatKind(StrEnum):
@@ -45,8 +47,35 @@ class ReferenceSegment(FrozenModel):
     label: NonEmptyStr | None = None
 
 
+class AtSegment(FrozenModel):
+    type: Literal["at"] = "at"
+    target_id: NonEmptyStr
+    display_name: NonEmptyStr | None = None
+
+
+class StickerSegment(FrozenModel):
+    type: Literal["sticker"] = "sticker"
+    id: NonEmptyStr
+    name: NonEmptyStr | None = None
+
+
+class VoiceSegment(FrozenModel):
+    type: Literal["voice"] = "voice"
+    url: NonEmptyStr
+    mime_type: NonEmptyStr | None = None
+    duration_ms: int | None = Field(default=None, ge=0, le=86_400_000)
+
+
 MessageSegment = Annotated[
-    TextSegment | ImageSegment | FileSegment | ReferenceSegment,
+    (
+        TextSegment
+        | ImageSegment
+        | FileSegment
+        | ReferenceSegment
+        | AtSegment
+        | StickerSegment
+        | VoiceSegment
+    ),
     Field(discriminator="type"),
 ]
 
@@ -63,6 +92,8 @@ class MessageEnvelope(FrozenModel):
     segments: Annotated[tuple[MessageSegment, ...], Field(min_length=1)]
     reply_to_message_id: NonEmptyStr | None = None
     raw_ref: FrozenJsonValueField | None = None
+    trace_id: NonEmptyStr = Field(default_factory=lambda: str(uuid4()))
+    ephemeral: bool = False
 
     @field_validator("occurred_at")
     @classmethod
@@ -80,3 +111,7 @@ class PlatformCapabilities(FrozenModel):
     combined_media_text: bool = False
     threads: bool = False
     reactions: bool = False
+    images: bool = False
+    mentions: bool = False
+    stickers: bool = False
+    voice_messages: bool = False

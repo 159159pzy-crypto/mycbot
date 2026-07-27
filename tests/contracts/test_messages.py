@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
+from uuid import UUID
 
 import pytest
 from hypothesis import given
@@ -7,6 +8,7 @@ from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from mybot.contracts import (
+    AtSegment,
     ChatKind,
     ConversationKey,
     FileSegment,
@@ -15,7 +17,10 @@ from mybot.contracts import (
     Platform,
     PlatformCapabilities,
     ReferenceSegment,
+    ReplyPlan,
+    StickerSegment,
     TextSegment,
+    VoiceSegment,
 )
 
 
@@ -33,6 +38,13 @@ def test_message_envelope_is_immutable_and_preserves_typed_segments() -> None:
             ImageSegment(url="https://cdn.example/image.png", alt_text="diagram"),
             FileSegment(name="notes.txt", url="https://cdn.example/notes.txt"),
             ReferenceSegment(message_id="message-41", label="previous context"),
+            AtSegment(target_id="qq:10001", display_name="Alice"),
+            StickerSegment(id="14", name="smile"),
+            VoiceSegment(
+                url="https://cdn.example/voice.ogg",
+                mime_type="audio/ogg",
+                duration_ms=1_250,
+            ),
         ),
         raw_ref={"event_id": 99},
     )
@@ -42,9 +54,30 @@ def test_message_envelope_is_immutable_and_preserves_typed_segments() -> None:
         "image",
         "file",
         "reference",
+        "at",
+        "sticker",
+        "voice",
     )
     with pytest.raises(ValidationError):
         envelope.chat_id = "different"  # type: ignore[misc]
+
+
+def test_envelope_additively_generates_trace_and_supports_ephemeral_sandbox() -> None:
+    envelope = MessageEnvelope(
+        id="sandbox:local:message-1",
+        connection_id="sandbox",
+        platform=Platform.SANDBOX,
+        chat_kind=ChatKind.DIRECT,
+        chat_id="session-1",
+        sender_identity_id="sandbox:operator",
+        occurred_at=datetime.now(tz=UTC),
+        segments=(TextSegment(text="测试"),),
+        ephemeral=True,
+    )
+
+    assert UUID(envelope.trace_id)
+    assert envelope.ephemeral is True
+    assert MessageEnvelope.model_validate_json(envelope.model_dump_json()) == envelope
 
 
 def test_message_raw_reference_is_deeply_immutable_and_json_serializable() -> None:
@@ -122,7 +155,40 @@ def test_platform_capabilities_default_to_denied() -> None:
         "combined_media_text": False,
         "threads": False,
         "reactions": False,
+        "images": False,
+        "mentions": False,
+        "stickers": False,
+        "voice_messages": False,
     }
+
+
+def test_reply_plan_additively_carries_supported_media_segments() -> None:
+    plan = ReplyPlan(
+        text_segments=("看看这个",),
+        media_segments=(
+            ImageSegment(url="https://cdn.example/cat.png", alt_text="cat"),
+            StickerSegment(id="sticker-1", name="wave"),
+            VoiceSegment(url="tg-file://voice-1", duration_ms=900),
+        ),
+    )
+
+    restored = ReplyPlan.model_validate(plan.model_dump(mode="json"))
+
+    assert restored == plan
+    assert [segment.type for segment in restored.media_segments] == [
+        "image",
+        "sticker",
+        "voice",
+    ]
+
+
+def test_new_segments_keep_strict_validation() -> None:
+    with pytest.raises(ValidationError):
+        AtSegment(target_id="")
+    with pytest.raises(ValidationError):
+        StickerSegment(id="")
+    with pytest.raises(ValidationError):
+        VoiceSegment(url="voice", duration_ms=-1)
 
 
 @given(

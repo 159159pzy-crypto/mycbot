@@ -1,0 +1,13 @@
+{
+  "time": 1784000001,
+  "self_id": 10000,
+  "post_type": "message",
+  "message_type": "private",
+  "sub_type": "friend",
+  "message_id": 7002,
+  "user_id": 10002,
+  "message": [{"type": "text", "data": {"text": "hello from spare endpoint"}}],
+  "raw_message": "hello from spare endpoint",
+  "font": 0,
+  "sender": {"user_id": 10002, "nickname": "bob"}
+}

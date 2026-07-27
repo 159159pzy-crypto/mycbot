@@ -115,8 +115,9 @@ The outbound equivalents are `mybot:seen:outbound:<key>` and
   memory only, so a reload already forgot the old one). Rotate on any
   suspicion of exposure and whenever an operator leaves.
 - **LLM / embedding keys** (`MYBOT_LLM_API_KEY`,
-  `MYBOT_EMBEDDING_API_KEY`): issue the new key at the provider, update
-  `.env`, then `docker compose up -d agent-worker maintenance-worker`,
+  `MYBOT_EMBEDDING_API_KEY`, `MYBOT_MODEL_API_KEYS`): issue the new key at
+  the provider, update `.env`, then `docker compose up -d api agent-worker
+  maintenance-worker`,
   and revoke the old key at the provider afterwards.
 - **Telegram bot token** (`MYBOT_TELEGRAM_BOT_TOKEN`): revoke via
   BotFather (`/revoke`), which invalidates the old token instantly;
@@ -126,7 +127,8 @@ The outbound equivalents are `mybot:seen:outbound:<key>` and
   `docker compose up -d gateway`.
 
 After any rotation, confirm recovery: `/health/ready`, one test message
-per platform, and no auth errors in `docker compose logs gateway`.
+per platform, the Models panel connectivity test, and no auth errors in
+`docker compose logs gateway agent-worker`.
 
 ## 6. Memory hygiene
 
@@ -189,3 +191,31 @@ cleanup afterwards. Token spend has its own ceilings
 (`MYBOT_AGENT_DAILY_TOKEN_CEILING`,
 `MYBOT_AGENT_CONVERSATION_DAILY_TOKEN_CEILING`); a crossed ceiling
 degrades to a deterministic budget notice, visible in the turns record.
+
+## 9. Multimodal and sandbox trace triage
+
+Use the console Sandbox before reproducing a problem on QQ or Telegram. Submit
+the same text and image URL, wait for the reply, then expand **追踪** in the
+conversation detail. Expected stage order is broadly: `ingest.persist`,
+`turn.decision`, `vision.prepare`, `memory.retrieval`, one or more
+`llm.complete`/`tool.call` spans, `moderation.outbound`, `outbound.publish`, and
+`outbound.delivery`. Disabled memory/moderation appears as `skipped`, not as a
+missing stage.
+
+- `vision.prepare` succeeded but the answer ignored the image: confirm the
+  selected channel/model really supports image input and that
+  `MYBOT_VISION_MODE` matches it (`describe` versus `direct`).
+- `vision.prepare` degraded: test the `vision` purpose in Models, then inspect
+  `llm_call_log` for its stable status/error code. Raw upstream bodies and image
+  URLs are deliberately absent from trace errors.
+- `outbound.publish` exists but `outbound.delivery` does not: inspect the
+  gateway consumer and `mybot:outbound` pending/dead-letter state. Sandbox uses
+  the in-process virtual sender, so this isolates queue/gateway failures from
+  QQ/TG credentials.
+- Sandbox created memories or received proactive messages: treat this as a
+  policy regression. The conversation row must have `ephemeral=true`; stop the
+  affected worker and run the focused ephemeral tests before resuming.
+
+Trace rows are operational data in PostgreSQL and therefore included in normal
+backups. Attributes are bounded, but recalled memory excerpts can still be
+sensitive; protect the operator bearer token and database backups accordingly.

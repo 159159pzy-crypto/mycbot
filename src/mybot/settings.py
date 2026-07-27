@@ -24,14 +24,13 @@ class Settings(BaseSettings):
     database_read_timeout_seconds: float = Field(default=3.0, gt=0.0, le=30.0)
     redis_connect_timeout_seconds: float = Field(default=2.0, gt=0.0, le=30.0)
     redis_read_timeout_seconds: float = Field(default=2.0, gt=0.0, le=30.0)
-    database_url: SecretStr = SecretStr(
-        "postgresql+psycopg://mybot:mybot@127.0.0.1:5432/mybot"
-    )
+    database_url: SecretStr = SecretStr("postgresql+psycopg://mybot:mybot@127.0.0.1:5432/mybot")
     redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
     ingest_stream: str = "mybot:ingest"
     outbound_stream: str = "mybot:outbound"
     ingest_group: str = "agent-workers"
     outbound_group: str = "gateway"
+    sandbox_connection_id: str = "sandbox"
     stream_maxlen: int = Field(default=10_000, ge=100, le=1_000_000)
     stream_delivery_max_attempts: int = Field(default=5, ge=1, le=100)
     stream_dedupe_ttl_seconds: int = Field(default=3_600, ge=60, le=604_800)
@@ -48,6 +47,11 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = Field(default=1_024, ge=1, le=32_768)
     llm_timeout_seconds: float = Field(default=60.0, gt=0.0, le=300.0)
     llm_max_retries: int = Field(default=2, ge=0, le=5)
+    vision_mode: Literal["off", "describe", "direct"] = "describe"
+    vision_max_description_chars: int = Field(default=2_000, ge=100, le=20_000)
+    model_api_keys: SecretStr | None = None
+    model_channel_cooldown_seconds: int = Field(default=60, ge=1, le=3_600)
+    model_channels_cache_ttl_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
     agent_system_prompt: str = (
         "You are MyBot, a helpful, concise assistant chatting on QQ and Telegram. "
         "Answer in the language the user writes in."
@@ -55,9 +59,12 @@ class Settings(BaseSettings):
     agent_history_max_messages: int = Field(default=40, ge=1, le=500)
     agent_history_token_budget: int = Field(default=6_000, ge=256, le=200_000)
     agent_daily_token_ceiling: int = Field(default=200_000, ge=0, le=100_000_000)
-    agent_conversation_daily_token_ceiling: int = Field(
-        default=20_000, ge=0, le=100_000_000
-    )
+    agent_conversation_daily_token_ceiling: int = Field(default=20_000, ge=0, le=100_000_000)
+    fallback_not_configured: str = "语言模型尚未配置, 请管理员先完成模型渠道设置。"
+    fallback_llm_failure: str = "语言模型暂时不可用, 请稍后再试。"
+    fallback_budget_exceeded: str = "本会话今天的 token 预算已用完, 明天再继续聊吧。"
+    fallback_empty_reply: str = "抱歉, 这次没能组织好回复, 请稍后再试。"
+    fallback_moderation: str = "回复触发了内容策略, 已停止发送。"
     embedding_base_url: str | None = None
     embedding_api_key: SecretStr | None = None
     embedding_model: str = "text-embedding-3-small"
@@ -79,9 +86,7 @@ class Settings(BaseSettings):
     proactive_min_interval_hours: float = Field(default=24.0, ge=1.0, le=720.0)
     proactive_quiet_start_hour: int = Field(default=22, ge=0, le=23)
     proactive_quiet_end_hour: int = Field(default=8, ge=0, le=23)
-    proactive_message: str = (
-        "It's been quiet here for a while — anything I can help with?"
-    )
+    proactive_message: str = "最近有点安静, 有什么想聊或需要我帮忙的吗?"
     operator_token: SecretStr | None = None
     operator_auth_max_failures: int = Field(default=10, ge=1, le=1_000)
     operator_auth_window_seconds: float = Field(default=60.0, ge=1.0, le=3_600.0)
@@ -127,6 +132,29 @@ class Settings(BaseSettings):
                     str(capability) for capability in cast(list[object], capabilities)
                 )
         return grants
+
+    def model_secret(self, name: str) -> str | None:
+        """Resolve a channel key from env-backed secret settings only."""
+
+        import json
+        import os
+        from typing import cast
+
+        if name == "MYBOT_LLM_API_KEY" and self.llm_api_key is not None:
+            return self.llm_api_key.get_secret_value()
+        if name == "MYBOT_EMBEDDING_API_KEY" and self.embedding_api_key is not None:
+            return self.embedding_api_key.get_secret_value()
+        if self.model_api_keys is not None:
+            try:
+                decoded = json.loads(self.model_api_keys.get_secret_value())
+            except ValueError:
+                decoded = {}
+            if isinstance(decoded, dict):
+                value = cast(dict[object, object], decoded).get(name)
+                if isinstance(value, str) and value:
+                    return value
+        return os.environ.get(name)
+
     qq_connection_id: str = "qq-main"
     telegram_connection_id: str = "telegram-main"
     telegram_api_base_url: str = "https://api.telegram.org"
@@ -140,6 +168,7 @@ class Settings(BaseSettings):
         "qq_access_token",
         "napcat_ws_url",
         "llm_api_key",
+        "model_api_keys",
         "llm_base_url",
         "embedding_api_key",
         "embedding_base_url",

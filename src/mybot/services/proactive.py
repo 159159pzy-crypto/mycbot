@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 from pydantic import JsonValue
@@ -41,6 +41,7 @@ class OutboundStore(Protocol):
         plan: ReplyPlan,
         *,
         occurred_at: datetime | None = None,
+        trace_id: str | None = None,
     ) -> UUID: ...
 
 
@@ -93,7 +94,7 @@ class ProactivePass:
     outbound: Publisher
     once: OnceBackend
     enabled: bool = False
-    message: str = "It's been quiet here for a while — anything I can help with?"
+    message: str = "最近有点安静, 有什么想聊或需要我帮忙的吗?"
     min_interval_hours: float = 24.0
     quiet_start_hour: int = 22
     quiet_end_hour: int = 8
@@ -120,6 +121,9 @@ class ProactivePass:
             if detail is None:
                 logger.warning("proactive_conversation_missing", stable_key=stable_key)
                 continue
+            if detail.ephemeral:
+                logger.info("proactive_ephemeral_skipped", stable_key=stable_key)
+                continue
             due = await self.once.acquire_once(
                 f"{self.key_prefix}:{stable_key}",
                 ttl_seconds=max(60, int(self.min_interval_hours * 3600)),
@@ -134,17 +138,20 @@ class ProactivePass:
 
     async def _send(self, detail: ConversationDetail) -> None:
         plan = ReplyPlan(text_segments=(self.message,))
-        outbound_id = await self.messages.record_outbound(detail.id, plan)
-        await self.outbound.publish(
-            OutboundMessage(
-                internal_message_id=outbound_id,
-                platform=Platform(detail.platform),
-                connection_id=detail.connection_id,
-                chat_kind=ChatKind(detail.chat_kind),
-                chat_id=detail.chat_id,
-                reply_plan=plan,
-            ).model_dump_json()
+        trace_id = str(uuid4())
+        outbound_id = await self.messages.record_outbound(
+            detail.id, plan, trace_id=trace_id
         )
+        message = OutboundMessage(
+            internal_message_id=outbound_id,
+            platform=Platform(detail.platform),
+            connection_id=detail.connection_id,
+            chat_kind=ChatKind(detail.chat_kind),
+            chat_id=detail.chat_id,
+            reply_plan=plan,
+            trace_id=trace_id,
+        )
+        await self.outbound.publish(message.model_dump_json())
         await self.turns.record_turn(
             detail.id,
             TurnDecision(

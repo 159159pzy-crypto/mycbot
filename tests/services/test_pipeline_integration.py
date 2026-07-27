@@ -23,9 +23,11 @@ from mybot.infrastructure.streams import (
 from mybot.repositories.conversations import ConversationRepository
 from mybot.repositories.messages import MessageRepository
 from mybot.repositories.system_kv import SystemKvRepository
+from mybot.repositories.traces import TraceSpanRepository
 from mybot.repositories.turns import TurnRepository
 from mybot.runtime import ProcessMode
 from mybot.services.agent_worker import DEFAULT_CAPABILITIES, AgentWorkerService
+from mybot.services.gateway import GatewayService, SandboxSender
 
 DATABASE_URL = os.environ.get("MYBOT_TEST_DATABASE_URL")
 REDIS_URL = os.environ.get("MYBOT_TEST_REDIS_URL")
@@ -41,6 +43,10 @@ pytestmark = [
 ROOT = Path(__file__).resolve().parents[2]
 INGEST = "mybot:e2e:ingest"
 OUTBOUND = "mybot:e2e:outbound"
+DEDUPE_KEY = "mybot:e2e:seen:telegram:telegram-main:777:1001"
+SANDBOX_INGEST = "mybot:e2e:sandbox:ingest"
+SANDBOX_OUTBOUND = "mybot:e2e:sandbox:outbound"
+SANDBOX_DEDUPE_KEY = "mybot:e2e:sandbox:seen:sandbox:sandbox:debug-1:1001"
 
 
 class HealthyReadiness:
@@ -85,7 +91,7 @@ async def test_ping_flows_from_ingest_stream_to_outbound_stream_and_database(
             await connection.execute(
             sa.text("TRUNCATE tool_invocations, turns, messages, conversations CASCADE")
         )
-        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead")
+        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead", DEDUPE_KEY)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         messages_repository = MessageRepository(sessions)
         agent = AgentTurnEngine(
@@ -156,6 +162,159 @@ async def test_ping_flows_from_ingest_stream_to_outbound_stream_and_database(
         assert inbound_count == 1
         assert outbound_count == 1
     finally:
-        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead")
+        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead", DEDUPE_KEY)
+        await backend.aclose()
+        await engine.dispose()
+
+
+async def test_sandbox_uses_real_streams_persistence_gateway_and_trace_path(
+    migrated_database_url: str,
+) -> None:
+    assert REDIS_URL is not None
+    engine = create_async_engine(migrated_database_url)
+    backend: RedisStreamBackend = create_redis_backend(REDIS_URL)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text("TRUNCATE tool_invocations, turns, messages, conversations CASCADE")
+            )
+        await backend.delete(
+            SANDBOX_INGEST,
+            SANDBOX_OUTBOUND,
+            f"{SANDBOX_INGEST}:dead",
+            f"{SANDBOX_OUTBOUND}:dead",
+            SANDBOX_DEDUPE_KEY,
+        )
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        messages = MessageRepository(sessions)
+        traces = TraceSpanRepository(sessions)
+        agent = AgentTurnEngine(
+            llm=None,
+            persona=SystemKvRepository(sessions),
+            history=messages,
+            turns=TurnRepository(sessions),
+            budget=None,
+            default_system_prompt="test persona",
+        )
+        worker = AgentWorkerService(
+            consumer=StreamConsumer(
+                backend,
+                stream=SANDBOX_INGEST,
+                group="sandbox-workers",
+                consumer="sandbox-worker-e2e",
+                dead_letter_stream=f"{SANDBOX_INGEST}:dead",
+                max_attempts=3,
+                dedupe_ttl_seconds=30,
+                dedupe_prefix="mybot:e2e:sandbox:seen",
+                block_ms=50,
+                claim_min_idle_ms=1_000,
+            ),
+            outbound=StreamPublisher(backend=backend, stream=SANDBOX_OUTBOUND, maxlen=100),
+            conversations=ConversationRepository(sessions),
+            messages=messages,
+            readiness=HealthyReadiness(),
+            agent=agent,
+            capabilities=DEFAULT_CAPABILITIES,
+            traces=traces,
+        )
+        gateway = GatewayService(
+            qq=None,
+            telegram=None,
+            sandbox=SandboxSender(),
+            outbound_consumer=StreamConsumer(
+                backend,
+                stream=SANDBOX_OUTBOUND,
+                group="sandbox-gateway",
+                consumer="sandbox-gateway-e2e",
+                dead_letter_stream=f"{SANDBOX_OUTBOUND}:dead",
+                max_attempts=3,
+                dedupe_ttl_seconds=30,
+                dedupe_prefix="mybot:e2e:sandbox:outbound-seen",
+                block_ms=50,
+                claim_min_idle_ms=1_000,
+            ),
+            deliveries=messages,
+            traces=traces,
+        )
+        stop_event = asyncio.Event()
+        worker_task = asyncio.create_task(worker.run(ProcessMode.AGENT_WORKER, stop_event))
+        gateway_task = asyncio.create_task(gateway.run(ProcessMode.GATEWAY, stop_event))
+        envelope = MessageEnvelope(
+            id="sandbox:sandbox:debug-1:1001",
+            connection_id="sandbox",
+            platform=Platform.SANDBOX,
+            chat_kind=ChatKind.DIRECT,
+            chat_id="debug-1",
+            sender_identity_id="sandbox:operator",
+            occurred_at=datetime(2026, 7, 27, 12, tzinfo=UTC),
+            segments=(TextSegment(text="/ping"),),
+            trace_id="trace-sandbox-e2e",
+            ephemeral=True,
+        )
+        await StreamPublisher(
+            backend=backend, stream=SANDBOX_INGEST, maxlen=100
+        ).publish(InboundEvent(envelope=envelope).model_dump_json())
+
+        deadline = asyncio.get_running_loop().time() + 10.0
+        delivered = False
+        while asyncio.get_running_loop().time() < deadline:
+            async with engine.connect() as connection:
+                delivered = bool(
+                    (
+                        await connection.execute(
+                            sa.text(
+                                "SELECT count(*) FROM messages "
+                                "WHERE direction = 'outbound' AND platform_message_id IS NOT NULL"
+                            )
+                        )
+                    ).scalar_one()
+                )
+            if delivered:
+                break
+            await asyncio.sleep(0.05)
+        stop_event.set()
+        await asyncio.wait_for(asyncio.gather(worker_task, gateway_task), timeout=5.0)
+
+        assert delivered is True
+        async with engine.connect() as connection:
+            conversation = (
+                await connection.execute(
+                    sa.text("SELECT ephemeral FROM conversations WHERE chat_id = 'debug-1'")
+                )
+            ).mappings().one()
+            outbound = (
+                await connection.execute(
+                    sa.text(
+                        "SELECT trace_id, platform_message_id FROM messages "
+                        "WHERE direction = 'outbound'"
+                    )
+                )
+            ).mappings().one()
+            stages = (
+                await connection.execute(
+                    sa.text(
+                        "SELECT stage FROM trace_spans "
+                        "WHERE trace_id = 'trace-sandbox-e2e' ORDER BY created_at, stage"
+                    )
+                )
+            ).scalars().all()
+        assert conversation["ephemeral"] is True
+        assert outbound["trace_id"] == "trace-sandbox-e2e"
+        assert str(outbound["platform_message_id"]).startswith("sandbox:")
+        assert set(stages) == {
+            "ingest.persist",
+            "moderation.outbound",
+            "outbound.delivery",
+            "outbound.publish",
+            "turn.decision",
+        }
+    finally:
+        await backend.delete(
+            SANDBOX_INGEST,
+            SANDBOX_OUTBOUND,
+            f"{SANDBOX_INGEST}:dead",
+            f"{SANDBOX_OUTBOUND}:dead",
+            SANDBOX_DEDUPE_KEY,
+        )
         await backend.aclose()
         await engine.dispose()

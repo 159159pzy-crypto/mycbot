@@ -57,8 +57,8 @@ def test_status_command_renders_dependency_summary() -> None:
 
     text = plan.text_segments[0]
     assert "not_ready" in text
-    assert "database: up" in text
-    assert "redis: down" in text
+    assert "数据库: up" in text
+    assert "Redis: down" in text
 
 
 def test_status_without_report_degrades_gracefully() -> None:
@@ -69,7 +69,7 @@ def test_status_without_report_degrades_gracefully() -> None:
         capabilities=TELEGRAM_CAPABILITIES,
     )
 
-    assert "unavailable" in plan.text_segments[0]
+    assert "暂时无法获取" in plan.text_segments[0]
 
 
 def test_unknown_command_states_supported_commands() -> None:
@@ -103,9 +103,9 @@ def test_plain_message_echoes_a_truncated_excerpt_deterministically() -> None:
     assert plan == again
     assert 1 <= len(plan.text_segments) <= 3
     text = plan.text_segments[0]
-    assert "echo" in text
+    assert "回显" in text
     assert len(text) < 240
-    assert "later milestone" in text
+    assert "规则回复" in text
 
 
 def test_forget_reply_covers_disabled_zero_and_counted_cases() -> None:
@@ -115,9 +115,9 @@ def test_forget_reply_covers_disabled_zero_and_counted_cases() -> None:
     empty = forget_reply(0, capabilities=TELEGRAM_CAPABILITIES)
     counted = forget_reply(5, capabilities=QQ_CAPABILITIES)
 
-    assert "memory is disabled" in disabled.text_segments[0]
-    assert "no stored memories" in empty.text_segments[0]
-    assert "revoked 5 stored memories" in counted.text_segments[0]
+    assert "未启用记忆" in disabled.text_segments[0]
+    assert "没有找到" in empty.text_segments[0]
+    assert "已撤销 5 条" in counted.text_segments[0]
     assert counted.typing.enabled is False
 
 

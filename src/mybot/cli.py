@@ -1,11 +1,11 @@
 """Command-line entrypoints for all deployable process roles."""
 
 import argparse
-import asyncio
 from collections.abc import Sequence
 
 import uvicorn
 
+from mybot.asyncio_compat import run, uvicorn_loop
 from mybot.infrastructure.logging import configure_logging
 from mybot.runtime import ProcessMode, run_process
 from mybot.settings import Settings
@@ -16,6 +16,7 @@ def _run_api(settings: Settings) -> None:
         "mybot.api:app",
         host=settings.api_host,
         port=settings.api_port,
+        loop=uvicorn_loop(),
         log_config=None,
     )
 
@@ -24,7 +25,7 @@ def _run_non_api(mode: ProcessMode, settings: Settings) -> None:
     configure_logging(settings.log_level)
     from mybot.services import create_service
 
-    asyncio.run(run_process(mode, service=create_service(mode, settings)))
+    run(run_process(mode, service=create_service(mode, settings)))
 
 
 def main(argv: Sequence[str] | None = None) -> None:

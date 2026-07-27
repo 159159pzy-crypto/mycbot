@@ -27,7 +27,7 @@ def build_direct_reply(
     elif command == "status":
         text = _status_text(readiness)
     elif command is not None:
-        text = f"unknown command /{command}; supported commands: {', '.join(_KNOWN_COMMANDS)}"
+        text = f"未知命令 /{command}; 支持的命令: {', '.join(_KNOWN_COMMANDS)}"
     else:
         text = _echo_text(envelope)
     return ReplyPlan(
@@ -42,11 +42,11 @@ def forget_reply(
     """Deterministic /forget acknowledgment; None means memory is not wired."""
 
     if revoked_count is None:
-        text = "memory is disabled on this deployment, so there is nothing to forget"
+        text = "当前部署未启用记忆, 没有需要遗忘的内容"
     elif revoked_count == 0:
-        text = "done — I had no stored memories about you"
+        text = "完成: 没有找到关于你的已存记忆"
     else:
-        text = f"done — revoked {revoked_count} stored memories about you"
+        text = f"完成: 已撤销 {revoked_count} 条关于你的记忆"
     return ReplyPlan(
         text_segments=(text,),
         typing=TypingProfile(enabled=capabilities.typing),
@@ -55,12 +55,12 @@ def forget_reply(
 
 def _status_text(readiness: ReadinessResponse | None) -> str:
     if readiness is None:
-        return "status: readiness report unavailable"
+        return "状态: 暂时无法获取就绪报告"
     dependencies = readiness.dependencies
     return (
-        f"status: {readiness.status} | "
-        f"database: {dependencies.database.status.value} | "
-        f"redis: {dependencies.redis.status.value}"
+        f"状态: {readiness.status} | "
+        f"数据库: {dependencies.database.status.value} | "
+        f"Redis: {dependencies.redis.status.value}"
     )
 
 
@@ -73,5 +73,5 @@ def _echo_text(envelope: MessageEnvelope) -> str:
     if len(excerpt) > _EXCERPT_LIMIT:
         excerpt = excerpt[: _EXCERPT_LIMIT - 1] + "…"
     if excerpt:
-        return f'echo: "{excerpt}" (rule-based reply; the full agent arrives in a later milestone)'
-    return "received (rule-based reply; the full agent arrives in a later milestone)"
+        return f'回显: "{excerpt}" (规则回复)'
+    return "已收到 (规则回复)"

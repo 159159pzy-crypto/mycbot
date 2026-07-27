@@ -3,10 +3,11 @@
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import Annotated, Literal, cast
 
 import httpx
 import structlog
+from pydantic import Field
 
 from mybot.adapters.payload import as_string_mapping, get_int, get_mapping, get_str
 from mybot.contracts.common import FrozenModel, NonEmptyStr
@@ -22,9 +23,31 @@ class ToolCall(FrozenModel):
     arguments: str  # raw JSON string exactly as the model emitted it
 
 
+class TextContentPart(FrozenModel):
+    type: Literal["text"] = "text"
+    text: NonEmptyStr
+
+
+class ImageUrl(FrozenModel):
+    url: NonEmptyStr
+    detail: Literal["auto", "low", "high"] = "auto"
+
+
+class ImageContentPart(FrozenModel):
+    type: Literal["image_url"] = "image_url"
+    image_url: ImageUrl
+
+
+ChatContentPart = Annotated[
+    TextContentPart | ImageContentPart,
+    Field(discriminator="type"),
+]
+type ChatContent = str | tuple[ChatContentPart, ...]
+
+
 class ChatMessage(FrozenModel):
     role: NonEmptyStr
-    content: str | None = None
+    content: ChatContent | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: NonEmptyStr | None = None
     name: NonEmptyStr | None = None
@@ -46,9 +69,14 @@ def _serialize_message(message: ChatMessage) -> dict[str, object]:
                 for call in message.tool_calls
             ],
         }
+    content: object
+    if isinstance(message.content, tuple):
+        content = [part.model_dump(mode="json") for part in message.content]
+    else:
+        content = message.content if message.content is not None else ""
     serialized: dict[str, object] = {
         "role": message.role,
-        "content": message.content if message.content is not None else "",
+        "content": content,
     }
     if message.tool_call_id is not None:
         serialized["tool_call_id"] = message.tool_call_id

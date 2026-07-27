@@ -5,6 +5,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from time import monotonic
 from typing import Protocol
 from uuid import UUID
 
@@ -36,6 +37,7 @@ from mybot.repositories.messages import (
     StoredMessage,
     platform_message_id_from_envelope,
 )
+from mybot.repositories.traces import TraceStatus
 from mybot.runtime import ProcessMode
 from mybot.settings import Settings
 
@@ -44,12 +46,25 @@ logger = structlog.get_logger("mybot.agent_worker")
 DEFAULT_CAPABILITIES: Mapping[Platform, PlatformCapabilities] = {
     Platform.QQ: QQ_CAPABILITIES,
     Platform.TELEGRAM: TELEGRAM_CAPABILITIES,
+    Platform.SANDBOX: PlatformCapabilities(
+        editing=False,
+        replies=True,
+        typing=False,
+        proactive_messages=False,
+        combined_media_text=True,
+        threads=False,
+        reactions=False,
+        images=True,
+        mentions=True,
+        stickers=True,
+        voice_messages=False,
+    ),
 }
 
 
 class ConversationStore(Protocol):
     async def get_or_create(
-        self, key: ConversationKey, *, platform: Platform
+        self, key: ConversationKey, *, platform: Platform, ephemeral: bool = False
     ) -> ConversationRecord: ...
 
 
@@ -64,6 +79,7 @@ class MessageStore(Protocol):
         plan: ReplyPlan,
         *,
         occurred_at: datetime | None = None,
+        trace_id: str | None = None,
     ) -> UUID: ...
 
     async def recent_outbound_platform_ids(
@@ -128,9 +144,21 @@ class ModerationHook(Protocol):
     async def allows(self, text: str) -> bool: ...
 
 
-MODERATION_NOTICE = (
-    "I drafted a reply, but it was withheld by this deployment's moderation policy."
-)
+class TraceSink(Protocol):
+    async def record(
+        self,
+        *,
+        trace_id: str,
+        stage: str,
+        status: TraceStatus = "ok",
+        duration_ms: int = 0,
+        conversation_id: UUID | None = None,
+        message_id: UUID | None = None,
+        attributes: Mapping[str, JsonValue] | None = None,
+    ) -> UUID: ...
+
+
+MODERATION_NOTICE = "回复触发了内容策略, 已停止发送。"
 
 
 @dataclass(slots=True)
@@ -148,6 +176,8 @@ class AgentWorkerService:
     events: EventSink | None = None
     guards: Guards | None = None
     moderation: ModerationHook | None = None
+    moderation_notice: str = MODERATION_NOTICE
+    traces: TraceSink | None = None
     _conversation_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
 
     async def run(self, mode: ProcessMode, stop_event: asyncio.Event) -> None:
@@ -177,12 +207,23 @@ class AgentWorkerService:
     async def _handle_serialized(self, event: InboundEvent, key: ConversationKey) -> None:
         envelope = event.envelope
         conversation = await self.conversations.get_or_create(
-            key, platform=envelope.platform
+            key, platform=envelope.platform, ephemeral=envelope.ephemeral
         )
         stored = await self.messages.record_inbound(conversation.id, envelope)
         if stored.duplicate:
             logger.info("inbound_duplicate_skipped", envelope_id=envelope.id)
             return
+        await self._trace(
+            envelope,
+            conversation.id,
+            "ingest.persist",
+            message_id=stored.id,
+            attributes={
+                "platform": envelope.platform.value,
+                "ephemeral": envelope.ephemeral,
+                "segments": len(envelope.segments),
+            },
+        )
         own_ids = await self.messages.recent_outbound_platform_ids(conversation.id)
         decision = decide_turn(
             envelope,
@@ -197,12 +238,20 @@ class AgentWorkerService:
             trigger=decision.trigger.value,
             reason=decision.reason,
         )
+        await self._trace(
+            envelope,
+            conversation.id,
+            "turn.decision",
+            attributes={
+                "action": decision.action.value,
+                "trigger": decision.trigger.value,
+                "reason": decision.reason,
+            },
+        )
         await self._post_event(envelope, decision)
         if decision.action is TurnAction.IGNORE:
             return
-        capabilities = self.capabilities.get(
-            envelope.platform, PlatformCapabilities()
-        )
+        capabilities = self.capabilities.get(envelope.platform, PlatformCapabilities())
         refusal_text = await self._guard_refusal(event, decision, conversation.id, key)
         if refusal_text == "":
             return  # guard says ignore silently
@@ -215,30 +264,39 @@ class AgentWorkerService:
                 typing=TypingProfile(enabled=capabilities.typing),
             )
         elif is_agent_turn:
-            plan = await self.agent.run_turn(
-                conversation_id=conversation.id,
-                stable_key=key.stable_key,
-                envelope=envelope,
-                decision=decision,
-                inbound_message_id=stored.id,
-                capabilities=capabilities,
+            from mybot.infrastructure.model_routing import (
+                reset_model_conversation,
+                set_model_conversation,
             )
+
+            model_context = set_model_conversation(str(conversation.id))
+            try:
+                plan = await self.agent.run_turn(
+                    conversation_id=conversation.id,
+                    stable_key=key.stable_key,
+                    envelope=envelope,
+                    decision=decision,
+                    inbound_message_id=stored.id,
+                    capabilities=capabilities,
+                )
+            finally:
+                reset_model_conversation(model_context)
         else:
             command = extract_command(envelope)
             if command == "forget":
                 plan = await self._handle_forget(envelope, key, capabilities)
             else:
-                readiness = (
-                    await self._readiness_report() if command == "status" else None
-                )
+                readiness = await self._readiness_report() if command == "status" else None
                 plan = build_direct_reply(
                     envelope,
                     command=command,
                     readiness=readiness,
                     capabilities=capabilities,
                 )
-        plan = await self._moderated(plan, capabilities)
-        outbound_id = await self.messages.record_outbound(conversation.id, plan)
+        plan = await self._moderated(plan, capabilities, envelope, conversation.id)
+        outbound_id = await self.messages.record_outbound(
+            conversation.id, plan, trace_id=envelope.trace_id
+        )
         message = OutboundMessage(
             internal_message_id=outbound_id,
             platform=envelope.platform,
@@ -247,13 +305,30 @@ class AgentWorkerService:
             chat_id=envelope.chat_id,
             reply_plan=plan,
             reply_to_platform_message_id=(
-                platform_message_id_from_envelope(envelope)
-                if capabilities.replies
-                else None
+                platform_message_id_from_envelope(envelope) if capabilities.replies else None
             ),
+            trace_id=envelope.trace_id,
         )
+        publish_started = monotonic()
         await self.outbound.publish(message.model_dump_json())
+        await self._trace(
+            envelope,
+            conversation.id,
+            "outbound.publish",
+            duration_ms=int((monotonic() - publish_started) * 1_000),
+            message_id=outbound_id,
+            attributes={
+                "text_segments": len(plan.text_segments),
+                "media_segments": len(plan.media_segments),
+            },
+        )
         if is_agent_turn:
+            from mybot.infrastructure.model_routing import (
+                reset_model_conversation,
+                set_model_conversation,
+            )
+
+            model_context = set_model_conversation(str(conversation.id))
             try:
                 await self.agent.after_reply(
                     envelope=envelope,
@@ -264,6 +339,8 @@ class AgentWorkerService:
                 raise
             except Exception:
                 logger.exception("after_reply_hook_failed", envelope_id=envelope.id)
+            finally:
+                reset_model_conversation(model_context)
 
     async def _guard_refusal(
         self,
@@ -305,24 +382,59 @@ class AgentWorkerService:
         return None
 
     async def _moderated(
-        self, plan: ReplyPlan, capabilities: PlatformCapabilities
+        self,
+        plan: ReplyPlan,
+        capabilities: PlatformCapabilities,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
     ) -> ReplyPlan:
         if self.moderation is None:
+            await self._trace(
+                envelope,
+                conversation_id,
+                "moderation.outbound",
+                status="skipped",
+                attributes={"reason": "disabled"},
+            )
             return plan
+        started = monotonic()
         try:
             approved = await self.moderation.allows("\n\n".join(plan.text_segments))
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("moderation_hook_failed")
+            await self._trace(
+                envelope,
+                conversation_id,
+                "moderation.outbound",
+                status="error",
+                duration_ms=int((monotonic() - started) * 1_000),
+                attributes={"error_code": "moderation_hook_failed"},
+            )
             return plan
         if approved:
+            await self._trace(
+                envelope,
+                conversation_id,
+                "moderation.outbound",
+                duration_ms=int((monotonic() - started) * 1_000),
+                attributes={"approved": True},
+            )
             return plan
         from mybot.contracts import TypingProfile
 
         logger.warning("reply_withheld_by_moderation")
+        await self._trace(
+            envelope,
+            conversation_id,
+            "moderation.outbound",
+            status="error",
+            duration_ms=int((monotonic() - started) * 1_000),
+            attributes={"approved": False},
+        )
         return ReplyPlan(
-            text_segments=(MODERATION_NOTICE,),
+            text_segments=(self.moderation_notice,),
             typing=TypingProfile(enabled=capabilities.typing),
         )
 
@@ -355,9 +467,7 @@ class AgentWorkerService:
 
         if self.memory is None:
             return forget_reply(None, capabilities=capabilities)
-        conversation_scope = (
-            key.stable_key if envelope.chat_kind is ChatKind.DIRECT else None
-        )
+        conversation_scope = key.stable_key if envelope.chat_kind is ChatKind.DIRECT else None
         revoked = await self.memory.forget(
             subject_identity_id=envelope.sender_identity_id,
             conversation_stable_key=conversation_scope,
@@ -385,6 +495,34 @@ class AgentWorkerService:
             logger.exception("status_readiness_probe_failed")
             return None
 
+    async def _trace(
+        self,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
+        stage: str,
+        *,
+        status: TraceStatus = "ok",
+        duration_ms: int = 0,
+        message_id: UUID | None = None,
+        attributes: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        if self.traces is None:
+            return
+        try:
+            await self.traces.record(
+                trace_id=envelope.trace_id,
+                stage=stage,
+                status=status,
+                duration_ms=duration_ms,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                attributes=attributes,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("trace_span_record_failed", stage=stage)
+
 
 def _envelope_dedupe_key(payload: str) -> str:
     return InboundEvent.model_validate_json(payload).envelope.id
@@ -397,15 +535,23 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
 
     from mybot.engine.agent_turns import AgentTurnEngine
     from mybot.engine.memory_service import MemoryService
+    from mybot.engine.vision import VisionMode, VisionService
     from mybot.infrastructure.budget import TokenBudget
     from mybot.infrastructure.database import create_database_engine, create_session_factory
-    from mybot.infrastructure.embeddings import EmbeddingClient
-    from mybot.infrastructure.llm import LlmClient
+    from mybot.infrastructure.model_routing import (
+        ModelPurpose,
+        ModelRouter,
+        RedisModelCooldowns,
+        legacy_model_channels,
+        openai_client_factory,
+    )
     from mybot.repositories.conversations import ConversationRepository
+    from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.messages import MessageRepository
     from mybot.repositories.system_kv import SystemKvRepository
     from mybot.repositories.tool_invocations import ToolInvocationRepository
+    from mybot.repositories.traces import TraceSpanRepository
     from mybot.repositories.turns import TurnRepository
     from mybot.tools import ToolExecutor, ToolRegistry
     from mybot.tools.approvals import SystemKvApprovals
@@ -416,6 +562,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     backend = create_redis_backend(settings.redis_url.get_secret_value())
     sessions = create_session_factory(create_database_engine(settings))
     messages = MessageRepository(sessions)
+    traces = TraceSpanRepository(sessions)
     consumer = StreamConsumer(
         backend,
         stream=settings.ingest_stream,
@@ -428,39 +575,39 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         block_ms=settings.stream_block_ms,
         claim_min_idle_ms=settings.stream_claim_min_idle_ms,
     )
-    llm: LlmClient | None = None
-    if settings.llm_base_url is not None:
-        llm = LlmClient(
-            client=httpx.AsyncClient(),
-            base_url=settings.llm_base_url,
-            api_key=(
-                settings.llm_api_key.get_secret_value()
-                if settings.llm_api_key is not None
-                else None
-            ),
-            model=settings.llm_model,
+    config = SystemKvRepository(sessions)
+    def secret_lookup(name: str) -> str | None:
+        return settings.model_secret(name)
+
+    model_http = httpx.AsyncClient()
+    from redis.asyncio import Redis
+
+    model_router = ModelRouter(
+        config=config,
+        fallback_channels=legacy_model_channels(settings),
+        cooldowns=RedisModelCooldowns(
+            Redis.from_url(  # pyright: ignore[reportUnknownMemberType]
+                settings.redis_url.get_secret_value(), decode_responses=True
+            )
+        ),
+        attempts=LlmCallLogRepository(sessions),
+        client_factory=openai_client_factory(
+            model_http,
             temperature=settings.llm_temperature,
             max_output_tokens=settings.llm_max_output_tokens,
             timeout_seconds=settings.llm_timeout_seconds,
-            max_retries=settings.llm_max_retries,
-        )
+        ),
+        secret_lookup=secret_lookup,
+        cache_ttl_seconds=settings.model_channels_cache_ttl_seconds,
+        cooldown_seconds=settings.model_channel_cooldown_seconds,
+    )
+    llm = model_router.for_purpose(ModelPurpose.CHAT)
     memory: MemoryService | None = None
-    embedding_base = settings.embedding_base_url or settings.llm_base_url
-    if settings.memory_enabled and embedding_base is not None:
-        embedding_key = settings.embedding_api_key or settings.llm_api_key
+    if settings.memory_enabled:
         memory = MemoryService(
-            embeddings=EmbeddingClient(
-                client=httpx.AsyncClient(),
-                base_url=embedding_base,
-                api_key=(
-                    embedding_key.get_secret_value()
-                    if embedding_key is not None
-                    else None
-                ),
-                model=settings.embedding_model,
-            ),
+            embeddings=model_router.embeddings(),
             store=MemoryRepository(sessions),
-            llm=None,  # assigned below once the chat client exists
+            llm=model_router.for_purpose(ModelPurpose.MEMORY),
             embedding_model=settings.embedding_model,
             min_confidence=settings.memory_min_confidence,
             retrieval_limit=settings.memory_retrieval_limit,
@@ -475,9 +622,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
                 max_results=settings.search_max_results,
             ),
             UrlFetchTool(
-                client=httpx.AsyncClient(
-                    timeout=tool_http_timeout, follow_redirects=True
-                ),
+                client=httpx.AsyncClient(timeout=tool_http_timeout, follow_redirects=True),
                 max_bytes=settings.tool_fetch_max_bytes,
             ),
         ]
@@ -493,12 +638,10 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             ttl_seconds=settings.plugin_catalog_ttl_seconds,
             invoke_timeout_seconds=settings.plugin_invoke_timeout_seconds,
         )
-        events = BrokerEventSink(
-            client=broker_client, broker_url=settings.plugin_broker_url
-        )
+        events = BrokerEventSink(client=broker_client, broker_url=settings.plugin_broker_url)
     agent = AgentTurnEngine(
         llm=llm,
-        persona=SystemKvRepository(sessions),
+        persona=config,
         history=messages,
         turns=TurnRepository(sessions),
         budget=TokenBudget(
@@ -515,7 +658,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             catalog,
             timeout_seconds=settings.tool_timeout_seconds,
             approvals=SystemKvApprovals(
-                config=SystemKvRepository(sessions),
+                config=config,
                 ttl_seconds=settings.tool_approvals_cache_ttl_seconds,
             ),
         ),
@@ -524,9 +667,17 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         turn_deadline_seconds=settings.turn_deadline_seconds,
         invocations=ToolInvocationRepository(sessions),
         memory=memory,
+        vision=VisionService(
+            llm=model_router.for_purpose(ModelPurpose.VISION),
+            mode=VisionMode(settings.vision_mode),
+            max_description_chars=settings.vision_max_description_chars,
+        ),
+        not_configured_fallback=settings.fallback_not_configured,
+        llm_failure_fallback=settings.fallback_llm_failure,
+        budget_fallback=settings.fallback_budget_exceeded,
+        empty_reply_fallback=settings.fallback_empty_reply,
+        traces=traces,
     )
-    if memory is not None:
-        memory.llm = llm
     from mybot.engine.guards import TurnGuards
 
     return AgentWorkerService(
@@ -552,4 +703,6 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             input_max_chars=settings.input_max_chars,
             loop_guard_enabled=settings.loop_guard_enabled,
         ),
+        moderation_notice=settings.fallback_moderation,
+        traces=traces,
     )

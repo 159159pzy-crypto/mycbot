@@ -1,0 +1,26 @@
+{
+  "time": 1784000000,
+  "self_id": 10000,
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "message_id": 7001,
+  "group_id": 333,
+  "user_id": 10001,
+  "message": [
+    {"type": "at", "data": {"qq": "10000"}},
+    {"type": "text", "data": {"text": " 看看这个"}},
+    {"type": "face", "data": {"id": "14"}},
+    {
+      "type": "image",
+      "data": {"file": "image-token", "url": "https://cdn.example/image.png"}
+    },
+    {
+      "type": "record",
+      "data": {"file": "voice.amr", "url": "https://cdn.example/voice.amr"}
+    }
+  ],
+  "raw_message": "[CQ:at,qq=10000] 看看这个[CQ:face,id=14][CQ:image,file=image-token]",
+  "font": 0,
+  "sender": {"user_id": 10001, "nickname": "alice"}
+}

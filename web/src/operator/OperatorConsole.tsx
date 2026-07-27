@@ -3,15 +3,19 @@ import { useMemo, useState } from 'react';
 import { createOperatorClient } from './api';
 import { ConversationsPanel } from './panels/ConversationsPanel';
 import { MemoriesPanel } from './panels/MemoriesPanel';
+import { ModelsPanel } from './panels/ModelsPanel';
 import { OverviewPanel } from './panels/OverviewPanel';
 import { PersonaPanel } from './panels/PersonaPanel';
 import { PluginsPanel } from './panels/PluginsPanel';
+import { SandboxPanel } from './panels/SandboxPanel';
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'conversations', label: 'Conversations' },
+  { id: 'sandbox', label: 'Sandbox' },
   { id: 'memories', label: 'Memories' },
   { id: 'plugins', label: 'Plugins' },
+  { id: 'models', label: 'Models' },
   { id: 'persona', label: 'Persona' },
 ] as const;
 
@@ -100,8 +104,10 @@ export function OperatorConsole() {
       <div className="op-panel">
         {tab === 'overview' && <OverviewPanel client={client} />}
         {tab === 'conversations' && <ConversationsPanel client={client} />}
+        {tab === 'sandbox' && <SandboxPanel client={client} />}
         {tab === 'memories' && <MemoriesPanel client={client} />}
         {tab === 'plugins' && <PluginsPanel client={client} />}
+        {tab === 'models' && <ModelsPanel client={client} />}
         {tab === 'persona' && <PersonaPanel client={client} />}
       </div>
     </section>

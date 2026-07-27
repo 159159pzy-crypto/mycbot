@@ -1,6 +1,8 @@
 """Platform adapters translating between platform payloads and public contracts."""
 
-from uuid import UUID
+from uuid import UUID, uuid4
+
+from pydantic import Field
 
 from mybot.contracts.common import FrozenModel, NonEmptyStr
 from mybot.contracts.messages import ChatKind, MessageEnvelope, Platform
@@ -26,6 +28,7 @@ class OutboundMessage(FrozenModel):
     chat_id: NonEmptyStr
     reply_plan: ReplyPlan
     reply_to_platform_message_id: NonEmptyStr | None = None
+    trace_id: NonEmptyStr = Field(default_factory=lambda: str(uuid4()))
 
 
 __all__ = ["InboundEvent", "OutboundMessage"]

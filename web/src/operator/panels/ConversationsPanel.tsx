@@ -4,13 +4,20 @@ import type {
   ConversationSummary,
   MessageView,
   OperatorClient,
+  TraceSpanView,
   TurnView,
 } from '../api';
 
 type DetailState =
   | { kind: 'idle' }
   | { kind: 'loading'; id: string }
-  | { kind: 'ready'; id: string; messages: MessageView[]; turns: TurnView[] };
+  | {
+      kind: 'ready';
+      id: string;
+      messages: MessageView[];
+      turns: TurnView[];
+      traces: TraceSpanView[];
+    };
 
 export function ConversationsPanel({ client }: { client: OperatorClient }) {
   const [conversations, setConversations] = useState<ConversationSummary[] | null>(null);
@@ -35,12 +42,15 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
   const open = async (conversation: ConversationSummary) => {
     setDetail({ kind: 'loading', id: conversation.id });
     try {
-      const [messages, turns] = await Promise.all([
+      const [messages, turns, traces] = await Promise.all([
         client.get<{ messages: MessageView[] }>(
           `/operator/conversations/${conversation.id}/messages`,
         ),
         client.get<{ turns: TurnView[] }>(
           `/operator/conversations/${conversation.id}/turns`,
+        ),
+        client.get<{ traces: TraceSpanView[] }>(
+          `/operator/conversations/${conversation.id}/traces`,
         ),
       ]);
       setDetail({
@@ -48,6 +58,7 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
         id: conversation.id,
         messages: messages.messages,
         turns: turns.turns,
+        traces: traces.traces,
       });
     } catch (cause) {
       setError(String(cause));
@@ -71,6 +82,7 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
                 {conversation.platform} / {conversation.chat_kind} / {conversation.chat_id}
               </code>
               <span>{conversation.message_count} msgs</span>
+              {conversation.ephemeral && <small>沙盒</small>}
             </button>
           </li>
         ))}
@@ -109,6 +121,26 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
                 </li>
               ))}
             </ul>
+            <details className="op-trace">
+              <summary>追踪 · {detail.traces.length} 个阶段</summary>
+              {detail.traces.length === 0 ? (
+                <p className="op-empty">暂无追踪数据。</p>
+              ) : (
+                <ol className="op-list" aria-label="Trace spans">
+                  {detail.traces.map((span) => (
+                    <li key={span.id} data-status={span.status}>
+                      <code>
+                        {span.stage} / {span.status}
+                      </code>
+                      <span>{span.duration_ms}ms</span>
+                      {Object.keys(span.attributes).length > 0 && (
+                        <pre>{JSON.stringify(span.attributes, null, 2)}</pre>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </details>
           </>
         )}
       </div>

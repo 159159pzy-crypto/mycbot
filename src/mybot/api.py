@@ -3,6 +3,7 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Response
 
 from mybot.infrastructure.correlation import CorrelationIdMiddleware
@@ -32,12 +33,15 @@ def create_app(
         grants=resolved_settings.plugin_grants(),
         invoke_timeout_seconds=resolved_settings.plugin_invoke_timeout_seconds,
     )
+    operator_model_client = httpx.AsyncClient()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         yield
         if owns_readiness:
             await readiness_service.aclose()
+        await operator_model_client.aclose()
+        await operator_backend.aclose()
 
     from collections.abc import Awaitable, Callable
 
@@ -74,15 +78,15 @@ def create_app(
     app.include_router(create_broker_router(plugin_broker))
 
     from mybot.infrastructure.database import create_database_engine, create_session_factory
-    from mybot.infrastructure.streams import create_redis_backend
+    from mybot.infrastructure.streams import StreamPublisher, create_redis_backend
     from mybot.operator.api import OperatorContext, create_operator_router
     from mybot.repositories.audit import AuditRepository
+    from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.operator_views import OperatorViews
     from mybot.repositories.system_kv import SystemKvRepository
 
-    operator_sessions = create_session_factory(
-        create_database_engine(resolved_settings)
-    )
+    operator_sessions = create_session_factory(create_database_engine(resolved_settings))
+    operator_backend = create_redis_backend(resolved_settings.redis_url.get_secret_value())
     app.include_router(
         create_operator_router(
             OperatorContext(
@@ -90,10 +94,15 @@ def create_app(
                 audit=AuditRepository(operator_sessions),
                 config=SystemKvRepository(operator_sessions),
                 broker=plugin_broker,
-                streams=create_redis_backend(
-                    resolved_settings.redis_url.get_secret_value()
-                ),
+                streams=operator_backend,
                 settings=resolved_settings,
+                model_client=operator_model_client,
+                model_attempts=LlmCallLogRepository(operator_sessions),
+                sandbox=StreamPublisher(
+                    backend=operator_backend,
+                    stream=resolved_settings.ingest_stream,
+                    maxlen=resolved_settings.stream_maxlen,
+                ),
             )
         )
     )

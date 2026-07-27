@@ -147,11 +147,52 @@ reach the model. Configure any OpenAI-compatible endpoint in `.env`:
 
 | Setting | Purpose |
 | --- | --- |
-| `MYBOT_LLM_BASE_URL` | e.g. `https://api.deepseek.com/v1`, or a local vLLM/Ollama URL; empty disables the agent |
+| `MYBOT_LLM_BASE_URL` | Legacy fallback channel, e.g. `https://api.deepseek.com/v1`; empty is allowed when runtime channels are configured |
 | `MYBOT_LLM_API_KEY` | Bearer token for that endpoint (optional for local servers) |
 | `MYBOT_LLM_MODEL` | Model name the endpoint expects (default `deepseek-chat`) |
 | `MYBOT_AGENT_DAILY_TOKEN_CEILING` | Global daily token budget, 0 = unlimited |
 | `MYBOT_AGENT_CONVERSATION_DAILY_TOKEN_CEILING` | Per-conversation daily budget, 0 = unlimited |
+| `MYBOT_MODEL_API_KEYS` | Optional JSON secret map used by runtime channels; never stored in `system_kv` |
+| `MYBOT_MODEL_CHANNEL_COOLDOWN_SECONDS` | Redis cooldown after a retryable channel failure (default 60) |
+| `MYBOT_MODEL_CHANNELS_CACHE_TTL_SECONDS` | Worker refresh interval for runtime channel configuration (default 30) |
+
+The operator console's **Models** panel manages a purpose-aware channel
+list stored at `models.channels` in `system_kv`. Each channel maps one or
+more purposes (`chat`, `memory`, `embedding`, `vision`) to models, carries
+priority and weight, and stores price-per-million snapshots for cost
+accounting. Secrets stay env-only: `api_key_env` is a reference name, never
+the key value. For example:
+
+```json
+[
+  {
+    "name": "primary",
+    "base_url": "https://models.example/v1",
+    "api_key_env": "PRIMARY_MODEL_KEY",
+    "priority": 0,
+    "weight": 2,
+    "enabled": true,
+    "model_map": {
+      "chat": {
+        "model": "chat-model",
+        "input_price_per_million": "0.50",
+        "output_price_per_million": "1.50"
+      },
+      "memory": {"model": "small-model"},
+      "embedding": {"model": "text-embedding-3-small"}
+    }
+  }
+]
+```
+
+Set `MYBOT_MODEL_API_KEYS={"PRIMARY_MODEL_KEY":"..."}` outside version
+control. Channels at the same priority use deterministic weighted rotation;
+retryable transport/429/5xx failures put that channel into Redis cooldown and
+continue to the next channel. Permanent 4xx errors stop immediately. Every
+attempt is written to `llm_call_log` without URLs, keys, response bodies, or
+exception text. Enabled embedding channels must use the same model so vector
+spaces are never mixed. The Models panel summarizes the last 30 days by day,
+conversation, and channel, including token totals and price-snapshot cost.
 
 The default persona comes from `MYBOT_AGENT_SYSTEM_PROMPT` and is edited
 at runtime without a restart in the operator console's Persona panel
@@ -164,8 +205,8 @@ VALUES ('agent.system_prompt', '"你是一只高冷但热心的猫娘助手。"'
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
 ```
 
-Degradation is explicit by design: with no `MYBOT_LLM_BASE_URL` the bot
-answers with a built-in fallback naming the missing configuration; an LLM
+Degradation is explicit by design: with neither runtime nor legacy channels
+the bot answers with an unavailable-model fallback; an LLM
 outage produces an apologetic fallback; a crossed token ceiling produces a
 budget notice. Every agent turn — replied, fallback, budget_exceeded, or
 error — is recorded in the `turns` table with model, token usage, and
@@ -315,6 +356,14 @@ When `NAPCAT_WS_URL` is set, the gateway maintains that WebSocket connection
 with authenticated headers and bounded reconnect backoff, translating OneBot
 v11 message events into the platform-neutral envelope contract.
 
+That contract now represents text, image, file, reference, `at`, sticker, and
+voice segments. QQ and Telegram encoders are pure functions covered by replay
+fixtures; unsupported outbound media becomes readable text instead of being
+dropped. Voice is representable and forwardable, but M1 does not perform ASR,
+TTS, or voice understanding. Plugin runner registration negotiates protocol
+version 2; legacy version-1 runners remain accepted and receive new segment
+types projected to readable text so strict older SDK models do not fail.
+
 ## Operator console
 
 The web shell is now an authenticated operations console. Set
@@ -421,6 +470,40 @@ local pipeline is the `otel/opentelemetry-collector` image with an OTLP
 receiver and a logging or Prometheus exporter; the operator console's
 metrics panel complements this with turn latency, token usage, and queue
 depth without requiring any collector at all.
+
+## V2-M2: image understanding, sandbox, and reply traces
+
+Inbound `image` segments are no longer collapsed into a generic non-text
+placeholder. `MYBOT_VISION_MODE=describe` (the default) sends OpenAI-compatible
+text/image content parts through the M1 `vision` model purpose and adds the
+bounded Chinese description to the normal chat prompt. `direct` keeps the
+image parts in the main chat request for a multimodal chat model; `off` keeps a
+readable image reference without making a vision call. A vision failure never
+drops the turn: it degrades to the configured Chinese reference text. ASR/TTS
+and video understanding remain outside M2.
+
+The authenticated console now has a **Sandbox** tab. A submitted text and
+optional HTTP(S) image URL becomes a normal `InboundEvent` on `mybot:ingest`,
+is consumed by the production agent worker, and leaves through the normal
+outbound stream. The gateway's virtual `SANDBOX` sender performs no network
+delivery; the console reads the persisted transcript. Sandbox envelopes and
+conversations are marked `ephemeral`, so memory retrieval/extraction and
+proactive delivery are skipped, while tools, model routing, turn persistence,
+moderation, and accounting remain identical to QQ/TG.
+
+Every envelope carries a `trace_id`. Completed spans for vision preparation,
+memory retrieval, model calls, tool calls, moderation, outbound publication,
+and gateway delivery are stored in `trace_spans`. Open any conversation and
+expand **追踪** to see stage status, duration, bounded memory recall context,
+tool outcome, moderation decision, and model token use. Trace writes are
+best-effort and store stable error codes rather than raw exception text.
+
+Model replies can deliberately emit standalone validated directives such as
+`[[media:{"type":"image","url":"https://example/image.png"}]]`,
+`[[media:{"type":"sticker","id":"14","name":"smile"}]]`, and
+`[[meme:acknowledge]]`. `shape_reply` removes valid directives from visible
+text and carries the typed media through the existing QQ/Telegram capability
+encoders; malformed or unsafe image directives remain readable text.
 
 ## Verification
 

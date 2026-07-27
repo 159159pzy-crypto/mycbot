@@ -17,13 +17,17 @@ from mybot.adapters.payload import (
     get_str,
 )
 from mybot.contracts import (
+    AtSegment,
     ChatKind,
     FileSegment,
     ImageSegment,
     MessageEnvelope,
     Platform,
     PlatformCapabilities,
+    ReplyPlan,
+    StickerSegment,
     TextSegment,
+    VoiceSegment,
 )
 from mybot.contracts.json import FrozenJsonValue
 
@@ -35,6 +39,10 @@ TELEGRAM_CAPABILITIES = PlatformCapabilities(
     combined_media_text=True,
     threads=True,
     reactions=False,
+    images=True,
+    mentions=True,
+    stickers=True,
+    voice_messages=True,
 )
 
 _CHAT_KINDS: dict[str, ChatKind] = {
@@ -45,8 +53,6 @@ _CHAT_KINDS: dict[str, ChatKind] = {
 }
 
 _UNSUPPORTED_CONTENT_KEYS = (
-    "sticker",
-    "voice",
     "audio",
     "video",
     "video_note",
@@ -58,7 +64,9 @@ _UNSUPPORTED_CONTENT_KEYS = (
     "dice",
 )
 
-type ContentSegment = TextSegment | ImageSegment | FileSegment
+type ContentSegment = (
+    TextSegment | ImageSegment | FileSegment | AtSegment | StickerSegment | VoiceSegment
+)
 
 
 def translate_telegram_update(
@@ -118,13 +126,36 @@ def translate_telegram_update(
                 )
             )
 
+    sticker = get_mapping(message, "sticker")
+    if sticker is not None:
+        file_id = get_str(sticker, "file_id")
+        if file_id:
+            segments.append(
+                StickerSegment(id=f"tg-file://{file_id}", name=get_str(sticker, "emoji"))
+            )
+
+    voice = get_mapping(message, "voice")
+    if voice is not None:
+        file_id = get_str(voice, "file_id")
+        if file_id:
+            duration = get_int(voice, "duration")
+            segments.append(
+                VoiceSegment(
+                    url=f"tg-file://{file_id}",
+                    mime_type=get_str(voice, "mime_type"),
+                    duration_ms=duration * 1_000 if duration is not None else None,
+                )
+            )
+
     if not segments:
         placeholder = _first_unsupported_key(message)
         if placeholder is None:
             return None
-        segments.append(TextSegment(text=f"[unsupported: {placeholder}]"))
+        segments.append(TextSegment(text=f"[暂不支持的消息类型: {placeholder}]"))
 
     mentions_self = _mentions_bot(get_str(message, "text") or "", message, bot_username, self_id)
+    if mentions_self:
+        segments.insert(0, AtSegment(target_id=str(self_id), display_name=bot_username))
 
     reply_to: str | None = None
     replies_to_self = False
@@ -153,6 +184,46 @@ def translate_telegram_update(
         replies_to_self=replies_to_self,
         sender_is_bot=sender.get("is_bot") is True,
     )
+
+
+def encode_telegram_reply(
+    plan: ReplyPlan,
+    *,
+    capabilities: PlatformCapabilities,
+    reply_to_message_id: str | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Purely encode a reply plan into Telegram Bot API method/body pairs."""
+
+    actions: list[dict[str, object]] = []
+    for index, text in enumerate(plan.text_segments):
+        body: dict[str, object] = {"text": text}
+        if index == 0 and reply_to_message_id is not None:
+            body["reply_to_message_id"] = reply_to_message_id
+            body["allow_sending_without_reply"] = True
+        actions.append({"method": "sendMessage", "body": body})
+    for media in plan.media_segments:
+        if isinstance(media, ImageSegment) and capabilities.images:
+            actions.append({"method": "sendPhoto", "body": {"photo": _telegram_locator(media.url)}})
+        elif isinstance(media, StickerSegment) and capabilities.stickers:
+            actions.append(
+                {"method": "sendSticker", "body": {"sticker": _telegram_locator(media.id)}}
+            )
+        elif isinstance(media, VoiceSegment) and capabilities.voice_messages:
+            actions.append({"method": "sendVoice", "body": {"voice": _telegram_locator(media.url)}})
+        else:
+            fallback = (
+                f"[图片: {media.alt_text or media.url}]"
+                if isinstance(media, ImageSegment)
+                else f"[表情: {media.name or media.id}]"
+                if isinstance(media, StickerSegment)
+                else "[语音消息]"
+            )
+            actions.append({"method": "sendMessage", "body": {"text": fallback}})
+    return tuple(actions)
+
+
+def _telegram_locator(value: str) -> str:
+    return value.removeprefix("tg-file://")
 
 
 def _photo_area(size: RawMapping) -> int:

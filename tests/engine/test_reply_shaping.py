@@ -1,6 +1,6 @@
 from mybot.adapters.qq.translate import QQ_CAPABILITIES
 from mybot.adapters.telegram.translate import TELEGRAM_CAPABILITIES
-from mybot.contracts import Citation
+from mybot.contracts import Citation, ImageSegment, StickerSegment
 from mybot.engine.reply_shaping import EMPTY_REPLY_FALLBACK, shape_reply
 
 
@@ -51,7 +51,7 @@ def test_citations_set_the_plan_field_and_render_a_sources_footer() -> None:
 
     assert plan.citations == citations
     footer = plan.text_segments[-1]
-    assert "Sources:" in footer
+    assert "参考来源:" in footer
     assert "[1] Weather today — https://a.example/1" in footer
     assert "[2] https://b.example/2" in footer
     assert "https://b.example/2 — https://b.example/2" not in footer
@@ -63,7 +63,7 @@ def test_without_citations_the_output_is_unchanged() -> None:
 
     assert plain == explicit
     assert plain.citations == ()
-    assert "Sources:" not in plain.text_segments[-1]
+    assert "参考来源:" not in plain.text_segments[-1]
 
 
 def test_sources_footer_respects_the_segment_cap() -> None:
@@ -75,3 +75,39 @@ def test_sources_footer_respects_the_segment_cap() -> None:
 
     assert all(len(segment) <= 3_500 for segment in plan.text_segments)
     assert len(plan.text_segments) <= 3
+
+
+def test_shape_reply_extracts_validated_media_and_meme_directives() -> None:
+    plan = shape_reply(
+        "给你看看。\n\n"
+        '[[media:{"type":"image","url":"https://img.example/cat.png","alt_text":"猫"}]]\n'
+        '[[media:{"type":"sticker","id":"14","name":"微笑"}]]\n'
+        "[[meme:acknowledge]]",
+        capabilities=QQ_CAPABILITIES,
+    )
+
+    assert plan.text_segments == ("给你看看。",)
+    assert plan.media_segments == (
+        ImageSegment(url="https://img.example/cat.png", alt_text="猫"),
+        StickerSegment(id="14", name="微笑"),
+    )
+    assert plan.meme_intent == "acknowledge"
+
+
+def test_shape_reply_keeps_malformed_media_directive_as_readable_text() -> None:
+    plan = shape_reply(
+        '说明\n\n[[media:{"type":"image","url":"javascript:alert(1)"}]]',
+        capabilities=QQ_CAPABILITIES,
+    )
+
+    assert not plan.media_segments
+    assert "javascript" in "\n".join(plan.text_segments)
+
+
+def test_empty_reply_fallback_is_chinese_and_overrideable() -> None:
+    assert shape_reply(" ", capabilities=QQ_CAPABILITIES).text_segments == (
+        EMPTY_REPLY_FALLBACK,
+    )
+    assert shape_reply(
+        " ", capabilities=QQ_CAPABILITIES, empty_fallback="暂时无法回复。"
+    ).text_segments == ("暂时无法回复。",)

@@ -4,9 +4,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type { OperatorClient } from '../api';
 import { ConversationsPanel } from './ConversationsPanel';
 import { MemoriesPanel } from './MemoriesPanel';
+import { ModelsPanel } from './ModelsPanel';
 import { OverviewPanel } from './OverviewPanel';
 import { PersonaPanel } from './PersonaPanel';
 import { PluginsPanel } from './PluginsPanel';
+import { SandboxPanel } from './SandboxPanel';
 
 function stubClient(routes: Record<string, unknown>): OperatorClient & {
   sent: Array<{ method: string; path: string; body: unknown }>;
@@ -85,6 +87,20 @@ describe('ConversationsPanel', () => {
           },
         ],
       },
+      '/operator/conversations/conv-1/traces': {
+        traces: [
+          {
+            id: 'span-1',
+            trace_id: 'trace-1',
+            message_id: null,
+            stage: 'memory.retrieval',
+            status: 'ok',
+            duration_ms: 12,
+            attributes: { recalled: true, summary: '喜欢美式咖啡' },
+            created_at: null,
+          },
+        ],
+      },
       '/operator/conversations': {
         conversations: [
           {
@@ -108,6 +124,61 @@ describe('ConversationsPanel', () => {
     await waitFor(() => expect(screen.getByText('讲个笑话')).toBeInTheDocument());
     expect(screen.getByText(/replied \/ DIRECT_MESSAGE/)).toBeInTheDocument();
     expect(screen.getByText(/web_search\(timeout\)/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText(/追踪 · 1 个阶段/));
+    expect(screen.getByText(/memory.retrieval \/ ok/)).toBeInTheDocument();
+    expect(screen.getByText(/喜欢美式咖啡/)).toBeInTheDocument();
+  });
+});
+
+describe('SandboxPanel', () => {
+  it('submits a synthetic message and renders the persisted reply', async () => {
+    const client = stubClient({
+      '/operator/sandbox/messages': {
+        accepted: true,
+        session_id: 'debug-1',
+        trace_id: 'trace-1',
+        envelope_id: 'sandbox:1',
+      },
+      '/operator/sandbox/': {
+        status: 'ready',
+        session_id: 'debug-1',
+        messages: [
+          {
+            direction: 'inbound',
+            sender_identity_id: 'sandbox:operator',
+            text: '看图',
+            occurred_at: null,
+            trace_id: 'trace-1',
+          },
+          {
+            direction: 'outbound',
+            sender_identity_id: 'self',
+            text: '是一只猫',
+            occurred_at: null,
+            trace_id: 'trace-1',
+          },
+        ],
+        turns: [],
+        traces: [],
+      },
+    });
+
+    render(<SandboxPanel client={client} />);
+    fireEvent.change(screen.getByLabelText('消息'), { target: { value: '看图' } });
+    fireEvent.change(screen.getByLabelText('图片 URL（可选）'), {
+      target: { value: 'https://img.example/cat.png' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送到真实链路' }));
+
+    await screen.findByText('是一只猫');
+    expect(client.sent[0]).toMatchObject({
+      method: 'POST',
+      path: '/operator/sandbox/messages',
+    });
+    expect(client.sent[0].body).toMatchObject({
+      text: '看图',
+      image_urls: ['https://img.example/cat.png'],
+    });
   });
 });
 
@@ -213,5 +284,85 @@ describe('PersonaPanel', () => {
     expect(sendSpy).toHaveBeenCalledWith('PUT', '/operator/config/persona', {
       system_prompt: '你是高冷的猫娘助手。',
     });
+  });
+});
+
+describe('ModelsPanel', () => {
+  it('loads non-secret channels, saves JSON, and runs a connectivity test', async () => {
+    const payload = {
+      source: 'runtime',
+      channels: [
+        {
+          name: 'primary',
+          base_url: 'https://models.example/v1',
+          api_key_env: 'MODEL_API_KEY',
+          priority: 0,
+          weight: 1,
+          enabled: true,
+          model_map: { chat: { model: 'chat-model' } },
+        },
+      ],
+      usage: [
+        {
+          channel: 'primary',
+          calls: 3,
+          prompt_tokens: 100,
+          completion_tokens: 20,
+          cost_usd_micros: 80,
+          last_status: 'success',
+          last_called_at: '2026-07-27T00:00:00Z',
+        },
+      ],
+      daily_usage: [
+        {
+          day: '2026-07-27',
+          calls: 3,
+          prompt_tokens: 100,
+          completion_tokens: 20,
+          cost_usd_micros: 80,
+        },
+      ],
+      conversation_usage: [
+        {
+          conversation_id: '00000000-0000-0000-0000-000000000001',
+          stable_key: 'v1:qq-main:DIRECT:10001:0',
+          calls: 2,
+          prompt_tokens: 80,
+          completion_tokens: 10,
+          cost_usd_micros: 60,
+        },
+      ],
+    };
+    const client = stubClient({
+      '/operator/models/primary/test': {
+        ok: true,
+        channel: 'primary',
+        model: 'chat-model',
+        latency_ms: 12,
+      },
+      '/operator/models': payload,
+    });
+
+    render(<ModelsPanel client={client} />);
+
+    await screen.findByText('primary');
+    expect(screen.getAllByText(/\$0\.000080/)).toHaveLength(2);
+    expect(screen.getByText('2026-07-27')).toBeInTheDocument();
+    expect(screen.getByText('v1:qq-main:DIRECT:10001:0')).toBeInTheDocument();
+    expect(screen.getByLabelText('Model channels JSON')).not.toHaveValue(
+      expect.stringContaining('secret-key'),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save channels' }));
+    await waitFor(() =>
+      expect(client.sent[0]).toMatchObject({
+        method: 'PUT',
+        path: '/operator/models',
+        body: { channels: payload.channels },
+      }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test primary' }));
+    await screen.findByText('primary / chat-model / 12ms');
   });
 });

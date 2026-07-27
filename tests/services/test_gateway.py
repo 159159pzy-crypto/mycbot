@@ -12,7 +12,7 @@ from mybot.infrastructure.streams import (
     StreamPublisher,
 )
 from mybot.runtime import ProcessMode
-from mybot.services.gateway import GatewayService, typing_delay_seconds
+from mybot.services.gateway import GatewayService, SandboxSender, typing_delay_seconds
 
 
 @dataclass
@@ -173,3 +173,17 @@ async def test_delivery_to_missing_adapter_raises_for_redelivery() -> None:
     with pytest.raises(RuntimeError):
         await service.deliver_payload(outbound(platform=Platform.QQ).model_dump_json())
     assert deliveries.delivered == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_sender_completes_delivery_without_external_platform() -> None:
+    backend = MemoryStreamBackend()
+    service, deliveries = make_service(backend, qq=None, telegram=None)
+    service.sandbox = SandboxSender()
+    message = outbound(platform=Platform.SANDBOX)
+
+    await service.deliver_payload(message.model_dump_json())
+
+    assert deliveries.delivered == [
+        (message.internal_message_id, f"sandbox:{message.internal_message_id}")
+    ]

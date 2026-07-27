@@ -1,12 +1,26 @@
 """The authenticated operator console API."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from time import monotonic
 from typing import Protocol, cast
-from uuid import UUID
+from urllib.parse import urlparse
+from uuid import UUID, uuid4
 
+import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError
+from mybot.infrastructure.model_routing import (
+    MODEL_CHANNELS_KEY,
+    ModelAttemptSink,
+    ModelCallAttempt,
+    ModelChannel,
+    ModelPurpose,
+    calculate_cost_micros,
+    legacy_model_channels,
+)
 from mybot.plugins.broker import PluginBroker
 from mybot.repositories.audit import AuditRepository
 from mybot.repositories.operator_views import OperatorViews
@@ -40,6 +54,24 @@ class ApprovalsUpdate(BaseModel):
     approved_ids: list[str]
 
 
+class ModelsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channels: list[ModelChannel]
+
+
+class SandboxMessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = None
+    text: str | None = None
+    image_urls: list[str] = Field(default_factory=list)
+
+
+class SandboxPublisher(Protocol):
+    async def publish(self, payload: str) -> str: ...
+
+
 @dataclass(slots=True)
 class OperatorContext:
     views: OperatorViews
@@ -48,6 +80,9 @@ class OperatorContext:
     broker: PluginBroker
     streams: StreamLengths
     settings: Settings
+    model_client: httpx.AsyncClient
+    model_attempts: ModelAttemptSink
+    sandbox: SandboxPublisher | None = None
 
 
 def create_operator_router(context: OperatorContext) -> APIRouter:
@@ -78,6 +113,91 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
         rows = await context.views.turns(conversation_id, limit=_bound(limit))
         return {"turns": cast(JsonValue, rows)}
 
+    @router.get("/conversations/{conversation_id}/traces")
+    async def traces(  # pyright: ignore[reportUnusedFunction]
+        conversation_id: UUID, trace_id: str | None = None, limit: int = 200
+    ) -> dict[str, JsonValue]:
+        rows = await context.views.traces(
+            conversation_id, trace_id=trace_id, limit=_bound(limit)
+        )
+        return {"traces": cast(JsonValue, rows)}
+
+    @router.post("/sandbox/messages")
+    async def sandbox_message(  # pyright: ignore[reportUnusedFunction]
+        request: SandboxMessageInput,
+    ) -> dict[str, JsonValue]:
+        if context.sandbox is None:
+            raise HTTPException(status_code=503, detail="sandbox stream is unavailable")
+        text = (request.text or "").strip()
+        image_urls = [_validated_image_url(value) for value in request.image_urls[:4]]
+        if not text and not image_urls:
+            raise HTTPException(status_code=422, detail="text or image_urls is required")
+        if len(text) > context.settings.input_max_chars:
+            raise HTTPException(status_code=422, detail="sandbox text is too long")
+        session_id = _sandbox_session_id(request.session_id)
+        from mybot.adapters import InboundEvent
+        from mybot.contracts import ChatKind, ImageSegment, MessageEnvelope, Platform, TextSegment
+
+        segments: list[TextSegment | ImageSegment] = []
+        if text:
+            segments.append(TextSegment(text=text))
+        segments.extend(ImageSegment(url=url) for url in image_urls)
+        envelope = MessageEnvelope(
+            id=f"sandbox:{context.settings.sandbox_connection_id}:{uuid4()}",
+            connection_id=context.settings.sandbox_connection_id,
+            platform=Platform.SANDBOX,
+            chat_kind=ChatKind.DIRECT,
+            chat_id=session_id,
+            sender_identity_id="sandbox:operator",
+            occurred_at=datetime.now(tz=UTC),
+            segments=tuple(segments),
+            ephemeral=True,
+        )
+        await context.sandbox.publish(InboundEvent(envelope=envelope).model_dump_json())
+        await context.audit.record(
+            "sandbox.message",
+            {
+                "session_id": session_id,
+                "trace_id": envelope.trace_id,
+                "has_text": bool(text),
+                "image_count": len(image_urls),
+            },
+        )
+        return {
+            "accepted": True,
+            "session_id": session_id,
+            "trace_id": envelope.trace_id,
+            "envelope_id": envelope.id,
+        }
+
+    @router.get("/sandbox/{session_id}")
+    async def sandbox_session(  # pyright: ignore[reportUnusedFunction]
+        session_id: str,
+    ) -> dict[str, JsonValue]:
+        from mybot.contracts import ChatKind, ConversationKey
+
+        normalized = _sandbox_session_id(session_id)
+        key = ConversationKey(
+            connection_id=context.settings.sandbox_connection_id,
+            chat_kind=ChatKind.DIRECT,
+            chat_id=normalized,
+        )
+        conversation = await context.views.conversation_by_stable_key(key.stable_key)
+        if conversation is None:
+            return {"status": "pending", "session_id": normalized}
+        conversation_id = UUID(str(conversation["id"]))
+        message_rows = await context.views.messages(conversation_id, limit=200)
+        turn_rows = await context.views.turns(conversation_id, limit=100)
+        trace_rows = await context.views.traces(conversation_id, limit=500)
+        return {
+            "status": "ready",
+            "session_id": normalized,
+            "conversation": cast(JsonValue, conversation),
+            "messages": cast(JsonValue, message_rows),
+            "turns": cast(JsonValue, turn_rows),
+            "traces": cast(JsonValue, trace_rows),
+        }
+
     @router.get("/memories")
     async def memories(  # pyright: ignore[reportUnusedFunction]
         scope: str | None = None, include_revoked: bool = False, limit: int = 100
@@ -107,6 +227,138 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     ) -> dict[str, JsonValue]:
         rows = await context.views.usage(days=max(1, min(days, 90)))
         return {"usage": cast(JsonValue, rows)}
+
+    @router.get("/models")
+    async def models() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        raw = await context.config.get(MODEL_CHANNELS_KEY)
+        if isinstance(raw, list):
+            channels = [ModelChannel.model_validate(item) for item in raw]
+            source = "runtime"
+        else:
+            channels = list(legacy_model_channels(context.settings))
+            source = "legacy"
+        usage = await context.views.model_channel_usage(days=30)
+        daily_usage = await context.views.model_daily_usage(days=30)
+        conversation_usage = await context.views.model_conversation_usage(days=30, limit=10)
+        return {
+            "source": source,
+            "channels": cast(
+                JsonValue,
+                [channel.model_dump(mode="json") for channel in channels],
+            ),
+            "usage": cast(JsonValue, usage),
+            "daily_usage": cast(JsonValue, daily_usage),
+            "conversation_usage": cast(JsonValue, conversation_usage),
+        }
+
+    @router.put("/models")
+    async def set_models(  # pyright: ignore[reportUnusedFunction]
+        update: ModelsUpdate,
+    ) -> dict[str, JsonValue]:
+        names = [channel.name for channel in update.channels]
+        if len(names) != len(set(names)):
+            raise HTTPException(status_code=422, detail="model channel names must be unique")
+        embedding_models = {
+            channel.model_map[ModelPurpose.EMBEDDING].model
+            for channel in update.channels
+            if channel.enabled and ModelPurpose.EMBEDDING in channel.model_map
+        }
+        if len(embedding_models) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="all enabled embedding channels must use the same embedding model",
+            )
+        serialized = [channel.model_dump(mode="json") for channel in update.channels]
+        await context.config.set(MODEL_CHANNELS_KEY, cast(JsonValue, serialized))
+        await context.audit.record(
+            "models.update",
+            {"channels": cast(JsonValue, sorted(names))},
+        )
+        return {"saved": True, "channels": cast(JsonValue, serialized)}
+
+    @router.post("/models/{channel_name}/test")
+    async def test_model(  # pyright: ignore[reportUnusedFunction]
+        channel_name: str,
+    ) -> dict[str, JsonValue]:
+        raw = await context.config.get(MODEL_CHANNELS_KEY)
+        channels = (
+            [ModelChannel.model_validate(item) for item in raw]
+            if isinstance(raw, list)
+            else list(legacy_model_channels(context.settings))
+        )
+        channel = next((item for item in channels if item.name == channel_name), None)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="model channel not found")
+        target = channel.model_map.get(ModelPurpose.CHAT)
+        if target is None:
+            raise HTTPException(status_code=409, detail="channel has no chat model")
+        api_key = _model_secret(context.settings, channel.api_key_env)
+        started = monotonic()
+        client = LlmClient(
+            client=context.model_client,
+            base_url=channel.base_url,
+            api_key=api_key,
+            model=target.model,
+            temperature=0.0,
+            max_output_tokens=8,
+            timeout_seconds=min(context.settings.llm_timeout_seconds, 20.0),
+            max_retries=0,
+        )
+        try:
+            reply = await client.complete(
+                [ChatMessage(role="user", content="Reply with exactly OK")]
+            )
+        except Exception as error:
+            latency_ms = max(0, int((monotonic() - started) * 1_000))
+            retryable = isinstance(error, LlmError) and error.retryable
+            await context.model_attempts.record(
+                ModelCallAttempt(
+                    purpose=ModelPurpose.CHAT,
+                    channel=channel.name,
+                    model=target.model,
+                    status="retryable_error" if retryable else "permanent_error",
+                    latency_ms=latency_ms,
+                    input_price_per_million=target.input_price_per_million,
+                    output_price_per_million=target.output_price_per_million,
+                    error_code=type(error).__name__,
+                )
+            )
+            await context.audit.record(
+                "models.test",
+                {
+                    "channel": channel.name,
+                    "ok": False,
+                    "error_code": type(error).__name__,
+                },
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"model connectivity test failed: {type(error).__name__}",
+            ) from error
+        latency_ms = max(0, int((monotonic() - started) * 1_000))
+        await context.model_attempts.record(
+            ModelCallAttempt(
+                purpose=ModelPurpose.CHAT,
+                channel=channel.name,
+                model=reply.model,
+                status="success",
+                prompt_tokens=reply.prompt_tokens,
+                completion_tokens=reply.completion_tokens,
+                latency_ms=latency_ms,
+                input_price_per_million=target.input_price_per_million,
+                output_price_per_million=target.output_price_per_million,
+                cost_usd_micros=calculate_cost_micros(
+                    target, reply.prompt_tokens, reply.completion_tokens
+                ),
+            )
+        )
+        await context.audit.record("models.test", {"channel": channel.name, "ok": True})
+        return {
+            "ok": True,
+            "channel": channel.name,
+            "model": reply.model,
+            "latency_ms": latency_ms,
+        }
 
     @router.get("/metrics")
     async def metrics() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
@@ -147,9 +399,7 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     async def get_approvals() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
         value = await context.config.get(APPROVALS_KEY)
         approved: list[str] = (
-            [str(item) for item in cast(list[object], value)]
-            if isinstance(value, list)
-            else []
+            [str(item) for item in cast(list[object], value)] if isinstance(value, list) else []
         )
         return {"approved_ids": cast(JsonValue, approved)}
 
@@ -159,18 +409,14 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     ) -> dict[str, JsonValue]:
         approved = sorted({tool_id.strip() for tool_id in update.approved_ids if tool_id.strip()})
         await context.config.set(APPROVALS_KEY, cast(JsonValue, approved))
-        await context.audit.record(
-            "approvals.update", {"approved_ids": cast(JsonValue, approved)}
-        )
+        await context.audit.record("approvals.update", {"approved_ids": cast(JsonValue, approved)})
         return {"approved_ids": cast(JsonValue, approved)}
 
     @router.get("/config/proactive")
     async def get_proactive() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
         value = await context.config.get(OPTIN_KEY)
         enabled: list[str] = (
-            [str(item) for item in cast(list[object], value)]
-            if isinstance(value, list)
-            else []
+            [str(item) for item in cast(list[object], value)] if isinstance(value, list) else []
         )
         return {
             "enabled_conversations": cast(JsonValue, enabled),
@@ -181,9 +427,7 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     async def set_proactive(  # pyright: ignore[reportUnusedFunction]
         update: ProactiveUpdate,
     ) -> dict[str, JsonValue]:
-        enabled = sorted(
-            {key.strip() for key in update.enabled_conversations if key.strip()}
-        )
+        enabled = sorted({key.strip() for key in update.enabled_conversations if key.strip()})
         await context.config.set(OPTIN_KEY, cast(JsonValue, enabled))
         await context.audit.record(
             "proactive.update", {"enabled_conversations": cast(JsonValue, enabled)}
@@ -202,3 +446,32 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
 
 def _bound(limit: int) -> int:
     return max(1, min(limit, 500))
+
+
+def _sandbox_session_id(value: str | None) -> str:
+    candidate = (value or str(uuid4())).strip()
+    if not candidate or len(candidate) > 80:
+        raise HTTPException(status_code=422, detail="invalid sandbox session id")
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if any(char not in allowed for char in candidate):
+        raise HTTPException(status_code=422, detail="invalid sandbox session id")
+    return candidate
+
+
+def _validated_image_url(value: str) -> str:
+    candidate = value.strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(
+            status_code=422,
+            detail="sandbox image URL must use http or https",
+        )
+    if len(candidate) > 2_000:
+        raise HTTPException(status_code=422, detail="sandbox image URL is too long")
+    return candidate
+
+
+def _model_secret(settings: Settings, name: str | None) -> str | None:
+    if name is None:
+        return None
+    return settings.model_secret(name)

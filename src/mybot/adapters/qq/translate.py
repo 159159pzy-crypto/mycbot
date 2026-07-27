@@ -16,13 +16,17 @@ from mybot.adapters.payload import (
     get_str,
 )
 from mybot.contracts import (
+    AtSegment,
     ChatKind,
     FileSegment,
     ImageSegment,
     MessageEnvelope,
     Platform,
     PlatformCapabilities,
+    ReplyPlan,
+    StickerSegment,
     TextSegment,
+    VoiceSegment,
 )
 from mybot.contracts.json import FrozenJsonValue
 
@@ -34,11 +38,15 @@ QQ_CAPABILITIES = PlatformCapabilities(
     combined_media_text=True,
     threads=False,
     reactions=False,
+    images=True,
+    mentions=True,
+    stickers=True,
+    voice_messages=True,
 )
 
-type ContentSegment = TextSegment | ImageSegment | FileSegment
-
-_MENTION_PLACEHOLDER = "[mention]"
+type ContentSegment = (
+    TextSegment | ImageSegment | FileSegment | AtSegment | StickerSegment | VoiceSegment
+)
 
 
 def translate_qq_event(
@@ -95,15 +103,24 @@ def translate_qq_event(
         elif segment_type == "reply":
             reply_to = get_id(data, "id") or reply_to
         elif segment_type == "at":
-            if get_id(data, "qq") == str(self_id):
+            target_id = get_id(data, "qq")
+            if target_id is not None:
+                segments.append(AtSegment(target_id=target_id))
+            if target_id == str(self_id):
                 mentions_self = True
+        elif segment_type == "face":
+            sticker_id = get_id(data, "id")
+            if sticker_id is not None:
+                segments.append(StickerSegment(id=sticker_id))
+        elif segment_type == "record":
+            locator = get_str(data, "url") or get_str(data, "file")
+            if locator and locator.strip():
+                segments.append(VoiceSegment(url=locator.strip()))
         elif segment_type is not None:
-            segments.append(TextSegment(text=f"[unsupported: {segment_type}]"))
+            segments.append(TextSegment(text=f"[暂不支持的消息类型: {segment_type}]"))
 
     if not segments:
-        if not mentions_self:
-            return None
-        segments.append(TextSegment(text=_MENTION_PLACEHOLDER))
+        return None
 
     envelope = MessageEnvelope(
         id=qq_envelope_id(connection_id, message_id),
@@ -118,3 +135,39 @@ def translate_qq_event(
         raw_ref=cast(FrozenJsonValue, as_json_value(event)),
     )
     return InboundEvent(envelope=envelope, mentions_self=mentions_self, replies_to_self=False)
+
+
+def encode_qq_reply(
+    plan: ReplyPlan,
+    *,
+    capabilities: PlatformCapabilities,
+    reply_to_message_id: str | None = None,
+) -> tuple[tuple[dict[str, object], ...], ...]:
+    """Purely encode a reply plan into OneBot v11 message arrays."""
+
+    messages: list[list[dict[str, object]]] = []
+    for index, text in enumerate(plan.text_segments):
+        encoded: list[dict[str, object]] = []
+        if index == 0 and reply_to_message_id is not None:
+            encoded.append({"type": "reply", "data": {"id": reply_to_message_id}})
+        encoded.append({"type": "text", "data": {"text": text}})
+        messages.append(encoded)
+    target = messages[-1]
+    for media in plan.media_segments:
+        if isinstance(media, ImageSegment) and capabilities.images:
+            target.append({"type": "image", "data": {"file": media.url}})
+        elif isinstance(media, StickerSegment) and capabilities.stickers:
+            target.append({"type": "face", "data": {"id": media.id}})
+        elif isinstance(media, VoiceSegment) and capabilities.voice_messages:
+            target.append({"type": "record", "data": {"file": media.url}})
+        else:
+            target.append({"type": "text", "data": {"text": _media_fallback(media)}})
+    return tuple(tuple(message) for message in messages)
+
+
+def _media_fallback(media: ImageSegment | StickerSegment | VoiceSegment) -> str:
+    if isinstance(media, ImageSegment):
+        return f"[图片: {media.alt_text or media.url}]"
+    if isinstance(media, StickerSegment):
+        return f"[表情: {media.name or media.id}]"
+    return "[语音消息]"
