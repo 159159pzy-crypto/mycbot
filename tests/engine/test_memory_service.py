@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -6,7 +7,11 @@ import pytest
 
 from mybot.contracts import (
     ChatKind,
+    CoreBlock,
+    CoreBlockLabel,
     MemoryItem,
+    MemoryMergeDecision,
+    MemoryOperation,
     MemoryPrivacy,
     MemoryScope,
     MessageEnvelope,
@@ -14,9 +19,15 @@ from mybot.contracts import (
     TextSegment,
 )
 from mybot.engine.memory_service import MemoryService
+from mybot.engine.prompt import HistoryEntry
 from mybot.infrastructure.embeddings import EmbeddingError
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply
-from mybot.repositories.memory import ScoredMemory
+from mybot.repositories.core_memory import CoreBlockRecord
+from mybot.repositories.memory import (
+    MemoryRecord,
+    MergeApplication,
+    ScoredMemory,
+)
 
 NOW = datetime(2026, 7, 26, 12, tzinfo=UTC)
 
@@ -36,11 +47,16 @@ class FakeEmbeddings:
 @dataclass
 class FakeStore:
     results: tuple[ScoredMemory, ...] = ()
+    similar: tuple[MemoryRecord, ...] = ()
     stored: list[tuple[MemoryItem, list[float] | None, str | None]] = field(
         default_factory=list
     )
     searches: list[dict[str, object]] = field(default_factory=list)
     revoked: list[dict[str, object]] = field(default_factory=list)
+    merge_queries: list[dict[str, object]] = field(default_factory=list)
+    merges: list[tuple[MemoryItem, MemoryMergeDecision, dict[str, object]]] = field(
+        default_factory=list
+    )
 
     async def store(self, item, *, embedding, embedding_model):  # type: ignore[no-untyped-def]
         self.stored.append((item, list(embedding) if embedding else None, embedding_model))
@@ -50,21 +66,79 @@ class FakeStore:
         self.searches.append(kwargs)
         return self.results
 
+    async def similar_for_merge(self, item, **kwargs):  # type: ignore[no-untyped-def]
+        self.merge_queries.append({"item": item, **kwargs})
+        return self.similar
+
+    async def apply_merge(self, candidate, decision, **kwargs):  # type: ignore[no-untyped-def]
+        self.merges.append((candidate, decision, kwargs))
+        if decision.operation in {MemoryOperation.ADD, MemoryOperation.UPDATE}:
+            self.stored.append(
+                (
+                    candidate.model_copy(
+                        update={
+                            "content": decision.content or candidate.content,
+                            "kind": decision.kind or candidate.kind,
+                            "confidence": decision.confidence or candidate.confidence,
+                        }
+                    ),
+                    list(kwargs["embedding"]) if kwargs.get("embedding") else None,
+                    kwargs.get("embedding_model"),
+                )
+            )
+        return MergeApplication(
+            operation=decision.operation,
+            memory_id=(
+                candidate.id
+                if decision.operation in {MemoryOperation.ADD, MemoryOperation.UPDATE}
+                else None
+            ),
+            previous_memory_id=decision.target_id,
+            applied=decision.operation is not MemoryOperation.NOOP,
+        )
+
     async def revoke_for(self, **kwargs):  # type: ignore[no-untyped-def]
         self.revoked.append(kwargs)
         return 4
 
 
 @dataclass
+class FakeCoreStore:
+    records: tuple[CoreBlockRecord, ...]
+
+    async def visible_for(self, subject_identity_id: str) -> tuple[CoreBlockRecord, ...]:
+        return self.records
+
+
+@dataclass
+class FakeOnce:
+    acquired: bool = True
+    calls: list[tuple[str, int]] = field(default_factory=list)
+
+    async def acquire_once(self, key: str, *, ttl_seconds: int) -> bool:
+        self.calls.append((key, ttl_seconds))
+        return self.acquired
+
+
+@dataclass
 class ScriptedLlm:
     reply: LlmReply | None = None
+    replies: list[LlmReply] = field(default_factory=list)
+    sequence: list[LlmReply | LlmError] = field(default_factory=list)
     error: LlmError | None = None
     calls: list[list[ChatMessage]] = field(default_factory=list)
 
     async def complete(self, messages, *, tools=None):  # type: ignore[no-untyped-def]
         self.calls.append(list(messages))
+        if self.sequence:
+            outcome = self.sequence.pop(0)
+            if isinstance(outcome, LlmError):
+                raise outcome
+            return outcome
         if self.error is not None:
             raise self.error
+        if self.replies:
+            return self.replies.pop(0)
         assert self.reply is not None
         return self.reply
 
@@ -95,6 +169,33 @@ def scored(content: str, *, distance: float = 0.1, memory_id: UUID | None = None
         created_at=datetime(2026, 7, 1, tzinfo=UTC),
         distance=distance,
         supersedes=(),
+    )
+
+
+def candidate(content: str = "喜欢美式咖啡") -> MemoryItem:
+    return MemoryItem(
+        scope=MemoryScope.SUBJECT,
+        subject_identity_id="telegram:777",
+        kind="preference",
+        content=content,
+        source_message_ids=("telegram:telegram-main:777:88",),
+        confidence=0.9,
+        privacy=MemoryPrivacy.PRIVATE,
+    )
+
+
+def existing(content: str = "喜欢咖啡") -> MemoryRecord:
+    return MemoryRecord(
+        id=uuid4(),
+        scope=MemoryScope.SUBJECT,
+        subject_identity_id="telegram:777",
+        conversation_stable_key=None,
+        privacy=MemoryPrivacy.PRIVATE,
+        kind="preference",
+        content=content,
+        confidence=0.8,
+        source_message_ids=("old-message",),
+        created_at=NOW,
     )
 
 
@@ -179,6 +280,63 @@ async def test_no_memories_yields_no_block() -> None:
 
 
 @pytest.mark.asyncio
+async def test_core_memory_is_always_rendered_for_non_ephemeral_turns() -> None:
+    record = CoreBlockRecord(
+        block=CoreBlock(
+            label=CoreBlockLabel.USER_PROFILE,
+            subject_identity_id="telegram:777",
+            content="用户偏好无糖美式",
+            token_budget=600,
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    service, _, _ = make_service()
+    service.core_store = FakeCoreStore((record,))
+
+    block = await service.core_block(envelope())
+
+    assert block is not None
+    assert "[user_profile]" in block
+    assert "用户偏好无糖美式" in block
+
+
+@pytest.mark.asyncio
+async def test_pre_truncation_flush_is_debounced_and_uses_dropped_source_ids() -> None:
+    llm = ScriptedLlm(
+        reply=LlmReply(
+            text=(
+                '[{"content":"用户在上海工作","kind":"fact",'
+                '"scope":"subject","confidence":0.9}]'
+            ),
+            model="memory-model",
+            prompt_tokens=20,
+            completion_tokens=8,
+        )
+    )
+    once = FakeOnce()
+    service, store, _ = make_service(llm=llm)
+    service.flush_once = once
+    history = (
+        HistoryEntry(
+            direction="inbound",
+            sender="telegram:777",
+            text="我在上海工作",
+            source_id="message-old",
+        ),
+    )
+
+    outcome = await service.flush_history(envelope(), history)
+
+    assert outcome.stored == 1
+    assert store.stored[0][0].source_message_ids == ("message-old",)
+    assert once.calls[0][0].startswith("mybot:memory-flush:")
+
+    once.acquired = False
+    assert (await service.flush_history(envelope(), history)).stored == 0
+
+
+@pytest.mark.asyncio
 async def test_extraction_stores_policy_filtered_candidates() -> None:
     llm = ScriptedLlm(
         reply=LlmReply(
@@ -249,6 +407,78 @@ async def test_extraction_llm_failure_is_swallowed() -> None:
     outcome = await service.extract_and_store(envelope(), "回复")
 
     assert outcome.stored == 0
+    assert store.stored == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected_stored"),
+    [("UPDATE", 1), ("DELETE", 0), ("NOOP", 0)],
+)
+async def test_merge_applies_structured_operation(
+    operation: str, expected_stored: int
+) -> None:
+    current = existing()
+    payload: dict[str, object] = {"operation": operation}
+    if operation in {"UPDATE", "DELETE"}:
+        payload["target_id"] = str(current.id)
+    if operation == "UPDATE":
+        payload["content"] = "喜欢无糖美式咖啡"
+    llm = ScriptedLlm(
+        reply=LlmReply(
+            text=json.dumps(payload),
+            model="memory-model",
+            prompt_tokens=12,
+            completion_tokens=4,
+        )
+    )
+    store = FakeStore(similar=(current,))
+    service, _, _ = make_service(store=store, llm=llm)
+
+    applied, usage = await service.merge_item(candidate(), source="test")
+
+    assert applied.operation.value == operation
+    assert len(store.stored) == expected_stored
+    assert usage == (12, 4)
+    assert store.merge_queries[0]["item"].scope is MemoryScope.SUBJECT
+    assert store.merge_queries[0]["item"].privacy is MemoryPrivacy.PRIVATE
+
+
+@pytest.mark.asyncio
+async def test_merge_rejects_target_not_returned_by_similarity_search() -> None:
+    current = existing()
+    llm = ScriptedLlm(
+        reply=LlmReply(
+            text=(
+                '{"operation":"UPDATE","target_id":"'
+                + str(uuid4())
+                + '","content":"伪造更新"}'
+            ),
+            model="memory-model",
+            prompt_tokens=0,
+            completion_tokens=0,
+        )
+    )
+    store = FakeStore(similar=(current,))
+    service, _, _ = make_service(store=store, llm=llm)
+
+    applied, _ = await service.merge_item(candidate(), source="test")
+
+    assert applied.operation is MemoryOperation.NOOP
+    assert store.stored == []
+
+
+@pytest.mark.asyncio
+async def test_merge_llm_failure_does_not_append_a_duplicate() -> None:
+    store = FakeStore(similar=(existing(),))
+    service, _, _ = make_service(
+        store=store,
+        llm=ScriptedLlm(error=LlmError("down", retryable=True)),
+    )
+
+    applied, _ = await service.merge_item(candidate(), source="test")
+
+    assert applied.operation is MemoryOperation.NOOP
     assert store.stored == []
 
 

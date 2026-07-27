@@ -1,5 +1,6 @@
 """Read-only aggregate queries backing the operator console."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
@@ -7,6 +8,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from pydantic import JsonValue
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -230,6 +232,7 @@ class OperatorViews:
         *,
         scope: str | None = None,
         include_revoked: bool = False,
+        state: str = "active",
         limit: int = 100,
     ) -> list[dict[str, JsonValue]]:
         clauses = ["1 = 1"]
@@ -237,8 +240,16 @@ class OperatorViews:
         if scope is not None:
             clauses.append("scope = :scope")
             params["scope"] = scope
-        if not include_revoked:
-            clauses.append("revoked_at IS NULL")
+        if include_revoked:
+            state = "all"
+        if state == "active":
+            clauses.extend(["revoked_at IS NULL", "invalid_at IS NULL"])
+        elif state == "invalidated":
+            clauses.append("invalid_at IS NOT NULL AND revoked_at IS NULL")
+        elif state == "revoked":
+            clauses.append("revoked_at IS NOT NULL")
+        elif state != "all":
+            raise ValueError("memory state must be active, invalidated, revoked, or all")
         where = " AND ".join(clauses)
         async with self.sessions() as session:
             rows = (
@@ -248,7 +259,8 @@ class OperatorViews:
                             f"""
                         SELECT id, scope, subject_identity_id, conversation_stable_key,
                                kind, content, confidence, privacy, revoked_at,
-                               revoked_reason, created_at, last_accessed_at
+                               revoked_reason, invalid_at, invalidated_by, supersedes,
+                               created_at, last_accessed_at
                         FROM memory_items
                         WHERE {where}
                         ORDER BY created_at DESC
@@ -273,11 +285,173 @@ class OperatorViews:
                     "privacy": row["privacy"],
                     "revoked_at": _iso(row["revoked_at"]),
                     "revoked_reason": row["revoked_reason"],
+                    "invalid_at": _iso(row["invalid_at"]),
+                    "invalidated_by": (
+                        str(row["invalidated_by"])
+                        if row["invalidated_by"] is not None
+                        else None
+                    ),
+                    "supersedes": cast(JsonValue, row["supersedes"]),
+                    "state": (
+                        "revoked"
+                        if row["revoked_at"] is not None
+                        else "invalidated"
+                        if row["invalid_at"] is not None
+                        else "active"
+                    ),
                     "created_at": _iso(row["created_at"]),
                     "last_accessed_at": _iso(row["last_accessed_at"]),
                 }
                 for row in rows
             ]
+
+    async def memory_history(self, memory_id: UUID) -> list[dict[str, JsonValue]]:
+        async with self.sessions() as session:
+            target = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT scope, subject_identity_id, conversation_stable_key,
+                               privacy
+                        FROM memory_items WHERE id = :id
+                        """
+                    ),
+                    {"id": memory_id},
+                )
+            ).mappings().one_or_none()
+            if target is None:
+                return []
+            rows = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT id, scope, subject_identity_id, conversation_stable_key,
+                               kind, content, confidence, privacy, supersedes,
+                               invalid_at, invalidated_by, revoked_at, revoked_reason,
+                               created_at
+                        FROM memory_items
+                        WHERE scope = :scope AND privacy = :privacy
+                          AND subject_identity_id IS NOT DISTINCT FROM :subject
+                          AND conversation_stable_key IS NOT DISTINCT FROM :conversation
+                        ORDER BY created_at ASC, id ASC
+                        LIMIT 500
+                        """
+                    ),
+                    {
+                        "scope": target["scope"],
+                        "privacy": target["privacy"],
+                        "subject": target["subject_identity_id"],
+                        "conversation": target["conversation_stable_key"],
+                    },
+                )
+            ).mappings().all()
+        connected = _connected_memory_ids(rows, memory_id)
+        return [
+            {
+                "id": str(row["id"]),
+                "scope": row["scope"],
+                "subject_identity_id": row["subject_identity_id"],
+                "conversation_stable_key": row["conversation_stable_key"],
+                "kind": row["kind"],
+                "content": row["content"],
+                "confidence": float(row["confidence"]),
+                "privacy": row["privacy"],
+                "supersedes": cast(JsonValue, row["supersedes"]),
+                "invalid_at": _iso(row["invalid_at"]),
+                "invalidated_by": (
+                    str(row["invalidated_by"])
+                    if row["invalidated_by"] is not None
+                    else None
+                ),
+                "revoked_at": _iso(row["revoked_at"]),
+                "revoked_reason": row["revoked_reason"],
+                "state": (
+                    "revoked"
+                    if row["revoked_at"] is not None
+                    else "invalidated"
+                    if row["invalid_at"] is not None
+                    else "active"
+                ),
+                "created_at": _iso(row["created_at"]),
+            }
+            for row in rows
+            if row["id"] in connected
+        ]
+
+    async def memory_operations(
+        self, memory_id: UUID, *, limit: int = 100
+    ) -> list[dict[str, JsonValue]]:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT id, operation, source, memory_id, previous_memory_id,
+                               detail, created_at
+                        FROM memory_operation_audit
+                        WHERE memory_id = :id OR previous_memory_id = :id
+                        ORDER BY created_at DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"id": memory_id, "limit": limit},
+                )
+            ).mappings().all()
+            return [
+                {
+                    "id": str(row["id"]),
+                    "operation": row["operation"],
+                    "source": row["source"],
+                    "memory_id": str(row["memory_id"]) if row["memory_id"] else None,
+                    "previous_memory_id": (
+                        str(row["previous_memory_id"])
+                        if row["previous_memory_id"]
+                        else None
+                    ),
+                    "detail": cast(JsonValue, row["detail"]),
+                    "created_at": _iso(row["created_at"]),
+                }
+                for row in rows
+            ]
+
+    async def core_blocks(self, *, limit: int = 200) -> list[dict[str, JsonValue]]:
+        from mybot.repositories.core_memory import CoreBlockRepository
+
+        records = await CoreBlockRepository(self.sessions).list_all(limit=limit)
+        return [
+            {
+                **record.block.model_dump(mode="json"),
+                "id": str(record.block.id),
+                "created_at": record.created_at.isoformat(),
+                "updated_at": record.updated_at.isoformat(),
+            }
+            for record in records
+        ]
+
+    async def replace_core_block(
+        self,
+        *,
+        label: str,
+        subject_identity_id: str | None,
+        content: str,
+        token_budget: int,
+    ) -> dict[str, JsonValue]:
+        from mybot.contracts import CoreBlockLabel
+        from mybot.repositories.core_memory import CoreBlockRepository
+
+        record = await CoreBlockRepository(self.sessions).replace(
+            label=CoreBlockLabel(label),
+            subject_identity_id=subject_identity_id,
+            content=content,
+            token_budget=token_budget,
+            source="operator",
+        )
+        return {
+            **record.block.model_dump(mode="json"),
+            "id": str(record.block.id),
+            "created_at": record.created_at.isoformat(),
+            "updated_at": record.updated_at.isoformat(),
+        }
 
     async def revoke_memory(self, memory_id: UUID) -> bool:
         async with self.sessions() as session:
@@ -510,3 +684,32 @@ def _texts(segments: object) -> str:
                 if isinstance(text, str):
                     parts.append(text)
     return "\n".join(parts)
+
+
+def _connected_memory_ids(rows: Sequence[RowMapping], start: UUID) -> set[UUID]:
+    adjacency: dict[UUID, set[UUID]] = {}
+    for row in rows:
+        memory_id = cast(UUID, row["id"])
+        adjacency.setdefault(memory_id, set())
+        invalidated_by = row["invalidated_by"]
+        if isinstance(invalidated_by, UUID):
+            adjacency[memory_id].add(invalidated_by)
+            adjacency.setdefault(invalidated_by, set()).add(memory_id)
+        supersedes = row["supersedes"]
+        if isinstance(supersedes, list):
+            for raw in cast(list[object], supersedes):
+                try:
+                    predecessor = UUID(str(raw))
+                except ValueError:
+                    continue
+                adjacency[memory_id].add(predecessor)
+                adjacency.setdefault(predecessor, set()).add(memory_id)
+    connected: set[UUID] = set()
+    pending = [start]
+    while pending:
+        current = pending.pop()
+        if current in connected:
+            continue
+        connected.add(current)
+        pending.extend(adjacency.get(current, ()))
+    return connected

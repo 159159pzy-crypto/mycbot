@@ -24,6 +24,18 @@ class MemoryPrivacy(StrEnum):
     SENSITIVE = "SENSITIVE"
 
 
+class MemoryOperation(StrEnum):
+    ADD = "ADD"
+    UPDATE = "UPDATE"
+    DELETE = "DELETE"
+    NOOP = "NOOP"
+
+
+class CoreBlockLabel(StrEnum):
+    PERSONA = "persona"
+    USER_PROFILE = "user_profile"
+
+
 class MemoryItem(FrozenModel):
     id: UUID = Field(default_factory=uuid4)
     scope: MemoryScope
@@ -38,10 +50,12 @@ class MemoryItem(FrozenModel):
     valid_until: datetime | None = None
     conflicts_with: tuple[UUID, ...] = ()
     supersedes: tuple[UUID, ...] = ()
+    invalid_at: datetime | None = None
+    invalidated_by: UUID | None = None
     revoked_at: datetime | None = None
     revoked_reason: NonEmptyStr | None = None
 
-    @field_validator("valid_from", "valid_until", "revoked_at")
+    @field_validator("valid_from", "valid_until", "invalid_at", "revoked_at")
     @classmethod
     def validate_timestamps(
         cls, value: datetime | None, info: ValidationInfo
@@ -72,6 +86,50 @@ class MemoryItem(FrozenModel):
             raise ValueError("valid_until must be later than valid_from")
         if (self.revoked_at is None) != (self.revoked_reason is None):
             raise ValueError("revoked_at and revoked_reason must be set together")
+        if self.invalidated_by is not None and self.invalid_at is None:
+            raise ValueError("invalidated_by requires invalid_at")
+        if self.invalidated_by == self.id:
+            raise ValueError("a memory item cannot invalidate itself")
         if self.id in self.conflicts_with or self.id in self.supersedes:
             raise ValueError("a memory item cannot conflict with or supersede itself")
+        return self
+
+
+class MemoryMergeDecision(FrozenModel):
+    operation: MemoryOperation
+    target_id: UUID | None = None
+    content: NonEmptyStr | None = None
+    kind: NonEmptyStr | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_operation_shape(self) -> Self:
+        if self.operation is MemoryOperation.ADD:
+            if self.target_id is not None or self.content is None:
+                raise ValueError("ADD requires content and forbids target_id")
+        elif self.operation is MemoryOperation.UPDATE:
+            if self.target_id is None or self.content is None:
+                raise ValueError("UPDATE requires target_id and content")
+        elif self.operation is MemoryOperation.DELETE:
+            if self.target_id is None or self.content is not None:
+                raise ValueError("DELETE requires target_id and forbids content")
+        elif self.content is not None:
+            raise ValueError("NOOP forbids content")
+        return self
+
+
+class CoreBlock(FrozenModel):
+    id: UUID = Field(default_factory=uuid4)
+    label: CoreBlockLabel
+    subject_identity_id: NonEmptyStr | None = None
+    content: str = ""
+    token_budget: int = Field(default=400, ge=50, le=20_000)
+    version: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def validate_owner(self) -> Self:
+        if self.label is CoreBlockLabel.PERSONA and self.subject_identity_id is not None:
+            raise ValueError("persona core block is global")
+        if self.label is CoreBlockLabel.USER_PROFILE and self.subject_identity_id is None:
+            raise ValueError("user_profile core block requires subject_identity_id")
         return self

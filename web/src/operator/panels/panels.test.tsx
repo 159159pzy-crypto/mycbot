@@ -248,6 +248,88 @@ describe('MemoriesPanel', () => {
       path: '/operator/memories/mem-1/revoke',
     });
   });
+
+  it('shows version history and saves bounded core memory', async () => {
+    const baseMemory = {
+      id: 'mem-2',
+      scope: 'SUBJECT',
+      subject_identity_id: 'telegram:777',
+      conversation_stable_key: null,
+      kind: 'preference',
+      content: '偏好无糖美式',
+      confidence: 0.9,
+      privacy: 'PRIVATE',
+      revoked_at: null,
+      revoked_reason: null,
+      invalid_at: null,
+      invalidated_by: null,
+      supersedes: ['mem-1'],
+      state: 'active',
+      created_at: null,
+    };
+    const client = stubClient({
+      '/operator/memories/mem-2/history': {
+        history: [
+          { ...baseMemory, id: 'mem-1', content: '偏好咖啡', state: 'invalidated' },
+          baseMemory,
+        ],
+      },
+      '/operator/memories/mem-2/operations': {
+        operations: [
+          {
+            id: 'op-1',
+            operation: 'UPDATE',
+            source: 'post_turn',
+            memory_id: 'mem-2',
+            previous_memory_id: 'mem-1',
+            detail: {},
+            created_at: null,
+          },
+        ],
+      },
+      '/operator/core-blocks/persona': { core_block: {} },
+      '/operator/core-blocks': {
+        core_blocks: [
+          {
+            id: 'core-1',
+            label: 'persona',
+            subject_identity_id: null,
+            content: '简洁、友好',
+            token_budget: 800,
+            version: 2,
+            created_at: '2026-07-28T00:00:00Z',
+            updated_at: '2026-07-28T00:00:00Z',
+          },
+        ],
+      },
+      '/operator/memories': { memories: [baseMemory] },
+    });
+
+    render(<MemoriesPanel client={client} />);
+
+    await screen.findByText('偏好无糖美式');
+    fireEvent.click(screen.getByRole('button', { name: '版本' }));
+    await screen.findByText(/invalidated · 偏好咖啡/);
+    expect(screen.getByText('UPDATE · post_turn')).toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole('button', { name: /人设 · v2/ }));
+    fireEvent.change(screen.getByLabelText('核心块内容'), {
+      target: { value: '简洁、友好、主动核对事实' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存核心块' }));
+
+    await waitFor(() =>
+      expect(client.sent).toContainEqual({
+        method: 'PUT',
+        path: '/operator/core-blocks/persona',
+        body: {
+          subject_identity_id: null,
+          content: '简洁、友好、主动核对事实',
+          token_budget: 800,
+        },
+      }),
+    );
+  });
 });
 
 describe('PluginsPanel', () => {

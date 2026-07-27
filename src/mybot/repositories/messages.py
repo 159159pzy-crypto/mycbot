@@ -35,6 +35,7 @@ class MessageText:
     direction: str
     sender: str
     text: str
+    id: UUID | None = None
 
 
 def _text_from_segments(segments: object) -> str:
@@ -176,6 +177,7 @@ class MessageRepository:
         async with self.sessions() as session:
             rows = await session.execute(
                 sa.select(
+                    messages_table.c.id,
                     messages_table.c.direction,
                     messages_table.c.sender_identity_id,
                     messages_table.c.segments,
@@ -185,11 +187,16 @@ class MessageRepository:
                 .limit(limit)
             )
             extracted: list[MessageText] = []
-            for direction, sender, segments in rows:
+            for message_id, direction, sender, segments in rows:
                 text = _text_from_segments(segments)
                 if text:
                     extracted.append(
-                        MessageText(direction=str(direction), sender=str(sender), text=text)
+                        MessageText(
+                            direction=str(direction),
+                            sender=str(sender),
+                            text=text,
+                            id=message_id,
+                        )
                     )
             return tuple(extracted)
 

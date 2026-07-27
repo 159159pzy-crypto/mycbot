@@ -74,6 +74,22 @@ class Settings(BaseSettings):
     memory_min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     memory_retrieval_limit: int = Field(default=5, ge=1, le=20)
     memory_token_budget: int = Field(default=1_200, ge=100, le=20_000)
+    memory_core_persona_token_budget: int = Field(default=800, ge=50, le=20_000)
+    memory_core_user_profile_token_budget: int = Field(default=600, ge=50, le=20_000)
+    memory_core_tools_approval_required: bool = True
+    memory_flush_enabled: bool = True
+    memory_flush_debounce_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    memory_flush_max_messages: int = Field(default=24, ge=1, le=200)
+    memory_flush_token_budget: int = Field(default=2_000, ge=100, le=20_000)
+    memory_consolidation_enabled: bool = True
+    memory_consolidation_interval_seconds: int = Field(
+        default=86_400, ge=3_600, le=604_800
+    )
+    memory_consolidation_lookback_hours: int = Field(default=48, ge=1, le=720)
+    memory_consolidation_conversation_limit: int = Field(default=20, ge=1, le=200)
+    memory_consolidation_message_limit: int = Field(default=40, ge=2, le=200)
+    memory_consolidation_memory_limit: int = Field(default=20, ge=1, le=100)
+    memory_consolidation_token_budget: int = Field(default=4_000, ge=256, le=32_000)
     memory_decay_days: int = Field(default=90, ge=1, le=3_650)
     memory_decay_factor: float = Field(default=0.8, gt=0.0, le=1.0)
     memory_confidence_floor: float = Field(default=0.2, ge=0.0, le=1.0)
@@ -101,7 +117,7 @@ class Settings(BaseSettings):
     plugin_catalog_ttl_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
     plugin_result_max_chars: int = Field(default=16_000, ge=1_000, le=200_000)
     searxng_url: str = "http://127.0.0.1:8080"
-    agent_granted_capabilities: str = "web.search,web.fetch"
+    agent_granted_capabilities: str = "web.search,web.fetch,memory.write"
     tool_max_calls_per_turn: int = Field(default=5, ge=1, le=20)
     tool_timeout_seconds: float = Field(default=15.0, gt=0.0, le=120.0)
     turn_deadline_seconds: float = Field(default=90.0, gt=0.0, le=600.0)

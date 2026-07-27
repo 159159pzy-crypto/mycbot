@@ -30,6 +30,11 @@ production:
   OpenAI-compatible endpoint.
 - `MYBOT_EMBEDDING_*` — an embeddings-capable endpoint, or leave both empty
   to run without memory.
+- Review `MYBOT_MEMORY_CONSOLIDATION_*` and `MYBOT_MEMORY_FLUSH_*` budgets.
+  Defaults are bounded and enabled; both can be disabled independently.
+- Keep core-memory tools approval-required in production. Grant
+  `memory_append`/`memory_replace` only after reviewing the persona/profile
+  blocks in the Memories panel.
 - `MYBOT_MODEL_API_KEYS` — optional JSON secret map for channels managed in
   the Models panel. Channel configuration stores only reference names.
 - Platform credentials: `MYBOT_TELEGRAM_BOT_TOKEN` and/or `NAPCAT_WS_URL` +
@@ -69,6 +74,11 @@ docker compose run --rm api alembic upgrade head
 docker compose up -d
 curl -s http://127.0.0.1:8000/health/ready
 ```
+
+Migration `20260728_0009` enables `pg_trgm`, adds temporal invalidation and
+memory audit tables, and creates core blocks. PostgreSQL therefore needs
+permission to create the extension on first upgrade. The shared `vector` and
+`pg_trgm` extensions are intentionally retained on downgrade.
 
 Expect `{"status": "ready", ...}`. The web console is on
 `http://127.0.0.1:4173` until the proxy from §5 fronts it.

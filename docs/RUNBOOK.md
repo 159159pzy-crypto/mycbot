@@ -135,16 +135,25 @@ per platform, the Models panel connectivity test, and no auth errors in
 Users own the fastest path: `/forget` in chat immediately revokes the
 sender's subject-scoped memories (and, in a direct chat, that
 conversation's memories) and reports the count. Operators work in the
-console's Memories panel — filter by scope or revocation state, revoke
-any item one click at a time; every revocation is written to the
-`operator_audit` table.
+console's Memories panel — filter by scope, include invalidated/revoked
+versions, expand a predecessor/successor chain, inspect merge audit, edit
+bounded core blocks, or revoke any active item. Operator mutations are also
+written to `operator_audit`.
 
 The maintenance worker automates the rest on
 `MYBOT_MEMORY_MAINTENANCE_INTERVAL_SECONDS`: items past `valid_until` are
-revoked, items untouched for `MYBOT_MEMORY_DECAY_DAYS` lose confidence
-(falling below the floor revokes them), and rows revoked more than
-`MYBOT_MEMORY_REVOKED_RETENTION_DAYS` ago are deleted permanently.
+invalidated, items untouched for `MYBOT_MEMORY_DECAY_DAYS` lose confidence
+(falling below the floor invalidates them), and only privacy-revoked rows more
+than `MYBOT_MEMORY_REVOKED_RETENTION_DAYS` old are deleted permanently. The
+separate sleep pass is controlled by `MYBOT_MEMORY_CONSOLIDATION_*`; disable it
+immediately with `MYBOT_MEMORY_CONSOLIDATION_ENABLED=false` if reviews look
+too aggressive.
 Confirm it is running from `docker compose logs maintenance-worker`.
+
+Pre-truncation extraction is controlled by `MYBOT_MEMORY_FLUSH_*`. Its Redis
+key is `mybot:memory-flush:<sha256-stable-key>` and contains no raw conversation
+identity. Disable it with `MYBOT_MEMORY_FLUSH_ENABLED=false` when diagnosing
+model behavior; normal prompt truncation and replies continue.
 
 Two practices worth keeping: review the Memories panel after enabling a
 new group (extraction is conservative, but groups produce more marginal

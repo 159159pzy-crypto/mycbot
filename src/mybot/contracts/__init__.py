@@ -6,7 +6,15 @@ from mybot.contracts.conversation import (
     TurnDecision,
     TurnTrigger,
 )
-from mybot.contracts.memory import MemoryItem, MemoryPrivacy, MemoryScope
+from mybot.contracts.memory import (
+    CoreBlock,
+    CoreBlockLabel,
+    MemoryItem,
+    MemoryMergeDecision,
+    MemoryOperation,
+    MemoryPrivacy,
+    MemoryScope,
+)
 from mybot.contracts.messages import (
     AtSegment,
     ChatKind,
@@ -29,9 +37,13 @@ __all__ = [
     "ChatKind",
     "Citation",
     "ConversationKey",
+    "CoreBlock",
+    "CoreBlockLabel",
     "FileSegment",
     "ImageSegment",
     "MemoryItem",
+    "MemoryMergeDecision",
+    "MemoryOperation",
     "MemoryPrivacy",
     "MemoryScope",
     "MessageEnvelope",

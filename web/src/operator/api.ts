@@ -72,7 +72,32 @@ export type MemoryView = {
   privacy: string;
   revoked_at: string | null;
   revoked_reason: string | null;
+  invalid_at: string | null;
+  invalidated_by: string | null;
+  supersedes: string[];
+  state: 'active' | 'invalidated' | 'revoked';
   created_at: string | null;
+};
+
+export type MemoryOperationView = {
+  id: string;
+  operation: string;
+  source: string;
+  memory_id: string | null;
+  previous_memory_id: string | null;
+  detail: Record<string, unknown>;
+  created_at: string | null;
+};
+
+export type CoreBlockView = {
+  id: string;
+  label: 'persona' | 'user_profile';
+  subject_identity_id: string | null;
+  content: string;
+  token_budget: number;
+  version: number;
+  created_at: string;
+  updated_at: string;
 };
 
 export type UsagePoint = { day: string; turns: number; tokens: number };

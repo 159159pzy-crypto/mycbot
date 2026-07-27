@@ -222,3 +222,35 @@ def test_agent_worker_receives_telegram_image_resolution_settings() -> None:
     assert "MYBOT_VISION_IMAGE_DOWNLOAD_TIMEOUT_SECONDS:" in worker
     assert "MYBOT_VISION_MAX_IMAGE_BYTES=10000000" in environment
     assert "MYBOT_VISION_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=30" in environment
+
+
+def test_memory_v2_settings_reach_the_correct_workers() -> None:
+    compose = source("compose.yaml")
+    environment = source(".env.example")
+    agent = indented_block(compose, "  agent-worker:")
+    maintenance = indented_block(compose, "  maintenance-worker:")
+
+    for name in (
+        "MYBOT_MEMORY_CORE_PERSONA_TOKEN_BUDGET",
+        "MYBOT_MEMORY_CORE_USER_PROFILE_TOKEN_BUDGET",
+        "MYBOT_MEMORY_CORE_TOOLS_APPROVAL_REQUIRED",
+        "MYBOT_MEMORY_FLUSH_ENABLED",
+        "MYBOT_MEMORY_FLUSH_DEBOUNCE_TTL_SECONDS",
+        "MYBOT_MEMORY_FLUSH_MAX_MESSAGES",
+        "MYBOT_MEMORY_FLUSH_TOKEN_BUDGET",
+    ):
+        assert f"{name}:" in agent
+        assert f"{name}=" in environment
+
+    for name in (
+        "MYBOT_MEMORY_CONSOLIDATION_ENABLED",
+        "MYBOT_MEMORY_CONSOLIDATION_INTERVAL_SECONDS",
+        "MYBOT_MEMORY_CONSOLIDATION_LOOKBACK_HOURS",
+        "MYBOT_MEMORY_CONSOLIDATION_TOKEN_BUDGET",
+    ):
+        assert f"{name}:" in maintenance
+        assert f"{name}=" in environment
+
+    assert "MYBOT_LLM_BASE_URL:" in maintenance
+    assert "MYBOT_EMBEDDING_BASE_URL:" in maintenance
+    assert "memory.write" in environment

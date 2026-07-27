@@ -107,7 +107,11 @@ def test_tool_settings_have_bounded_defaults_and_parsed_capabilities(
     settings = Settings()
 
     assert settings.searxng_url == "http://127.0.0.1:8080"
-    assert settings.granted_capabilities() == ("web.search", "web.fetch")
+    assert settings.granted_capabilities() == (
+        "web.search",
+        "web.fetch",
+        "memory.write",
+    )
     assert 1 <= settings.tool_max_calls_per_turn <= 20
     assert settings.tool_timeout_seconds <= settings.turn_deadline_seconds
 
@@ -130,6 +134,14 @@ def test_memory_settings_default_bounded_and_blank_embedding_endpoint_is_none(
     assert 0.0 <= settings.memory_min_confidence <= 1.0
     assert settings.memory_confidence_floor < settings.memory_min_confidence
     assert settings.memory_maintenance_interval_seconds >= 60
+    assert settings.memory_core_persona_token_budget >= 50
+    assert settings.memory_core_user_profile_token_budget >= 50
+    assert settings.memory_core_tools_approval_required is True
+    assert settings.memory_flush_enabled is True
+    assert settings.memory_flush_max_messages <= 200
+    assert settings.memory_consolidation_enabled is True
+    assert settings.memory_consolidation_interval_seconds >= 3_600
+    assert settings.memory_consolidation_token_budget <= 32_000
 
     monkeypatch.setenv("MYBOT_EMBEDDING_BASE_URL", "   ")
     monkeypatch.setenv("MYBOT_EMBEDDING_API_KEY", "")

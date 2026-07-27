@@ -8,7 +8,11 @@ from pydantic import ValidationError
 from mybot.contracts import (
     ChatKind,
     ConversationKey,
+    CoreBlock,
+    CoreBlockLabel,
     MemoryItem,
+    MemoryMergeDecision,
+    MemoryOperation,
     MemoryPrivacy,
     MemoryScope,
     Platform,
@@ -182,6 +186,58 @@ def test_memory_item_enforces_scope_validity_and_revocation_rules() -> None:
             privacy=MemoryPrivacy.PUBLIC,
             revoked_at=datetime.now(UTC) + timedelta(seconds=1),
         )
+
+    with pytest.raises(ValidationError, match="invalidated_by"):
+        MemoryItem(
+            scope=MemoryScope.GLOBAL,
+            kind="fact",
+            content="Broken invalidation",
+            source_message_ids=(source_id,),
+            confidence=0.5,
+            privacy=MemoryPrivacy.PUBLIC,
+            invalidated_by=uuid4(),
+        )
+
+
+def test_memory_merge_decision_shapes_are_strict() -> None:
+    target_id = uuid4()
+    assert MemoryMergeDecision(
+        operation=MemoryOperation.UPDATE,
+        target_id=target_id,
+        content="Updated fact",
+    ).target_id == target_id
+    assert MemoryMergeDecision(
+        operation=MemoryOperation.DELETE,
+        target_id=target_id,
+    ).content is None
+
+    with pytest.raises(ValidationError, match="ADD"):
+        MemoryMergeDecision(operation=MemoryOperation.ADD, target_id=target_id, content="x")
+    with pytest.raises(ValidationError, match="UPDATE"):
+        MemoryMergeDecision(operation=MemoryOperation.UPDATE, content="x")
+    with pytest.raises(ValidationError, match="DELETE"):
+        MemoryMergeDecision(
+            operation=MemoryOperation.DELETE,
+            target_id=target_id,
+            content="must not be present",
+        )
+
+
+def test_core_blocks_enforce_label_ownership_and_budget() -> None:
+    assert CoreBlock(label=CoreBlockLabel.PERSONA, content="calm", token_budget=200).version == 1
+    assert CoreBlock(
+        label=CoreBlockLabel.USER_PROFILE,
+        subject_identity_id="telegram:777",
+        content="likes coffee",
+    ).subject_identity_id == "telegram:777"
+
+    with pytest.raises(ValidationError, match="global"):
+        CoreBlock(
+            label=CoreBlockLabel.PERSONA,
+            subject_identity_id="telegram:777",
+        )
+    with pytest.raises(ValidationError, match="requires"):
+        CoreBlock(label=CoreBlockLabel.USER_PROFILE)
 
 
 def test_plugin_manifest_is_frozen_and_validates_requested_surfaces() -> None:

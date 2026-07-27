@@ -22,7 +22,13 @@ from mybot.contracts import (
     TurnDecision,
 )
 from mybot.contracts.json import thaw_json_object
-from mybot.engine.prompt import EnvelopePrompt, HistoryEntry, assemble_messages, envelope_prompt
+from mybot.engine.prompt import (
+    EnvelopePrompt,
+    HistoryEntry,
+    assemble_messages,
+    envelope_prompt,
+    partition_history,
+)
 from mybot.engine.reply_shaping import shape_reply
 from mybot.infrastructure.budget import TokenBudget
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply, ToolCall
@@ -84,12 +90,18 @@ class InvocationStore(Protocol):
 
 
 class MemoryHooks(Protocol):
+    async def core_block(self, envelope: MessageEnvelope) -> str | None: ...
+
     async def retrieval_block(
         self, envelope: MessageEnvelope, inbound_text: str
     ) -> str | None: ...
 
     async def extract_and_store(
         self, envelope: MessageEnvelope, reply_text: str
+    ) -> "ExtractionUsage": ...
+
+    async def flush_history(
+        self, envelope: MessageEnvelope, history: Sequence[HistoryEntry]
     ) -> "ExtractionUsage": ...
 
 
@@ -153,6 +165,7 @@ class AgentTurnEngine:
     llm_model_name: str = "unconfigured"
     history_max_messages: int = 40
     history_token_budget: int = 6_000
+    history_flush_max_messages: int = 24
     tools: ToolCatalog | None = None
     executor: ToolExecutor | None = None
     granted_capabilities: tuple[str, ...] = ()
@@ -213,11 +226,19 @@ class AgentTurnEngine:
                 empty_fallback=self.empty_reply_fallback,
             )
 
+        system_prompt = await self._system_prompt()
+        history = await self._history_window(
+            conversation_id,
+            inbound_text,
+            system_prompt=system_prompt,
+            envelope=envelope,
+            stable_key=stable_key,
+        )
         messages: list[ChatMessage] = assemble_messages(
-            system_prompt=await self._system_prompt(),
+            system_prompt=system_prompt,
             platform=envelope.platform,
             chat_kind=envelope.chat_kind,
-            history=await self._history_window(conversation_id, inbound_text),
+            history=history,
             inbound_sender=envelope.sender_identity_id,
             inbound_text=inbound_text,
             token_budget=self.history_token_budget,
@@ -228,8 +249,15 @@ class AgentTurnEngine:
             if envelope.ephemeral
             else await self._memory_block(envelope, inbound_text, conversation_id)
         )
+        core_block = (
+            None
+            if envelope.ephemeral
+            else await self._core_memory_block(envelope, conversation_id)
+        )
         if memory_block is not None:
             messages.insert(1, ChatMessage(role="system", content=memory_block))
+        if core_block is not None:
+            messages.insert(1, ChatMessage(role="system", content=core_block))
         if self.tools is not None:
             try:
                 await self.tools.refresh()
@@ -516,6 +544,39 @@ class AgentTurnEngine:
         )
         return block
 
+    async def _core_memory_block(
+        self, envelope: MessageEnvelope, conversation_id: UUID
+    ) -> str | None:
+        if self.memory is None:
+            return None
+        loader = getattr(self.memory, "core_block", None)
+        if loader is None:
+            return None
+        started = self.clock()
+        try:
+            block = await loader(envelope)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("core_memory_lookup_failed")
+            await self._trace(
+                envelope,
+                conversation_id,
+                "memory.core",
+                status="error",
+                duration_ms=int((self.clock() - started) * 1_000),
+                attributes={"error_code": "core_memory_lookup_failed"},
+            )
+            return None
+        await self._trace(
+            envelope,
+            conversation_id,
+            "memory.core",
+            duration_ms=int((self.clock() - started) * 1_000),
+            attributes={"loaded": block is not None},
+        )
+        return block
+
     async def after_reply(
         self, *, envelope: MessageEnvelope, stable_key: str, reply_text: str
     ) -> None:
@@ -570,17 +631,92 @@ class AgentTurnEngine:
             return envelope_prompt(envelope, include_images=False)
 
     async def _history_window(
-        self, conversation_id: UUID, inbound_text: str
+        self,
+        conversation_id: UUID,
+        inbound_text: str,
+        *,
+        system_prompt: str,
+        envelope: MessageEnvelope,
+        stable_key: str,
     ) -> tuple[HistoryEntry, ...]:
         rows = await self.history.recent_texts(
-            conversation_id, limit=self.history_max_messages
+            conversation_id,
+            limit=self.history_max_messages + self.history_flush_max_messages + 1,
         )
         # The just-persisted inbound message is the newest row; keep it out of history.
         if rows and rows[0].direction == "inbound" and rows[0].text == inbound_text:
             rows = rows[1:]
-        return tuple(
-            HistoryEntry(direction=row.direction, sender=row.sender, text=row.text)
+        entries = tuple(
+            HistoryEntry(
+                direction=row.direction,
+                sender=row.sender,
+                text=row.text,
+                source_id=str(row.id) if row.id is not None else None,
+            )
             for row in rows
+        )
+        partition = partition_history(
+            system_prompt=system_prompt,
+            platform=envelope.platform,
+            chat_kind=envelope.chat_kind,
+            history=entries,
+            inbound_text=inbound_text,
+            token_budget=self.history_token_budget,
+            max_messages=self.history_max_messages,
+        )
+        await self._flush_memory_history(
+            envelope,
+            conversation_id,
+            stable_key,
+            partition.dropped,
+        )
+        return partition.kept
+
+    async def _flush_memory_history(
+        self,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
+        stable_key: str,
+        dropped: Sequence[HistoryEntry],
+    ) -> None:
+        if envelope.ephemeral or self.memory is None or not dropped:
+            return
+        flusher = getattr(self.memory, "flush_history", None)
+        if flusher is None:
+            return
+        started = self.clock()
+        try:
+            outcome = await flusher(envelope, dropped)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("memory_flush_failed")
+            await self._trace(
+                envelope,
+                conversation_id,
+                "memory.flush",
+                status="error",
+                duration_ms=int((self.clock() - started) * 1_000),
+                attributes={"error_code": "memory_flush_failed"},
+            )
+            return
+        spent = outcome.prompt_tokens + outcome.completion_tokens
+        if self.budget is not None and spent > 0:
+            await self.budget.consume(
+                stable_key,
+                spent,
+                today=self.now().date().isoformat(),
+            )
+        await self._trace(
+            envelope,
+            conversation_id,
+            "memory.flush",
+            duration_ms=int((self.clock() - started) * 1_000),
+            attributes={
+                "dropped_messages": len(dropped),
+                "stored": outcome.stored,
+                "tokens": spent,
+            },
         )
 
     async def _record(

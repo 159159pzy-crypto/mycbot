@@ -6,6 +6,7 @@ from mybot.engine.prompt import (
     assemble_messages,
     envelope_prompt,
     estimate_tokens,
+    partition_history,
 )
 from mybot.infrastructure.llm import ImageContentPart, ImageUrl, TextContentPart
 
@@ -34,6 +35,26 @@ def test_estimate_tokens_calibrates_mixed_cjk_and_latin_text() -> None:
     assert estimate_tokens("中文" * 20) > estimate_tokens("ab" * 20)
     mixed = estimate_tokens("请检查 deploy status 和 error logs")
     assert estimate_tokens("请检查") < mixed < estimate_tokens("请检查" * 10)
+
+
+def test_partition_history_exposes_rows_before_count_truncation() -> None:
+    entries = tuple(
+        HistoryEntry("inbound", "u", f"message-{index}", source_id=str(index))
+        for index in range(5)
+    )
+
+    partition = partition_history(
+        system_prompt="system",
+        platform=Platform.TELEGRAM,
+        chat_kind=ChatKind.DIRECT,
+        history=entries,
+        inbound_text="current",
+        token_budget=1_000,
+        max_messages=2,
+    )
+
+    assert [entry.source_id for entry in partition.kept] == ["0", "1"]
+    assert [entry.source_id for entry in partition.dropped] == ["2", "3", "4"]
 
 
 def test_envelope_prompt_preserves_text_and_image_references() -> None:

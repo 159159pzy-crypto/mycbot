@@ -240,13 +240,20 @@ deployments.
 
 ## Memory
 
-After each agent reply the worker asks the LLM to extract at most three
-stable facts worth remembering, embeds them via the OpenAI-compatible
-`/embeddings` endpoint (`MYBOT_EMBEDDING_*`; credentials fall back to the
-LLM endpoint, and leaving both endpoints empty disables memory), and stores
-them in the pgvector-backed `memory_items` table. On later turns the inbound
-message is embedded and the closest valid memories are injected into the
-prompt with provenance markers under `MYBOT_MEMORY_TOKEN_BUDGET`.
+After each agent reply the worker extracts at most three durable candidates.
+Each candidate first retrieves active memories under the same scope, owner,
+conversation and privacy boundary; the memory-purpose model then chooses
+`ADD`, `UPDATE`, `DELETE`, or `NOOP`. `UPDATE` inserts a new row and marks its
+predecessor with `invalid_at`/`invalidated_by`; `DELETE` only invalidates the
+old row. `/forget` and operator revocation remain separate privacy actions via
+`revoked_at`, so a forgotten row can never be selected as an update target.
+
+Recall is hybrid: pgvector cosine rank and PostgreSQL `pg_trgm` text rank are
+computed after the same SQL scope/privacy/time filters, then fused with RRF.
+This keeps semantic matches while improving exact QQ names, slang and
+abbreviations. Recall audit stores only a SHA-256 query hash plus vector/text/
+selected memory IDs, never the raw query. `MYBOT_MEMORY_TOKEN_BUDGET` still
+bounds the rendered recall block.
 
 Privacy is enforced in SQL and code, never delegated to the prompt: facts
 about a person are stored subject-scoped and PRIVATE and are only ever
@@ -254,16 +261,24 @@ retrieved in that person's own direct chat; group turns can see only
 SHARED/PUBLIC conversation- or global-scoped memories, and extraction can
 never produce SENSITIVE items. `/forget` immediately revokes the sender's
 subject memories (in a direct chat it also clears that conversation's
-memories) and reports the count.
+memories) and reports the count. The console's Memories page can include
+invalidated/revoked versions, follow predecessor/successor chains, inspect
+operation audit, and edit bounded persona/user-profile core blocks.
 
-The maintenance worker now runs a real job: every
-`MYBOT_MEMORY_MAINTENANCE_INTERVAL_SECONDS` it revokes memories past their
-`valid_until`, decays the confidence of items untouched for
-`MYBOT_MEMORY_DECAY_DAYS` (revoking those that fall below the floor), and
-permanently deletes rows revoked more than
-`MYBOT_MEMORY_REVOKED_RETENTION_DAYS` ago. Embeddings are tagged with their
-model; switching `MYBOT_EMBEDDING_MODEL` starts fresh retrieval rather than
-comparing incompatible vectors (old rows age out via decay).
+Persona and per-subject user-profile core blocks are injected on every
+non-ephemeral turn without relying on retrieval. `memory_append` and
+`memory_replace` require the `memory.write` capability and, by default, a
+standing operator approval (`MYBOT_MEMORY_CORE_TOOLS_APPROVAL_REQUIRED`).
+Each save enforces its block token budget and increments a version.
+
+Before count/token pressure removes history, the worker sends only the rows
+about to be dropped to the memory-purpose model, under hard message/token caps
+and a Redis per-conversation debounce. The maintenance worker also runs an
+optional low-frequency consolidation pass over bounded recent dialogue and
+active memories; its candidates re-enter the normal merge pipeline. Lifecycle
+expiry/decay uses `invalid_at`, while only privacy-revoked rows older than
+`MYBOT_MEMORY_REVOKED_RETENTION_DAYS` are physically purged. Embeddings remain
+model-tagged, so incompatible vectors are never compared.
 
 ## Plugins
 

@@ -546,6 +546,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         openai_client_factory,
     )
     from mybot.repositories.conversations import ConversationRepository
+    from mybot.repositories.core_memory import CoreBlockRepository
     from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.messages import MessageRepository
@@ -553,9 +554,10 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.repositories.tool_invocations import ToolInvocationRepository
     from mybot.repositories.traces import TraceSpanRepository
     from mybot.repositories.turns import TurnRepository
-    from mybot.tools import ToolExecutor, ToolRegistry
+    from mybot.tools import Tool, ToolExecutor, ToolRegistry
     from mybot.tools.approvals import SystemKvApprovals
     from mybot.tools.fetch import UrlFetchTool
+    from mybot.tools.memory import MemoryAppendTool, MemoryReplaceTool
     from mybot.tools.plugins import BrokerEventSink, BrokerToolCatalog
     from mybot.tools.search import SearxngSearchTool
 
@@ -614,29 +616,58 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     )
     llm = model_router.for_purpose(ModelPurpose.CHAT)
     memory: MemoryService | None = None
+    core_memory = CoreBlockRepository(sessions)
     if settings.memory_enabled:
         memory = MemoryService(
             embeddings=model_router.embeddings(),
             store=MemoryRepository(sessions),
             llm=model_router.for_purpose(ModelPurpose.MEMORY),
             embedding_model=settings.embedding_model,
+            core_store=core_memory,
+            flush_once=backend,
+            flush_enabled=settings.memory_flush_enabled,
+            flush_debounce_ttl_seconds=settings.memory_flush_debounce_ttl_seconds,
+            flush_max_messages=settings.memory_flush_max_messages,
+            flush_token_budget=settings.memory_flush_token_budget,
             min_confidence=settings.memory_min_confidence,
             retrieval_limit=settings.memory_retrieval_limit,
             token_budget=settings.memory_token_budget,
         )
     tool_http_timeout = httpx.Timeout(min(settings.tool_timeout_seconds, 30.0))
+    builtin_tools: list[Tool] = [
+        SearxngSearchTool(
+            client=httpx.AsyncClient(timeout=tool_http_timeout),
+            searxng_url=settings.searxng_url,
+            max_results=settings.search_max_results,
+        ),
+        UrlFetchTool(
+            client=httpx.AsyncClient(timeout=tool_http_timeout, follow_redirects=True),
+            max_bytes=settings.tool_fetch_max_bytes,
+        ),
+    ]
+    if settings.memory_enabled:
+        builtin_tools.extend(
+            [
+                MemoryAppendTool(
+                    repository=core_memory,
+                    persona_token_budget=settings.memory_core_persona_token_budget,
+                    user_profile_token_budget=(
+                        settings.memory_core_user_profile_token_budget
+                    ),
+                    approval_required=settings.memory_core_tools_approval_required,
+                ),
+                MemoryReplaceTool(
+                    repository=core_memory,
+                    persona_token_budget=settings.memory_core_persona_token_budget,
+                    user_profile_token_budget=(
+                        settings.memory_core_user_profile_token_budget
+                    ),
+                    approval_required=settings.memory_core_tools_approval_required,
+                ),
+            ]
+        )
     registry = ToolRegistry(
-        [
-            SearxngSearchTool(
-                client=httpx.AsyncClient(timeout=tool_http_timeout),
-                searxng_url=settings.searxng_url,
-                max_results=settings.search_max_results,
-            ),
-            UrlFetchTool(
-                client=httpx.AsyncClient(timeout=tool_http_timeout, follow_redirects=True),
-                max_bytes=settings.tool_fetch_max_bytes,
-            ),
-        ]
+        builtin_tools
     )
     catalog: ToolRegistry | BrokerToolCatalog = registry
     events: BrokerEventSink | None = None
@@ -664,6 +695,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         llm_model_name=settings.llm_model,
         history_max_messages=settings.agent_history_max_messages,
         history_token_budget=settings.agent_history_token_budget,
+        history_flush_max_messages=settings.memory_flush_max_messages,
         tools=catalog,
         executor=ToolExecutor(
             catalog,

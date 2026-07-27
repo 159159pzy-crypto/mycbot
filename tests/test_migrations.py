@@ -15,6 +15,11 @@ class RecordingOperations:
     def drop_column(self, table_name: str, column_name: str) -> None:
         self.calls.append(("drop_column", f"{table_name}.{column_name}"))
 
+    def drop_constraint(
+        self, name: str, table_name: str, *, type_: str | None = None
+    ) -> None:
+        self.calls.append(("drop_constraint", f"{table_name}.{name}"))
+
     def execute(self, statement: str) -> None:
         self.calls.append(("execute", statement))
 
@@ -201,3 +206,40 @@ def test_multimodal_sandbox_trace_migration_chains_and_downgrades_cleanly() -> N
         ("drop_column", "messages.trace_id"),
         ("drop_column", "conversations.ephemeral"),
     ]
+
+
+def test_memory_v2_migration_chains_and_preserves_shared_extensions() -> None:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260728_0009_memory_v2.py"
+    )
+    namespace = runpy.run_path(str(migration_path))
+    assert namespace["revision"] == "20260728_0009"
+    assert namespace["down_revision"] == "20260727_0008"
+
+    downgrade = namespace["downgrade"]
+    operations = RecordingOperations()
+    downgrade.__globals__["op"] = operations
+    downgrade()
+
+    assert operations.calls == [
+        ("drop_index", "uq_core_blocks_user_profile"),
+        ("drop_index", "uq_core_blocks_persona"),
+        ("drop_table", "core_blocks"),
+        ("drop_index", "ix_memory_recall_audit_created"),
+        ("drop_table", "memory_recall_audit"),
+        ("drop_index", "ix_memory_operation_audit_memory_created"),
+        ("drop_index", "ix_memory_operation_audit_created"),
+        ("drop_table", "memory_operation_audit"),
+        ("drop_index", "ix_memory_items_content_trgm"),
+        ("drop_index", "ix_memory_items_active_scope"),
+        (
+            "drop_constraint",
+            "memory_items.ck_memory_items_invalidator_requires_time",
+        ),
+        ("drop_column", "memory_items.invalidated_by"),
+        ("drop_column", "memory_items.invalid_at"),
+    ]
+    assert all("DROP EXTENSION" not in call[1] for call in operations.calls)

@@ -38,6 +38,13 @@ class HistoryEntry:
     direction: str  # "inbound" | "outbound"
     sender: str
     text: str
+    source_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HistoryPartition:
+    kept: tuple[HistoryEntry, ...]
+    dropped: tuple[HistoryEntry, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -125,28 +132,27 @@ def assemble_messages(
 ) -> list[ChatMessage]:
     """Build system + windowed history + inbound; oldest history drops first."""
 
-    system_content = (
-        f"{system_prompt}\n\n"
-        f"You are chatting on {platform.value} in a {chat_kind.value.lower()} chat. "
-        f"{_REPLY_RULES}"
-    )
+    system_content = _system_content(system_prompt, platform, chat_kind)
     grouped = chat_kind is not ChatKind.DIRECT
     raw_inbound: ChatContent = inbound_content if inbound_content is not None else inbound_text
     rendered_inbound = _prefix_content(raw_inbound, inbound_sender) if grouped else raw_inbound
 
-    remaining = token_budget - estimate_tokens(system_content) - estimate_tokens(inbound_text)
+    partition = partition_history(
+        system_prompt=system_prompt,
+        platform=platform,
+        chat_kind=chat_kind,
+        history=history,
+        inbound_text=inbound_text,
+        token_budget=token_budget,
+    )
     window: list[ChatMessage] = []
-    for entry in history:  # newest first; stop when the budget is spent
+    for entry in partition.kept:
         if entry.direction == "outbound":
             content = entry.text
             role = "assistant"
         else:
             content = f"{entry.sender}: {entry.text}" if grouped else entry.text
             role = "user"
-        cost = estimate_tokens(content)
-        if cost > remaining:
-            break
-        remaining -= cost
         window.append(ChatMessage(role=role, content=content))
     window.reverse()
 
@@ -155,6 +161,46 @@ def assemble_messages(
         *window,
         ChatMessage(role="user", content=rendered_inbound),
     ]
+
+
+def partition_history(
+    *,
+    system_prompt: str,
+    platform: Platform,
+    chat_kind: ChatKind,
+    history: Sequence[HistoryEntry],
+    inbound_text: str,
+    token_budget: int,
+    max_messages: int | None = None,
+) -> HistoryPartition:
+    """Split newest-first history into prompt-visible and pre-truncation rows."""
+
+    system_content = _system_content(system_prompt, platform, chat_kind)
+    remaining = token_budget - estimate_tokens(system_content) - estimate_tokens(inbound_text)
+    grouped = chat_kind is not ChatKind.DIRECT
+    kept: list[HistoryEntry] = []
+    for index, entry in enumerate(history):
+        if max_messages is not None and len(kept) >= max_messages:
+            return HistoryPartition(tuple(kept), tuple(history[index:]))
+        content = (
+            entry.text
+            if entry.direction == "outbound" or not grouped
+            else f"{entry.sender}: {entry.text}"
+        )
+        cost = estimate_tokens(content)
+        if cost > remaining:
+            return HistoryPartition(tuple(kept), tuple(history[index:]))
+        remaining -= cost
+        kept.append(entry)
+    return HistoryPartition(tuple(kept), ())
+
+
+def _system_content(system_prompt: str, platform: Platform, chat_kind: ChatKind) -> str:
+    return (
+        f"{system_prompt}\n\n"
+        f"You are chatting on {platform.value} in a {chat_kind.value.lower()} chat. "
+        f"{_REPLY_RULES}"
+    )
 
 
 def _prefix_content(content: ChatContent, sender: str) -> ChatContent:

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
@@ -66,6 +66,14 @@ class SandboxMessageInput(BaseModel):
     session_id: str | None = None
     text: str | None = None
     image_urls: list[str] = Field(default_factory=list)
+
+
+class CoreBlockUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_identity_id: str | None = None
+    content: str = ""
+    token_budget: int = Field(default=400, ge=50, le=20_000)
 
 
 class SandboxPublisher(Protocol):
@@ -200,12 +208,63 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
 
     @router.get("/memories")
     async def memories(  # pyright: ignore[reportUnusedFunction]
-        scope: str | None = None, include_revoked: bool = False, limit: int = 100
+        scope: str | None = None,
+        include_revoked: bool = False,
+        state: Literal["active", "invalidated", "revoked", "all"] = "active",
+        limit: int = 100,
     ) -> dict[str, JsonValue]:
         rows = await context.views.memories(
-            scope=scope, include_revoked=include_revoked, limit=_bound(limit)
+            scope=scope,
+            include_revoked=include_revoked,
+            state=state,
+            limit=_bound(limit),
         )
         return {"memories": cast(JsonValue, rows)}
+
+    @router.get("/memories/{memory_id}/history")
+    async def memory_history(  # pyright: ignore[reportUnusedFunction]
+        memory_id: UUID,
+    ) -> dict[str, JsonValue]:
+        rows = await context.views.memory_history(memory_id)
+        if not rows:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"history": cast(JsonValue, rows)}
+
+    @router.get("/memories/{memory_id}/operations")
+    async def memory_operations(  # pyright: ignore[reportUnusedFunction]
+        memory_id: UUID, limit: int = 100
+    ) -> dict[str, JsonValue]:
+        rows = await context.views.memory_operations(memory_id, limit=_bound(limit))
+        return {"operations": cast(JsonValue, rows)}
+
+    @router.get("/core-blocks")
+    async def core_blocks() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        rows = await context.views.core_blocks()
+        return {"core_blocks": cast(JsonValue, rows)}
+
+    @router.put("/core-blocks/{label}")
+    async def replace_core_block(  # pyright: ignore[reportUnusedFunction]
+        label: str, update: CoreBlockUpdate
+    ) -> dict[str, JsonValue]:
+        try:
+            block = await context.views.replace_core_block(
+                label=label,
+                subject_identity_id=update.subject_identity_id,
+                content=update.content,
+                token_budget=update.token_budget,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        await context.audit.record(
+            "core_block.replace",
+            {
+                "label": label,
+                "subject_identity_id": update.subject_identity_id,
+                "content_length": len(update.content),
+                "token_budget": update.token_budget,
+            },
+        )
+        return {"core_block": cast(JsonValue, block)}
 
     @router.post("/memories/{memory_id}/revoke")
     async def revoke_memory(  # pyright: ignore[reportUnusedFunction]

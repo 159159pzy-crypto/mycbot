@@ -13,7 +13,15 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from mybot.contracts import ChatKind, ConversationKey, MemoryItem, MemoryPrivacy, MemoryScope
+from mybot.contracts import (
+    ChatKind,
+    ConversationKey,
+    MemoryItem,
+    MemoryMergeDecision,
+    MemoryOperation,
+    MemoryPrivacy,
+    MemoryScope,
+)
 from mybot.repositories.memory import MemoryRepository
 
 DATABASE_URL = os.environ.get("MYBOT_TEST_DATABASE_URL")
@@ -111,6 +119,7 @@ async def search(
     repository: MemoryRepository,
     *,
     query: list[float],
+    query_text: str = "咖啡",
     include_private: bool = True,
     subject: str = SUBJECT,
     conversation_key: str | None = None,
@@ -118,6 +127,7 @@ async def search(
 ):  # type: ignore[no-untyped-def]
     return await repository.search(
         query_embedding=query,
+        query_text=query_text,
         embedding_model=MODEL,
         subject_identity_id=subject,
         conversation_stable_key=conversation_key or CONVERSATION.stable_key,
@@ -256,7 +266,7 @@ async def test_validity_window_and_revocation_filter_results(
     assert contents == ["fresh after forget"]
 
 
-async def test_superseded_items_are_dropped_when_superseder_is_retrieved(
+async def test_supersedes_metadata_alone_does_not_bypass_temporal_invalidation(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:
     repository = MemoryRepository(sessions)
@@ -270,7 +280,7 @@ async def test_superseded_items_are_dropped_when_superseder_is_retrieved(
 
     contents = [memory.content for memory in await search(repository, query=[1.0, 0.0])]
 
-    assert contents == ["新偏好:喝咖啡"]
+    assert contents == ["新偏好:喝咖啡", "旧偏好:喝茶"]
 
 
 async def test_lifecycle_expires_decays_and_purges_with_injected_clock(
@@ -359,3 +369,110 @@ async def test_search_with_empty_table_returns_nothing(
     repository = MemoryRepository(sessions)
 
     assert await search(repository, query=[1.0, 0.0]) == ()
+
+
+async def test_hybrid_search_recalls_text_only_chinese_slang_and_audits_hash_only(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = MemoryRepository(sessions)
+    text_only = item(content="群里把 YYDS 当作永远的神")
+    await repository.store(text_only, embedding=None, embedding_model=None)
+
+    recalled = await search(
+        repository,
+        query=[0.0, 1.0],
+        query_text="YYDS 永远的神",
+    )
+
+    assert [memory.id for memory in recalled] == [text_only.id]
+    assert recalled[0].vector_rank is None
+    assert recalled[0].text_rank == 1
+    async with sessions() as session:
+        audit = (
+            await session.execute(
+                sa.text(
+                    "SELECT query_hash, vector_ids, text_ids, selected_ids "
+                    "FROM memory_recall_audit ORDER BY created_at DESC LIMIT 1"
+                )
+            )
+        ).mappings().one()
+    assert audit["query_hash"] != "YYDS 永远的神"
+    assert audit["vector_ids"] == []
+    assert audit["text_ids"] == [str(text_only.id)]
+    assert audit["selected_ids"] == [str(text_only.id)]
+
+
+async def test_update_inserts_successor_and_invalidates_predecessor_atomically(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = MemoryRepository(sessions)
+    old = item(content="喜欢加糖咖啡")
+    await repository.store(old, embedding=[1.0, 0.0], embedding_model=MODEL)
+    candidate_item = item(content="喜欢无糖美式")
+
+    applied = await repository.apply_merge(
+        candidate_item,
+        MemoryMergeDecision(
+            operation=MemoryOperation.UPDATE,
+            target_id=old.id,
+            content="喜欢无糖美式",
+        ),
+        embedding=[1.0, 0.0],
+        embedding_model=MODEL,
+        source="test",
+        now=NOW,
+    )
+
+    assert applied.memory_id is not None
+    assert applied.memory_id != old.id
+    async with sessions() as session:
+        rows = (
+            await session.execute(
+                sa.text(
+                    "SELECT id, invalid_at, invalidated_by, supersedes "
+                    "FROM memory_items ORDER BY created_at, id"
+                )
+            )
+        ).mappings().all()
+    predecessor = next(row for row in rows if row["id"] == old.id)
+    successor = next(row for row in rows if row["id"] == applied.memory_id)
+    assert predecessor["invalid_at"] == NOW
+    assert predecessor["invalidated_by"] == applied.memory_id
+    assert successor["supersedes"] == [str(old.id)]
+    assert [memory.id for memory in await search(repository, query=[1.0, 0.0])] == [
+        applied.memory_id
+    ]
+
+
+async def test_revoked_memory_cannot_be_selected_as_merge_target(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = MemoryRepository(sessions)
+    old = item(content="已忘记的偏好")
+    await repository.store(old, embedding=[1.0], embedding_model=MODEL)
+    await repository.revoke_for(
+        subject_identity_id=SUBJECT,
+        conversation_stable_key=None,
+        now=NOW,
+    )
+
+    applied = await repository.apply_merge(
+        item(content="试图复活"),
+        MemoryMergeDecision(
+            operation=MemoryOperation.UPDATE,
+            target_id=old.id,
+            content="试图复活",
+        ),
+        embedding=[1.0],
+        embedding_model=MODEL,
+        source="test",
+        now=NOW,
+    )
+
+    assert applied.operation is MemoryOperation.NOOP
+    assert applied.applied is False
+    async with sessions() as session:
+        count = (
+            await session.execute(sa.text("SELECT count(*) FROM memory_items"))
+        ).scalar_one()
+    assert count == 1
