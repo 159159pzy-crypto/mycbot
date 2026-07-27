@@ -44,6 +44,10 @@ INGEST = "mybot:load:ingest"
 OUTBOUND = "mybot:load:outbound"
 MESSAGE_COUNT = 100
 DEADLINE_SECONDS = 30.0
+DEDUPE_KEYS = tuple(
+    f"mybot:load:seen:telegram:telegram-main:777:{10_000 + index}"
+    for index in range(MESSAGE_COUNT)
+)
 
 
 class NeverReadiness:
@@ -93,7 +97,7 @@ async def test_one_hundred_messages_flow_with_no_dead_letters(
                     "conversations CASCADE"
                 )
             )
-        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead")
+        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead", *DEDUPE_KEYS)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         messages_repository = MessageRepository(sessions)
         service = AgentWorkerService(
@@ -153,6 +157,6 @@ async def test_one_hundred_messages_flow_with_no_dead_letters(
         assert outbound_rows == MESSAGE_COUNT
         assert elapsed < DEADLINE_SECONDS
     finally:
-        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead")
+        await backend.delete(INGEST, OUTBOUND, f"{INGEST}:dead", *DEDUPE_KEYS)
         await backend.aclose()
         await engine.dispose()

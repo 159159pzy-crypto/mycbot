@@ -16,12 +16,15 @@ from mybot.contracts.json import thaw_json_object
 logger = structlog.get_logger("mybot.plugins.broker")
 
 _EVENT_QUEUE_LIMIT = 100
+PLUGIN_PROTOCOL_VERSION = 2
+_SUPPORTED_PLUGIN_PROTOCOLS = frozenset({1, PLUGIN_PROTOCOL_VERSION})
 
 
 class RegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runner_id: str
+    protocol_version: int = Field(default=1, ge=1)
     manifests: list[JsonValue]
 
 
@@ -73,9 +76,8 @@ class _PendingInvocation:
 @dataclass(slots=True)
 class _RunnerState:
     runner_id: str
-    plugins: dict[str, PluginManifest] = field(
-        default_factory=dict[str, PluginManifest]
-    )
+    protocol_version: int = 1
+    plugins: dict[str, PluginManifest] = field(default_factory=dict[str, PluginManifest])
     work: deque[_PendingInvocation] = field(default_factory=deque[_PendingInvocation])
     events: deque[dict[str, JsonValue]] = field(
         default_factory=lambda: deque(maxlen=_EVENT_QUEUE_LIMIT)
@@ -99,8 +101,19 @@ class PluginBroker:
         self._pending: dict[str, _PendingInvocation] = {}
         self.audit_log: list[AuditEntry] = []
 
-    def register(self, runner_id: str, manifests: list[JsonValue]) -> list[str]:
+    def register(
+        self, runner_id: str, manifests: list[JsonValue], *, protocol_version: int = 1
+    ) -> list[str]:
         """Validate manifests and adopt their tools; returns accepted plugin ids."""
+
+        if protocol_version not in _SUPPORTED_PLUGIN_PROTOCOLS:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"plugin protocol {protocol_version} is unsupported; "
+                    f"supported versions are {sorted(_SUPPORTED_PLUGIN_PROTOCOLS)}"
+                ),
+            )
 
         validated: list[PluginManifest] = []
         for raw in manifests:
@@ -133,7 +146,7 @@ class PluginBroker:
             validated.append(manifest)
 
         previous = self._runners.get(runner_id)
-        state = _RunnerState(runner_id=runner_id)
+        state = _RunnerState(runner_id=runner_id, protocol_version=protocol_version)
         if previous is not None:
             self._tools = {
                 tool_id: tool
@@ -152,9 +165,7 @@ class PluginBroker:
             runner_id=runner_id,
             plugins=[manifest.id for manifest in validated],
             tools=sorted(
-                tool_id
-                for tool_id, tool in self._tools.items()
-                if tool.runner_id == runner_id
+                tool_id for tool_id, tool in self._tools.items() if tool.runner_id == runner_id
             ),
         )
         return [manifest.id for manifest in validated]
@@ -225,9 +236,7 @@ class PluginBroker:
         events: list[dict[str, JsonValue]] = []
         while runner.events:
             events.append(runner.events.popleft())
-        return cast(
-            dict[str, JsonValue], {"invocations": invocations, "events": events}
-        )
+        return cast(dict[str, JsonValue], {"invocations": invocations, "events": events})
 
     def post_result(self, invocation_id: str, result: dict[str, JsonValue]) -> bool:
         pending = self._pending.get(invocation_id)
@@ -239,12 +248,12 @@ class PluginBroker:
     def post_event(self, kind: str, payload: dict[str, JsonValue]) -> int:
         delivered = 0
         for runner in self._runners.values():
-            hooked = any(
-                kind in manifest.event_hooks for manifest in runner.plugins.values()
-            )
+            hooked = any(kind in manifest.event_hooks for manifest in runner.plugins.values())
             if not hooked:
                 continue
-            runner.events.append({"kind": kind, "payload": payload})
+            runner.events.append(
+                _event_for_protocol(kind, payload, protocol_version=runner.protocol_version)
+            )
             runner.wakeup.set()
             delivered += 1
         return delivered
@@ -261,12 +270,17 @@ class PluginBroker:
                         "tools": [spec.id for spec in manifest.tools],
                         "event_hooks": list(manifest.event_hooks),
                         "granted_capabilities": list(self._grants.get(manifest.id, ())),
-                        "config_schema": cast(
-                            JsonValue, thaw_json_object(manifest.config_schema)
-                        ),
+                        "config_schema": cast(JsonValue, thaw_json_object(manifest.config_schema)),
                     }
                 )
-        return {"runners": len(self._runners), "plugins": plugins}
+        return {
+            "protocol_version": PLUGIN_PROTOCOL_VERSION,
+            "runners": len(self._runners),
+            "runner_protocol_versions": {
+                runner_id: state.protocol_version for runner_id, state in self._runners.items()
+            },
+            "plugins": plugins,
+        }
 
 
 def create_broker_router(broker: PluginBroker) -> APIRouter:
@@ -274,7 +288,11 @@ def create_broker_router(broker: PluginBroker) -> APIRouter:
 
     @router.post("/register")
     def register(request: RegisterRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
-        accepted = broker.register(request.runner_id, request.manifests)
+        accepted = broker.register(
+            request.runner_id,
+            request.manifests,
+            protocol_version=request.protocol_version,
+        )
         return {"accepted": cast(JsonValue, accepted)}
 
     @router.get("/tools")
@@ -305,3 +323,40 @@ def create_broker_router(broker: PluginBroker) -> APIRouter:
         return broker.health()
 
     return router
+
+
+def _event_for_protocol(
+    kind: str, payload: dict[str, JsonValue], *, protocol_version: int
+) -> dict[str, JsonValue]:
+    if protocol_version >= 2:
+        return {"kind": kind, "payload": payload}
+    projected = dict(payload)
+    envelope = projected.get("envelope")
+    if isinstance(envelope, dict):
+        compatible_envelope = dict(cast(dict[str, JsonValue], envelope))
+        compatible_envelope.pop("trace_id", None)
+        compatible_envelope.pop("ephemeral", None)
+        segments = compatible_envelope.get("segments")
+        if isinstance(segments, list):
+            compatible_envelope["segments"] = cast(
+                JsonValue,
+                [_legacy_segment(item) for item in cast(list[object], segments)],
+            )
+        projected["envelope"] = cast(JsonValue, compatible_envelope)
+    return {"kind": kind, "payload": projected}
+
+
+def _legacy_segment(raw: object) -> JsonValue:
+    if not isinstance(raw, dict):
+        return cast(JsonValue, raw)
+    segment = cast(dict[str, object], raw)
+    segment_type = segment.get("type")
+    if segment_type == "at":
+        label = segment.get("display_name") or segment.get("target_id") or "user"
+        return {"type": "text", "text": f"[@{label}]"}
+    if segment_type == "sticker":
+        label = segment.get("name") or segment.get("id") or "sticker"
+        return {"type": "text", "text": f"[sticker: {label}]"}
+    if segment_type == "voice":
+        return {"type": "text", "text": "[voice message]"}
+    return cast(JsonValue, dict(segment))

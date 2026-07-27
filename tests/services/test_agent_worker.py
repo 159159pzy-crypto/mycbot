@@ -37,11 +37,13 @@ from mybot.services.agent_worker import DEFAULT_CAPABILITIES, AgentWorkerService
 class FakeConversations:
     record: ConversationRecord
     calls: list[ConversationKey] = field(default_factory=list)
+    ephemeral_calls: list[bool] = field(default_factory=list)
 
     async def get_or_create(
-        self, key: ConversationKey, *, platform: Platform
+        self, key: ConversationKey, *, platform: Platform, ephemeral: bool = False
     ) -> ConversationRecord:
         self.calls.append(key)
+        self.ephemeral_calls.append(ephemeral)
         return self.record
 
 
@@ -64,6 +66,7 @@ class FakeMessages:
         plan: ReplyPlan,
         *,
         occurred_at: datetime | None = None,
+        trace_id: str | None = None,
     ) -> UUID:
         self.outbound.append(plan)
         return uuid4()
@@ -254,7 +257,7 @@ async def test_ping_and_status_commands_stay_deterministic_and_bypass_the_agent(
 
     outbound = await outbound_messages(backend)
     assert outbound[0].reply_plan.text_segments == ("pong",)
-    assert "status: ready" in outbound[1].reply_plan.text_segments[0]
+    assert "状态: ready" in outbound[1].reply_plan.text_segments[0]
     assert engine.calls == []
 
 
@@ -336,7 +339,7 @@ async def test_forget_command_revokes_and_reports_the_count() -> None:
     )
 
     outbound = await outbound_messages(backend)
-    assert "revoked 3 stored memories" in outbound[0].reply_plan.text_segments[0]
+    assert "已撤销 3 条" in outbound[0].reply_plan.text_segments[0]
     assert engine.calls == []  # deterministic path, never the agent
     assert engine.after_replies == []
     subject, conversation_scope = memory.calls[0]
@@ -369,7 +372,7 @@ async def test_forget_without_memory_reports_disabled() -> None:
     )
 
     outbound = await outbound_messages(backend)
-    assert "memory is disabled" in outbound[0].reply_plan.text_segments[0]
+    assert "未启用记忆" in outbound[0].reply_plan.text_segments[0]
 
 
 @dataclass

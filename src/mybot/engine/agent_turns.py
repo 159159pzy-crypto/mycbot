@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
@@ -22,30 +22,23 @@ from mybot.contracts import (
     TurnDecision,
 )
 from mybot.contracts.json import thaw_json_object
-from mybot.engine.prompt import HistoryEntry, assemble_messages, envelope_text
+from mybot.engine.prompt import EnvelopePrompt, HistoryEntry, assemble_messages, envelope_prompt
 from mybot.engine.reply_shaping import shape_reply
 from mybot.infrastructure.budget import TokenBudget
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply, ToolCall
 from mybot.repositories.messages import MessageText
 from mybot.repositories.tool_invocations import ToolInvocationRecord
+from mybot.repositories.traces import TraceStatus
 from mybot.repositories.turns import TurnOutcome
 from mybot.tools import ToolCatalog, ToolExecutor, collect_citations
 
 logger = structlog.get_logger("mybot.agent")
 
 PERSONA_KEY = "agent.system_prompt"
-NOT_CONFIGURED_FALLBACK = (
-    "The LLM agent is not configured yet (set MYBOT_LLM_BASE_URL and MYBOT_LLM_API_KEY), "
-    "so this is the built-in fallback reply."
-)
-LLM_FAILURE_FALLBACK = (
-    "Sorry — my language model is unavailable right now. Please try again shortly."
-)
-BUDGET_FALLBACK = (
-    "I have reached today's token budget for this chat, so I am pausing replies "
-    "until tomorrow."
-)
-NON_TEXT_PLACEHOLDER = "[the user sent a non-text message]"
+NOT_CONFIGURED_FALLBACK = "语言模型尚未配置, 请管理员先完成模型渠道设置。"
+LLM_FAILURE_FALLBACK = "语言模型暂时不可用, 请稍后再试。"
+BUDGET_FALLBACK = "本会话今天的 token 预算已用完, 明天再继续聊吧。"
+EMPTY_REPLY_FALLBACK = "抱歉, 这次没能组织好回复, 请稍后再试。"
 _TOOL_RESULT_CHAR_CAP = 4_000
 
 
@@ -111,6 +104,24 @@ class ExtractionUsage(Protocol):
     def completion_tokens(self) -> int: ...
 
 
+class VisionPreparer(Protocol):
+    async def prepare(self, envelope: MessageEnvelope) -> EnvelopePrompt: ...
+
+
+class TraceSink(Protocol):
+    async def record(
+        self,
+        *,
+        trace_id: str,
+        stage: str,
+        status: TraceStatus = "ok",
+        duration_ms: int = 0,
+        conversation_id: UUID | None = None,
+        message_id: UUID | None = None,
+        attributes: Mapping[str, JsonValue] | None = None,
+    ) -> UUID: ...
+
+
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -149,6 +160,12 @@ class AgentTurnEngine:
     turn_deadline_seconds: float = 90.0
     invocations: InvocationStore | None = None
     memory: MemoryHooks | None = None
+    vision: VisionPreparer | None = None
+    traces: TraceSink | None = None
+    not_configured_fallback: str = NOT_CONFIGURED_FALLBACK
+    llm_failure_fallback: str = LLM_FAILURE_FALLBACK
+    budget_fallback: str = BUDGET_FALLBACK
+    empty_reply_fallback: str = EMPTY_REPLY_FALLBACK
     now: Callable[[], datetime] = field(default=_utc_now)
     clock: Callable[[], float] = field(default=monotonic)
 
@@ -162,13 +179,26 @@ class AgentTurnEngine:
         inbound_message_id: UUID | None,
         capabilities: PlatformCapabilities,
     ) -> ReplyPlan:
-        inbound_text = envelope_text(envelope) or NON_TEXT_PLACEHOLDER
+        vision_started = self.clock()
+        prepared = await self._prepare_inbound(envelope)
+        await self._trace(
+            envelope,
+            conversation_id,
+            "vision.prepare",
+            duration_ms=int((self.clock() - vision_started) * 1_000),
+            attributes={"mode": "multimodal" if not isinstance(prepared.content, str) else "text"},
+        )
+        inbound_text = prepared.summary
 
         if self.llm is None:
             await self._record(
                 conversation_id, decision, "fallback", inbound_message_id
             )
-            return shape_reply(NOT_CONFIGURED_FALLBACK, capabilities=capabilities)
+            return shape_reply(
+                self.not_configured_fallback,
+                capabilities=capabilities,
+                empty_fallback=self.empty_reply_fallback,
+            )
 
         today = self.now().date().isoformat()
         if self.budget is not None and not await self.budget.allows(
@@ -177,7 +207,11 @@ class AgentTurnEngine:
             await self._record(
                 conversation_id, decision, "budget_exceeded", inbound_message_id
             )
-            return shape_reply(BUDGET_FALLBACK, capabilities=capabilities)
+            return shape_reply(
+                self.budget_fallback,
+                capabilities=capabilities,
+                empty_fallback=self.empty_reply_fallback,
+            )
 
         messages: list[ChatMessage] = assemble_messages(
             system_prompt=await self._system_prompt(),
@@ -187,8 +221,13 @@ class AgentTurnEngine:
             inbound_sender=envelope.sender_identity_id,
             inbound_text=inbound_text,
             token_budget=self.history_token_budget,
+            inbound_content=prepared.content,
         )
-        memory_block = await self._memory_block(envelope, inbound_text)
+        memory_block = (
+            None
+            if envelope.ephemeral
+            else await self._memory_block(envelope, inbound_text, conversation_id)
+        )
         if memory_block is not None:
             messages.insert(1, ChatMessage(role="system", content=memory_block))
         if self.tools is not None:
@@ -202,7 +241,9 @@ class AgentTurnEngine:
         started = self.clock()
         try:
             async with asyncio.timeout(self.turn_deadline_seconds):
-                final_text = await self._tool_loop(messages, envelope, state)
+                final_text = await self._tool_loop(
+                    messages, envelope, state, conversation_id
+                )
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -245,7 +286,10 @@ class AgentTurnEngine:
                 today=today,
             )
         return shape_reply(
-            final_text, capabilities=capabilities, citations=tuple(state.citations)
+            final_text,
+            capabilities=capabilities,
+            citations=tuple(state.citations),
+            empty_fallback=self.empty_reply_fallback,
         )
 
     async def _tool_loop(
@@ -253,6 +297,7 @@ class AgentTurnEngine:
         messages: list[ChatMessage],
         envelope: MessageEnvelope,
         state: _ToolLoopState,
+        conversation_id: UUID,
     ) -> str:
         """Offer tools while budget remains; always end on a plain text reply."""
 
@@ -264,7 +309,34 @@ class AgentTurnEngine:
                 and state.calls_used < self.max_tool_calls
             ):
                 offer = self.tools.openai_tools(self.granted_capabilities) or None
-            reply = await self.llm.complete(messages, tools=offer)  # type: ignore[union-attr]
+            call_started = self.clock()
+            try:
+                reply = await self.llm.complete(messages, tools=offer)  # type: ignore[union-attr]
+            except LlmError as error:
+                await self._trace(
+                    envelope,
+                    conversation_id,
+                    "llm.complete",
+                    status="error",
+                    duration_ms=int((self.clock() - call_started) * 1_000),
+                    attributes={
+                        "error_code": type(error).__name__,
+                        "retryable": error.retryable,
+                    },
+                )
+                raise
+            await self._trace(
+                envelope,
+                conversation_id,
+                "llm.complete",
+                duration_ms=int((self.clock() - call_started) * 1_000),
+                attributes={
+                    "model": reply.model,
+                    "prompt_tokens": reply.prompt_tokens,
+                    "completion_tokens": reply.completion_tokens,
+                    "tool_calls": len(reply.tool_calls),
+                },
+            )
             state.prompt_tokens += reply.prompt_tokens
             state.completion_tokens += reply.completion_tokens
             state.model = reply.model
@@ -278,13 +350,16 @@ class AgentTurnEngine:
                 )
             )
             for call in reply.tool_calls:
-                messages.append(await self._execute_call(call, envelope, state))
+                messages.append(
+                    await self._execute_call(call, envelope, state, conversation_id)
+                )
 
     async def _execute_call(
         self,
         call: ToolCall,
         envelope: MessageEnvelope,
         state: _ToolLoopState,
+        conversation_id: UUID,
     ) -> ChatMessage:
         arguments, argument_error = _parse_arguments(call.arguments)
         call_started = self.clock()
@@ -349,6 +424,18 @@ class AgentTurnEngine:
             error_code=error_code,
             latency_ms=latency_ms,
         )
+        await self._trace(
+            envelope,
+            conversation_id,
+            "tool.call",
+            status="ok" if ok else "error",
+            duration_ms=latency_ms,
+            attributes={
+                "tool_id": call.name,
+                "ok": ok,
+                "error_code": error_code,
+            },
+        )
         content = json.dumps(payload, ensure_ascii=False, default=str)
         if len(content) > _TOOL_RESULT_CHAR_CAP:
             content = content[: _TOOL_RESULT_CHAR_CAP - 1] + "…"
@@ -380,27 +467,61 @@ class AgentTurnEngine:
             error=error,
         )
         await self._record_invocations(turn_id, state)
-        return shape_reply(LLM_FAILURE_FALLBACK, capabilities=capabilities)
+        return shape_reply(
+            self.llm_failure_fallback,
+            capabilities=capabilities,
+            empty_fallback=self.empty_reply_fallback,
+        )
 
     async def _memory_block(
-        self, envelope: MessageEnvelope, inbound_text: str
+        self,
+        envelope: MessageEnvelope,
+        inbound_text: str,
+        conversation_id: UUID,
     ) -> str | None:
         if self.memory is None:
+            await self._trace(
+                envelope,
+                conversation_id,
+                "memory.retrieval",
+                status="skipped",
+                attributes={"reason": "disabled"},
+            )
             return None
+        started = self.clock()
         try:
-            return await self.memory.retrieval_block(envelope, inbound_text)
+            block = await self.memory.retrieval_block(envelope, inbound_text)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("memory_retrieval_failed")
+            await self._trace(
+                envelope,
+                conversation_id,
+                "memory.retrieval",
+                status="error",
+                duration_ms=int((self.clock() - started) * 1_000),
+                attributes={"error_code": "memory_retrieval_failed"},
+            )
             return None
+        await self._trace(
+            envelope,
+            conversation_id,
+            "memory.retrieval",
+            duration_ms=int((self.clock() - started) * 1_000),
+            attributes={
+                "recalled": block is not None,
+                "summary": (block or "")[:2_000],
+            },
+        )
+        return block
 
     async def after_reply(
         self, *, envelope: MessageEnvelope, stable_key: str, reply_text: str
     ) -> None:
         """Post-turn memory extraction; failures never affect the delivered reply."""
 
-        if self.memory is None or self.llm is None:
+        if envelope.ephemeral or self.memory is None or self.llm is None:
             return
         try:
             outcome = await self.memory.extract_and_store(envelope, reply_text)
@@ -436,6 +557,17 @@ class AgentTurnEngine:
         if isinstance(override, str) and override.strip():
             return override.strip()
         return self.default_system_prompt
+
+    async def _prepare_inbound(self, envelope: MessageEnvelope) -> EnvelopePrompt:
+        if self.vision is None:
+            return envelope_prompt(envelope, include_images=False)
+        try:
+            return await self.vision.prepare(envelope)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("vision_prepare_unexpected_failure")
+            return envelope_prompt(envelope, include_images=False)
 
     async def _history_window(
         self, conversation_id: UUID, inbound_text: str
@@ -481,6 +613,32 @@ class AgentTurnEngine:
         except Exception:
             logger.exception("agent_turn_audit_failed", outcome=outcome)
             return None
+
+    async def _trace(
+        self,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
+        stage: str,
+        *,
+        status: TraceStatus = "ok",
+        duration_ms: int = 0,
+        attributes: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        if self.traces is None:
+            return
+        try:
+            await self.traces.record(
+                trace_id=envelope.trace_id,
+                stage=stage,
+                status=status,
+                duration_ms=duration_ms,
+                conversation_id=conversation_id,
+                attributes=attributes,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("trace_span_record_failed", stage=stage)
 
 
 def _parse_arguments(raw: str) -> tuple[dict[str, JsonValue] | None, str | None]:

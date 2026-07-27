@@ -71,9 +71,22 @@ def test_llm_settings_default_to_a_disabled_agent_with_bounded_knobs() -> None:
     assert settings.llm_api_key is None
     assert settings.llm_model == "deepseek-chat"
     assert 0.0 <= settings.llm_temperature <= 2.0
+    assert 1 <= settings.model_channel_cooldown_seconds <= 3_600
+    assert 1.0 <= settings.model_channels_cache_ttl_seconds <= 600.0
+    assert settings.model_api_keys is None
     assert settings.agent_history_token_budget >= 256
     assert settings.agent_daily_token_ceiling >= 0
     assert "MyBot" in settings.agent_system_prompt
+    assert settings.vision_mode == "describe"
+    assert settings.vision_max_description_chars >= 100
+    assert settings.fallback_llm_failure == "语言模型暂时不可用, 请稍后再试。"
+
+
+def test_model_secret_map_resolves_only_named_environment_references() -> None:
+    settings = Settings(model_api_keys='{"PRIMARY_KEY": "secret-value"}')
+
+    assert settings.model_secret("PRIMARY_KEY") == "secret-value"
+    assert settings.model_secret("MISSING_KEY") is None
 
 
 def test_blank_llm_base_url_becomes_none(monkeypatch: pytest.MonkeyPatch) -> None:

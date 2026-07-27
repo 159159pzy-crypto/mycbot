@@ -8,6 +8,7 @@ from mybot.contracts.conversation import (
 )
 from mybot.contracts.memory import MemoryItem, MemoryPrivacy, MemoryScope
 from mybot.contracts.messages import (
+    AtSegment,
     ChatKind,
     FileSegment,
     ImageSegment,
@@ -15,13 +16,16 @@ from mybot.contracts.messages import (
     Platform,
     PlatformCapabilities,
     ReferenceSegment,
+    StickerSegment,
     TextSegment,
+    VoiceSegment,
 )
 from mybot.contracts.plugins import PluginManifest
 from mybot.contracts.replies import Citation, ReplyPlan, TypingProfile
 from mybot.contracts.tools import ToolContext, ToolError, ToolResult, ToolRisk, ToolSpec
 
 __all__ = [
+    "AtSegment",
     "ChatKind",
     "Citation",
     "ConversationKey",
@@ -36,6 +40,7 @@ __all__ = [
     "PluginManifest",
     "ReferenceSegment",
     "ReplyPlan",
+    "StickerSegment",
     "TextSegment",
     "ToolContext",
     "ToolError",
@@ -46,4 +51,5 @@ __all__ = [
     "TurnDecision",
     "TurnTrigger",
     "TypingProfile",
+    "VoiceSegment",
 ]

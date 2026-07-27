@@ -48,6 +48,17 @@ def _text_from_segments(segments: object) -> str:
                 text = segment.get("text")
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
+            elif segment.get("type") == "image":
+                alt = segment.get("alt_text")
+                parts.append(f"[图片: {alt if isinstance(alt, str) and alt else '图片'}]")
+            elif segment.get("type") == "sticker":
+                name = segment.get("name")
+                parts.append(f"[表情: {name if isinstance(name, str) and name else '表情'}]")
+            elif segment.get("type") == "voice":
+                parts.append("[语音消息]")
+            elif segment.get("type") == "file":
+                name = segment.get("name")
+                parts.append(f"[文件: {name if isinstance(name, str) and name else '文件'}]")
     return "\n".join(parts)
 
 
@@ -77,6 +88,7 @@ class MessageRepository:
                     segments=segments,
                     occurred_at=envelope.occurred_at,
                     raw=raw,
+                    trace_id=envelope.trace_id,
                 )
                 .on_conflict_do_nothing(
                     index_elements=["conversation_id", "direction", "platform_message_id"]
@@ -101,6 +113,7 @@ class MessageRepository:
         plan: ReplyPlan,
         *,
         occurred_at: datetime | None = None,
+        trace_id: str | None = None,
     ) -> UUID:
         """Persist a planned reply with its platform message id pending delivery."""
 
@@ -108,6 +121,10 @@ class MessageRepository:
         segments: list[JsonValue] = [
             {"type": "text", "text": text} for text in plan.text_segments
         ]
+        segments.extend(
+            cast(JsonValue, segment.model_dump(mode="json"))
+            for segment in plan.media_segments
+        )
         async with self.sessions() as session:
             await session.execute(
                 sa.insert(messages_table).values(
@@ -118,6 +135,7 @@ class MessageRepository:
                     sender_identity_id=SELF_SENDER,
                     segments=segments,
                     occurred_at=occurred_at or datetime.now(tz=UTC),
+                    trace_id=trace_id,
                 )
             )
             await session.commit()

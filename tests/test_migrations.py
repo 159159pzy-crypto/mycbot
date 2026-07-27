@@ -12,6 +12,9 @@ class RecordingOperations:
     def drop_index(self, name: str, *, table_name: str | None = None) -> None:
         self.calls.append(("drop_index", name))
 
+    def drop_column(self, table_name: str, column_name: str) -> None:
+        self.calls.append(("drop_column", f"{table_name}.{column_name}"))
+
     def execute(self, statement: str) -> None:
         self.calls.append(("execute", statement))
 
@@ -147,4 +150,54 @@ def test_operator_audit_migration_chains_and_downgrade_drops_only_its_table() ->
     assert operations.calls == [
         ("drop_index", "ix_operator_audit_created"),
         ("drop_table", "operator_audit"),
+    ]
+
+
+def test_llm_call_log_migration_chains_and_downgrade_drops_only_its_table() -> None:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260727_0007_llm_call_log.py"
+    )
+    namespace = runpy.run_path(str(migration_path))
+    assert namespace["revision"] == "20260727_0007"
+    assert namespace["down_revision"] == "20260726_0006"
+
+    downgrade = namespace["downgrade"]
+    operations = RecordingOperations()
+    downgrade.__globals__["op"] = operations
+
+    downgrade()
+
+    assert operations.calls == [
+        ("drop_index", "ix_llm_call_log_conversation_created"),
+        ("drop_index", "ix_llm_call_log_channel_created"),
+        ("drop_table", "llm_call_log"),
+    ]
+
+
+def test_multimodal_sandbox_trace_migration_chains_and_downgrades_cleanly() -> None:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260727_0008_multimodal_sandbox_trace.py"
+    )
+    namespace = runpy.run_path(str(migration_path))
+    assert namespace["revision"] == "20260727_0008"
+    assert namespace["down_revision"] == "20260727_0007"
+
+    downgrade = namespace["downgrade"]
+    operations = RecordingOperations()
+    downgrade.__globals__["op"] = operations
+    downgrade()
+
+    assert operations.calls == [
+        ("drop_index", "ix_trace_spans_conversation_created"),
+        ("drop_index", "ix_trace_spans_trace_created"),
+        ("drop_table", "trace_spans"),
+        ("drop_index", "ix_messages_trace_id"),
+        ("drop_column", "messages.trace_id"),
+        ("drop_column", "conversations.ephemeral"),
     ]

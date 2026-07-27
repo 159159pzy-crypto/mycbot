@@ -13,6 +13,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  audit:
+    name: Production dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.24"
+
+      - name: Audit locked production dependencies
+        run: |
+          uv export --no-emit-project --no-dev --locked --format requirements-txt > requirements.txt
+          uv tool run pip-audit --strict --requirement requirements.txt
+
   python:
     name: Python lint, type, and tests
     runs-on: ubuntu-latest

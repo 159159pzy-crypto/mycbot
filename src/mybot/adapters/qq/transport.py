@@ -19,7 +19,7 @@ from mybot.adapters.payload import (
     get_mapping,
     get_str,
 )
-from mybot.adapters.qq.translate import translate_qq_event
+from mybot.adapters.qq.translate import QQ_CAPABILITIES, encode_qq_reply, translate_qq_event
 from mybot.contracts import ChatKind
 
 logger = structlog.get_logger("mybot.gateway.qq")
@@ -88,13 +88,12 @@ class QQTransport:
         """Send every reply segment as a message; return the last platform message id."""
 
         last_message_id = ""
-        for index, text in enumerate(message.reply_plan.text_segments):
-            segments: list[dict[str, object]] = []
-            if index == 0 and message.reply_to_platform_message_id is not None:
-                segments.append(
-                    {"type": "reply", "data": {"id": message.reply_to_platform_message_id}}
-                )
-            segments.append({"type": "text", "data": {"text": text}})
+        encoded_messages = encode_qq_reply(
+            message.reply_plan,
+            capabilities=QQ_CAPABILITIES,
+            reply_to_message_id=message.reply_to_platform_message_id,
+        )
+        for segments in encoded_messages:
             params: dict[str, object] = {"message": segments}
             if message.chat_kind is ChatKind.DIRECT:
                 params["message_type"] = "private"
@@ -120,9 +119,7 @@ class QQTransport:
         future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
         self._pending[echo] = future
         try:
-            await connection.send(
-                json.dumps({"action": action, "params": params, "echo": echo})
-            )
+            await connection.send(json.dumps({"action": action, "params": params, "echo": echo}))
             async with asyncio.timeout(_ACTION_TIMEOUT_SECONDS):
                 response = await future
         except TimeoutError as error:
@@ -152,9 +149,7 @@ class QQTransport:
             return
         self_id = get_int(frame, "self_id") or 0
         try:
-            event = translate_qq_event(
-                frame, connection_id=self.connection_id, self_id=self_id
-            )
+            event = translate_qq_event(frame, connection_id=self.connection_id, self_id=self_id)
         except asyncio.CancelledError:
             raise
         except Exception:

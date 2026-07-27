@@ -4,7 +4,15 @@ from dataclasses import dataclass, field
 import httpx
 import pytest
 
-from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError, ToolCall
+from mybot.infrastructure.llm import (
+    ChatMessage,
+    ImageContentPart,
+    ImageUrl,
+    LlmClient,
+    LlmError,
+    TextContentPart,
+    ToolCall,
+)
 
 
 @dataclass
@@ -249,6 +257,41 @@ async def test_no_tools_request_body_is_unchanged() -> None:
     assert body["messages"] == [
         {"role": "system", "content": "You are MyBot."},
         {"role": "user", "content": "hi"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_serializes_openai_multimodal_content_parts() -> None:
+    server = FakeOpenAiServer(responses=[ok_response("是一只猫")])
+    client = make_client(server)
+
+    await client.complete(
+        [
+            ChatMessage(
+                role="user",
+                content=(
+                    TextContentPart(text="请描述图片"),
+                    ImageContentPart(image_url=ImageUrl(url="https://img.example/cat.png")),
+                ),
+            )
+        ]
+    )
+
+    body = json.loads(server.requests[0].content.decode())
+    assert body["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "请描述图片"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://img.example/cat.png",
+                        "detail": "auto",
+                    },
+                },
+            ],
+        }
     ]
 
 

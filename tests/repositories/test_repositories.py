@@ -20,6 +20,7 @@ from mybot.contracts import (
     MessageEnvelope,
     Platform,
     ReplyPlan,
+    StickerSegment,
     TextSegment,
 )
 from mybot.repositories.conversations import ConversationRepository
@@ -145,8 +146,16 @@ async def test_outbound_lifecycle_backfills_platform_id_for_reply_detection(
     conversation = await conversations.get_or_create(conversation_key(), platform=Platform.QQ)
 
     outbound_id = await messages.record_outbound(
-        conversation.id, ReplyPlan(text_segments=("pong",))
+        conversation.id,
+        ReplyPlan(
+            text_segments=("pong",),
+            media_segments=(StickerSegment(id="14", name="smile"),),
+        ),
     )
+    assert await messages.stored_segments(outbound_id) == [
+        {"type": "text", "text": "pong"},
+        {"type": "sticker", "id": "14", "name": "smile"},
+    ]
     assert await messages.recent_outbound_platform_ids(conversation.id) == ()
 
     await messages.mark_delivered(outbound_id, "5001")
@@ -225,7 +234,7 @@ async def test_recent_texts_returns_newest_first_text_extracts(
 
     assert [entry.direction for entry in recent] == ["outbound", "inbound"]
     assert recent[0].text == "回复一"
-    assert recent[1].text == "hello"
+    assert recent[1].text == "hello\n[图片: 图片]"
     assert recent[1].sender == "qq:10001"
 
 

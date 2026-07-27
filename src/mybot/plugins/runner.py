@@ -13,6 +13,7 @@ import structlog
 from pydantic import JsonValue
 
 from mybot.adapters.payload import as_string_mapping, get_str
+from mybot.plugins.broker import PLUGIN_PROTOCOL_VERSION
 from mybot.plugins.sdk import PluginToolError, SimplePlugin
 from mybot.runtime import ProcessMode
 from mybot.settings import Settings
@@ -48,9 +49,7 @@ def load_plugins(config_json: str) -> list[SimplePlugin]:
             logger.warning("plugin_entrypoint_not_a_plugin", entry=raw)
             continue
         plugins.append(plugin)
-        logger.info(
-            "plugin_loaded", plugin_id=plugin.manifest.id, version=plugin.manifest.version
-        )
+        logger.info("plugin_loaded", plugin_id=plugin.manifest.id, version=plugin.manifest.version)
     return plugins
 
 
@@ -94,9 +93,9 @@ class PluginRunnerService:
                     f"{self.broker_url.rstrip('/')}/plugin-broker/register",
                     json={
                         "runner_id": self.runner_id,
+                        "protocol_version": PLUGIN_PROTOCOL_VERSION,
                         "manifests": [
-                            plugin.manifest.model_dump(mode="json")
-                            for plugin in self.plugins
+                            plugin.manifest.model_dump(mode="json") for plugin in self.plugins
                         ],
                     },
                     timeout=10.0,
@@ -104,9 +103,7 @@ class PluginRunnerService:
             except asyncio.CancelledError:
                 raise
             except httpx.HTTPError as error:
-                logger.warning(
-                    "plugin_registration_unreachable", error=type(error).__name__
-                )
+                logger.warning("plugin_registration_unreachable", error=type(error).__name__)
                 await _wait(stop_event, backoff)
                 backoff = min(backoff * 2, self.reconnect_max_seconds)
                 continue
@@ -164,15 +161,11 @@ class PluginRunnerService:
                 continue
             try:
                 payload = as_string_mapping(event.get("payload")) or {}
-                await plugin.deliver_event(
-                    {"kind": kind, **cast(Mapping[str, JsonValue], payload)}
-                )
+                await plugin.deliver_event({"kind": kind, **cast(Mapping[str, JsonValue], payload)})
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception(
-                    "plugin_event_handler_failed", plugin_id=plugin.manifest.id
-                )
+                logger.exception("plugin_event_handler_failed", plugin_id=plugin.manifest.id)
 
     async def _execute(self, raw_invocation: object) -> None:
         invocation = as_string_mapping(raw_invocation)
@@ -199,11 +192,7 @@ class PluginRunnerService:
         self, tool_id: str, arguments: Mapping[str, JsonValue]
     ) -> dict[str, JsonValue]:
         plugin = next(
-            (
-                candidate
-                for candidate in self.plugins
-                if tool_id in candidate.tool_handlers
-            ),
+            (candidate for candidate in self.plugins if tool_id in candidate.tool_handlers),
             None,
         )
         if plugin is None:
@@ -223,16 +212,13 @@ class PluginRunnerService:
         except PluginToolError as error:
             return _failure(error.code, str(error))
         except Exception as error:
-            logger.exception(
-                "plugin_tool_crashed", tool_id=tool_id, plugin_id=plugin.manifest.id
-            )
+            logger.exception("plugin_tool_crashed", tool_id=tool_id, plugin_id=plugin.manifest.id)
             return _failure("tool_error", type(error).__name__)
         encoded = json.dumps(data, ensure_ascii=False, default=str)
         if len(encoded) > self.result_max_chars:
             return _failure(
                 "result_too_large",
-                f"{tool_id} produced {len(encoded)} chars "
-                f"(limit {self.result_max_chars})",
+                f"{tool_id} produced {len(encoded)} chars (limit {self.result_max_chars})",
             )
         return {"ok": True, "data": data, "error": None}
 

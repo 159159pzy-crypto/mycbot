@@ -109,6 +109,15 @@ class FakeTurns:
         return uuid4()
 
 
+@dataclass
+class FakeTraces:
+    spans: list[dict[str, object]] = field(default_factory=list)
+
+    async def record(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.spans.append(kwargs)
+        return uuid4()
+
+
 def envelope(text: str = "讲个笑话") -> MessageEnvelope:
     return MessageEnvelope(
         id="telegram:telegram-main:777:66",
@@ -187,13 +196,34 @@ async def test_successful_turn_returns_shaped_reply_and_records_audit_and_spend(
     assert record.model == "deepseek-chat-v3"
     assert (record.prompt_tokens, record.completion_tokens) == (100, 50)
     # spend was consumed: another 400-token turn still fits, but not 500
+    today = datetime.now(tz=UTC).date().isoformat()
     assert (
-        await budget.allows("v1:telegram-main:DIRECT:777:0", today="2026-07-26") is True
+        await budget.allows("v1:telegram-main:DIRECT:777:0", today=today) is True
     )
-    await budget.consume("v1:telegram-main:DIRECT:777:0", 350, today="2026-07-26")
+    await budget.consume("v1:telegram-main:DIRECT:777:0", 350, today=today)
     assert (
-        await budget.allows("v1:telegram-main:DIRECT:777:0", today="2026-07-26") is False
+        await budget.allows("v1:telegram-main:DIRECT:777:0", today=today) is False
     )
+
+
+@pytest.mark.asyncio
+async def test_turn_records_vision_memory_and_llm_trace_stages() -> None:
+    llm = FakeLlm(
+        reply=LlmReply(text="回答", model="m", prompt_tokens=3, completion_tokens=2)
+    )
+    turns = FakeTurns()
+    traces = FakeTraces()
+    engine = make_engine(llm=llm, turns=turns)
+    engine.traces = traces
+
+    await run(engine)
+
+    assert [span["stage"] for span in traces.spans] == [
+        "vision.prepare",
+        "memory.retrieval",
+        "llm.complete",
+    ]
+    assert all(span["trace_id"] for span in traces.spans)
 
 
 @pytest.mark.asyncio
@@ -359,7 +389,7 @@ async def test_search_then_answer_produces_cited_reply_and_audit() -> None:
 
     assert "今天多云" in plan.text_segments[0]
     assert plan.citations == (Citation(label="Weather", uri="https://a.example/1"),)
-    assert "Sources:" in plan.text_segments[-1]
+    assert "参考来源:" in plan.text_segments[-1]
     assert tool.calls == [{"query": "天气"}]
     # first call offered tools; the conversation grew by assistant+tool messages
     assert llm.calls[0][1] is not None
@@ -493,6 +523,26 @@ async def test_memory_retrieval_failure_leaves_the_prompt_unchanged() -> None:
     assert plan.text_segments[0] == "回答"
     roles = [message.role for message in llm.calls[0]]
     assert roles.count("system") == 1
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_turn_skips_memory_retrieval_and_extraction() -> None:
+    llm = FakeLlm(reply=LlmReply(text="回答", model="m", prompt_tokens=1, completion_tokens=1))
+    turns = FakeTurns()
+    memory = FakeMemoryHooks()
+    engine = make_engine(llm=llm, turns=turns)
+    engine.memory = memory
+    ephemeral = envelope().model_copy(update={"ephemeral": True})
+
+    await run(engine, ephemeral)
+    await engine.after_reply(
+        envelope=ephemeral,
+        stable_key="v1:sandbox:DIRECT:session:0",
+        reply_text="回答",
+    )
+
+    assert len(llm.calls[0]) == 2
+    assert memory.extractions == []
 
 
 @pytest.mark.asyncio

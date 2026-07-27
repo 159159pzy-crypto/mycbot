@@ -1,5 +1,13 @@
-from mybot.contracts import ChatKind, Platform
-from mybot.engine.prompt import HistoryEntry, assemble_messages, estimate_tokens
+from datetime import UTC, datetime
+
+from mybot.contracts import ChatKind, ImageSegment, MessageEnvelope, Platform, TextSegment
+from mybot.engine.prompt import (
+    HistoryEntry,
+    assemble_messages,
+    envelope_prompt,
+    estimate_tokens,
+)
+from mybot.infrastructure.llm import ImageContentPart, ImageUrl, TextContentPart
 
 
 def history(count: int) -> list[HistoryEntry]:
@@ -20,6 +28,38 @@ def test_estimate_tokens_is_positive_and_monotonic() -> None:
     assert estimate_tokens("") == 1
     assert estimate_tokens("word") >= 1
     assert estimate_tokens("a" * 400) > estimate_tokens("a" * 100)
+
+
+def test_estimate_tokens_calibrates_mixed_cjk_and_latin_text() -> None:
+    assert estimate_tokens("中文" * 20) > estimate_tokens("ab" * 20)
+    mixed = estimate_tokens("请检查 deploy status 和 error logs")
+    assert estimate_tokens("请检查") < mixed < estimate_tokens("请检查" * 10)
+
+
+def test_envelope_prompt_preserves_text_and_image_references() -> None:
+    envelope = MessageEnvelope(
+        id="qq:main:1",
+        connection_id="main",
+        platform=Platform.QQ,
+        chat_kind=ChatKind.DIRECT,
+        chat_id="42",
+        sender_identity_id="qq:7",
+        occurred_at=datetime.now(tz=UTC),
+        segments=(
+            TextSegment(text="这是什么?"),
+            ImageSegment(url="https://img.example/cat.png", alt_text="随手拍"),
+        ),
+    )
+
+    prepared = envelope_prompt(envelope, include_images=True)
+
+    assert prepared.summary == "这是什么?\n[图片: 随手拍]"
+    assert prepared.content == (
+        TextContentPart(text="这是什么?"),
+        ImageContentPart(
+            image_url=ImageUrl(url="https://img.example/cat.png")
+        ),
+    )
 
 
 def test_system_message_carries_persona_context_and_reply_rules() -> None:

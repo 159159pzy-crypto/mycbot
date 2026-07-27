@@ -9,7 +9,11 @@ import structlog
 
 from mybot.adapters import OutboundMessage
 from mybot.adapters.payload import RawMapping, as_string_mapping, get_id, get_int, get_str
-from mybot.adapters.telegram.translate import translate_telegram_update
+from mybot.adapters.telegram.translate import (
+    TELEGRAM_CAPABILITIES,
+    encode_telegram_reply,
+    translate_telegram_update,
+)
 
 logger = structlog.get_logger("mybot.gateway.telegram")
 
@@ -79,16 +83,20 @@ class TelegramTransport:
         """Send each reply segment; return the last Telegram message id."""
 
         last_message_id = ""
-        for index, text in enumerate(message.reply_plan.text_segments):
-            body: dict[str, object] = {"chat_id": message.chat_id, "text": text}
-            if index == 0 and message.reply_to_platform_message_id is not None:
-                body["reply_to_message_id"] = message.reply_to_platform_message_id
-                body["allow_sending_without_reply"] = True
-            sent = await self._post("sendMessage", body)
+        actions = encode_telegram_reply(
+            message.reply_plan,
+            capabilities=TELEGRAM_CAPABILITIES,
+            reply_to_message_id=message.reply_to_platform_message_id,
+        )
+        for action in actions:
+            method = str(action["method"])
+            body = dict(cast(dict[str, object], action["body"]))
+            body["chat_id"] = message.chat_id
+            sent = await self._post(method, body)
             sent_mapping = as_string_mapping(sent) or {}
             message_id = get_id(sent_mapping, "message_id")
             if message_id is None:
-                raise DeliveryError("sendMessage response did not include a message_id")
+                raise DeliveryError(f"{method} response did not include a message_id")
             last_message_id = message_id
         return last_message_id
 
@@ -139,9 +147,7 @@ class TelegramTransport:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception(
-                "telegram_update_translation_failed", connection_id=self.connection_id
-            )
+            logger.exception("telegram_update_translation_failed", connection_id=self.connection_id)
             return
         if event is None:
             return

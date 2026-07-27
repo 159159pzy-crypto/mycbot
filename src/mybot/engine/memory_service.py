@@ -19,7 +19,7 @@ from mybot.contracts import (
     MessageEnvelope,
 )
 from mybot.engine.prompt import estimate_tokens
-from mybot.infrastructure.embeddings import EmbeddingClient, EmbeddingError
+from mybot.infrastructure.embeddings import EmbeddingError
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply
 from mybot.repositories.memory import ScoredMemory
 
@@ -30,8 +30,8 @@ EXTRACTION_SYSTEM_PROMPT = (
     "You extract long-term memories from one chat exchange. Return ONLY a JSON "
     'array, no prose. Each element: {"content": string, "kind": string, '
     '"scope": "subject" | "conversation", "confidence": number between 0 and 1}. '
-    "Use scope \"subject\" for stable facts or preferences about the user "
-    "personally, and \"conversation\" for context that only matters in this "
+    'Use scope "subject" for stable facts or preferences about the user '
+    'personally, and "conversation" for context that only matters in this '
     "chat. Extract at most 3 items and return [] when nothing is worth "
     "remembering. Never include secrets, credentials, or sensitive personal "
     "data such as health, finances, or government identifiers."
@@ -69,6 +69,10 @@ class MemoryStore(Protocol):
     ) -> int: ...
 
 
+class Embeddings(Protocol):
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+
 class ExtractionLlm(Protocol):
     async def complete(
         self,
@@ -93,7 +97,7 @@ class ExtractionOutcome:
 class MemoryService:
     """Retrieval and extraction under the contract's scope/privacy rules."""
 
-    embeddings: EmbeddingClient
+    embeddings: Embeddings
     store: MemoryStore
     llm: ExtractionLlm | None
     embedding_model: str
@@ -102,10 +106,11 @@ class MemoryService:
     token_budget: int = 1_200
     now: Callable[[], datetime] = _utc_now
 
-    async def retrieval_block(
-        self, envelope: MessageEnvelope, inbound_text: str
-    ) -> str | None:
+    async def retrieval_block(self, envelope: MessageEnvelope, inbound_text: str) -> str | None:
         """Render relevant memories, or None; privacy is enforced here in code."""
+
+        if envelope.ephemeral:
+            return None
 
         try:
             vectors = await self.embeddings.embed([inbound_text])
@@ -151,7 +156,7 @@ class MemoryService:
     ) -> ExtractionOutcome:
         """Ask the LLM for candidates and persist the ones that pass policy."""
 
-        if self.llm is None:
+        if envelope.ephemeral or self.llm is None:
             return ExtractionOutcome(0, 0, 0)
         inbound_text = _first_text(envelope)
         messages = [
@@ -159,8 +164,7 @@ class MemoryService:
             ChatMessage(
                 role="user",
                 content=(
-                    f"User ({envelope.sender_identity_id}): {inbound_text}\n"
-                    f"Assistant: {reply_text}"
+                    f"User ({envelope.sender_identity_id}): {inbound_text}\nAssistant: {reply_text}"
                 ),
             ),
         ]
@@ -183,17 +187,13 @@ class MemoryService:
             except EmbeddingError as error:
                 logger.warning("memory_store_embedding_failed", error=str(error))
                 continue
-            await self.store.store(
-                item, embedding=vectors[0], embedding_model=self.embedding_model
-            )
+            await self.store.store(item, embedding=vectors[0], embedding_model=self.embedding_model)
             stored += 1
         if stored:
             logger.info("memories_stored", count=stored)
         return ExtractionOutcome(stored, reply.prompt_tokens, reply.completion_tokens)
 
-    async def forget(
-        self, *, subject_identity_id: str, conversation_stable_key: str | None
-    ) -> int:
+    async def forget(self, *, subject_identity_id: str, conversation_stable_key: str | None) -> int:
         return await self.store.revoke_for(
             subject_identity_id=subject_identity_id,
             conversation_stable_key=conversation_stable_key,
@@ -242,9 +242,9 @@ def _conversation_key(envelope: MessageEnvelope) -> ConversationKey:
 
 
 def _first_text(envelope: MessageEnvelope) -> str:
-    from mybot.engine.prompt import envelope_text
+    from mybot.engine.prompt import envelope_prompt
 
-    return envelope_text(envelope) or "[non-text message]"
+    return envelope_prompt(envelope, include_images=False).summary
 
 
 def _parse_candidates(text: str) -> list[_Candidate]:

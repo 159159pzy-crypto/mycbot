@@ -33,7 +33,9 @@ class FakeLookup:
 class FakeMessages:
     outbound: list[tuple[UUID, ReplyPlan]] = field(default_factory=list)
 
-    async def record_outbound(self, conversation_id, plan, *, occurred_at=None):  # type: ignore[no-untyped-def]
+    async def record_outbound(  # type: ignore[no-untyped-def]
+        self, conversation_id, plan, *, occurred_at=None, trace_id=None
+    ):
         self.outbound.append((conversation_id, plan))
         return uuid4()
 

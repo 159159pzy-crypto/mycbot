@@ -3,6 +3,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,13 +28,16 @@ from mybot.contracts import (
     TurnTrigger,
 )
 from mybot.infrastructure.health import ReadinessService
+from mybot.infrastructure.model_routing import ModelCallAttempt, ModelPurpose
 from mybot.repositories.conversations import ConversationRepository
+from mybot.repositories.llm_calls import LlmCallLogRepository
 from mybot.repositories.memory import MemoryRepository
 from mybot.repositories.messages import MessageRepository
 from mybot.repositories.tool_invocations import (
     ToolInvocationRecord,
     ToolInvocationRepository,
 )
+from mybot.repositories.traces import TraceSpanRepository
 from mybot.repositories.turns import TurnRepository
 from mybot.settings import Settings
 
@@ -107,6 +111,8 @@ async def _seed(migrated: str) -> tuple[str, str]:
     turns = TurnRepository(sessions)
     invocations = ToolInvocationRepository(sessions)
     memory = MemoryRepository(sessions)
+    llm_calls = LlmCallLogRepository(sessions)
+    traces = TraceSpanRepository(sessions)
     key = ConversationKey(
         connection_id="telegram-main", chat_kind=ChatKind.DIRECT, chat_id="777"
     )
@@ -118,10 +124,18 @@ async def _seed(migrated: str) -> tuple[str, str]:
         chat_kind=ChatKind.DIRECT,
         chat_id="777",
         sender_identity_id="telegram:777",
+        trace_id="trace-operator-1",
         occurred_at=datetime(2026, 7, 26, 6, tzinfo=UTC),
         segments=(TextSegment(text="讲个笑话"),),
     )
     stored = await messages.record_inbound(conversation.id, envelope)
+    await traces.record(
+        trace_id=envelope.trace_id,
+        stage="llm.chat",
+        duration_ms=900,
+        message_id=stored.id,
+        attributes={"model": "deepseek-chat", "prompt_tokens": 100},
+    )
     await messages.record_outbound(conversation.id, ReplyPlan(text_segments=("好的",)))
     turn_id = await turns.record_turn(
         conversation.id,
@@ -141,6 +155,21 @@ async def _seed(migrated: str) -> tuple[str, str]:
     await invocations.record_many(
         turn_id,
         [ToolInvocationRecord(tool_id="web_search", ok=True, error_code=None, latency_ms=120)],
+    )
+    await llm_calls.record(
+        ModelCallAttempt(
+            purpose=ModelPurpose.CHAT,
+            channel="primary",
+            model="deepseek-chat",
+            status="success",
+            prompt_tokens=100,
+            completion_tokens=40,
+            latency_ms=900,
+            conversation_id=str(conversation.id),
+            input_price_per_million=Decimal("0.50"),
+            output_price_per_million=Decimal("1.50"),
+            cost_usd_micros=110,
+        )
     )
     memory_item = MemoryItem(
         scope=MemoryScope.SUBJECT,
@@ -180,6 +209,17 @@ async def test_conversation_browsing_returns_turns_and_tool_detail(
         )
     ).json()["messages"]
     assert [m["direction"] for m in messages] == ["inbound", "outbound"]
+    traces = (
+        await client.get(
+            f"/operator/conversations/{conversation_id}/traces",
+            params={"trace_id": "trace-operator-1"},
+            headers=AUTH,
+        )
+    ).json()["traces"]
+    assert traces[0]["trace_id"] == "trace-operator-1"
+    assert traces[0]["stage"] == "llm.chat"
+    assert traces[0]["duration_ms"] == 900
+    assert traces[0]["attributes"]["prompt_tokens"] == 100
     assert messages[0]["text"] == "讲个笑话"
 
 
@@ -244,7 +284,7 @@ async def test_persona_and_approvals_round_trip_with_audit(
 async def test_usage_and_metrics_shapes(
     client: httpx.AsyncClient, migrated: str
 ) -> None:
-    await _seed(migrated)
+    conversation_id, _ = await _seed(migrated)
 
     usage = (await client.get("/operator/usage", headers=AUTH)).json()["usage"]
     assert usage[-1]["tokens"] == 140
@@ -253,6 +293,12 @@ async def test_usage_and_metrics_shapes(
     assert metrics["turns"]["by_outcome"]["replied"] == 1
     assert "ingest" in metrics["queues"]
     assert "outbound_dead_letter" in metrics["queues"]
+
+    models = (await client.get("/operator/models", headers=AUTH)).json()
+    assert models["usage"][0]["channel"] == "primary"
+    assert models["usage"][0]["cost_usd_micros"] >= 110
+    assert models["daily_usage"][-1]["calls"] >= 1
+    assert models["conversation_usage"][0]["conversation_id"] == conversation_id
 
 
 @pytest.mark.asyncio

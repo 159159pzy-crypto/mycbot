@@ -8,6 +8,7 @@ export type ConversationSummary = {
   chat_id: string;
   last_message_at: string | null;
   message_count: number;
+  ephemeral?: boolean;
 };
 
 export type MessageView = {
@@ -15,6 +16,28 @@ export type MessageView = {
   sender_identity_id: string;
   text: string;
   occurred_at: string | null;
+  trace_id?: string | null;
+  segments?: Array<Record<string, unknown>>;
+};
+
+export type TraceSpanView = {
+  id: string;
+  trace_id: string;
+  message_id: string | null;
+  stage: string;
+  status: 'ok' | 'error' | 'skipped';
+  duration_ms: number;
+  attributes: Record<string, unknown>;
+  created_at: string | null;
+};
+
+export type SandboxSessionView = {
+  status: 'pending' | 'ready';
+  session_id: string;
+  conversation?: ConversationSummary;
+  messages?: MessageView[];
+  turns?: TurnView[];
+  traces?: TraceSpanView[];
 };
 
 export type ToolInvocationView = {
@@ -73,6 +96,57 @@ export type PluginView = {
 };
 
 export type PersonaConfig = { override: string | null; default: string };
+
+export type ModelTarget = {
+  model: string;
+  input_price_per_million?: string | null;
+  output_price_per_million?: string | null;
+};
+
+export type ModelChannel = {
+  name: string;
+  base_url: string;
+  api_key_env: string | null;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+  model_map: Record<string, ModelTarget>;
+};
+
+export type ModelChannelUsage = {
+  channel: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd_micros: number;
+  last_status: string;
+  last_called_at: string | null;
+};
+
+export type ModelDailyUsage = {
+  day: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd_micros: number;
+};
+
+export type ModelConversationUsage = {
+  conversation_id: string | null;
+  stable_key: string | null;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd_micros: number;
+};
+
+export type ModelsView = {
+  source: 'runtime' | 'legacy';
+  channels: ModelChannel[];
+  usage: ModelChannelUsage[];
+  daily_usage: ModelDailyUsage[];
+  conversation_usage: ModelConversationUsage[];
+};
 
 export type OperatorClient = {
   get: <T>(path: string) => Promise<T>;

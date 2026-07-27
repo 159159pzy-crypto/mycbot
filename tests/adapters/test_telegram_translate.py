@@ -11,9 +11,20 @@ from platform_payloads import (
 from mybot.adapters import InboundEvent
 from mybot.adapters.telegram.translate import (
     TELEGRAM_CAPABILITIES,
+    encode_telegram_reply,
     translate_telegram_update,
 )
-from mybot.contracts import ChatKind, FileSegment, ImageSegment, Platform, TextSegment
+from mybot.contracts import (
+    AtSegment,
+    ChatKind,
+    FileSegment,
+    ImageSegment,
+    Platform,
+    ReplyPlan,
+    StickerSegment,
+    TextSegment,
+    VoiceSegment,
+)
 
 CONNECTION = "telegram-main"
 BOT_ID = 424242
@@ -74,6 +85,7 @@ def test_mention_entity_matching_bot_username_sets_mentions_self() -> None:
     event = translate(telegram_update(message))
 
     assert event.mentions_self is True
+    assert AtSegment(target_id=str(BOT_ID), display_name=BOT_USERNAME) in event.envelope.segments
 
 
 def test_mention_of_other_user_does_not_set_mentions_self() -> None:
@@ -170,13 +182,18 @@ def test_update_without_message_returns_none() -> None:
     )
 
 
-def test_unsupported_content_degrades_to_placeholder() -> None:
-    message = telegram_private_message(text=None, sticker={"file_id": "st-1", "emoji": "😀"})
+def test_sticker_and_voice_map_to_typed_segments() -> None:
+    message = telegram_private_message(
+        text=None,
+        sticker={"file_id": "st-1", "emoji": "😀"},
+        voice={"file_id": "voice-1", "duration": 2, "mime_type": "audio/ogg"},
+    )
     segments = translate(telegram_update(message)).envelope.segments
 
-    assert len(segments) == 1
-    assert isinstance(segments[0], TextSegment)
-    assert "sticker" in segments[0].text
+    assert segments == (
+        StickerSegment(id="tg-file://st-1", name="😀"),
+        VoiceSegment(url="tg-file://voice-1", mime_type="audio/ogg", duration_ms=2_000),
+    )
 
 
 def test_raw_ref_is_frozen_against_mutation() -> None:
@@ -191,3 +208,32 @@ def test_telegram_capabilities() -> None:
     assert TELEGRAM_CAPABILITIES.replies is True
     assert TELEGRAM_CAPABILITIES.typing is True
     assert TELEGRAM_CAPABILITIES.editing is True
+    assert TELEGRAM_CAPABILITIES.mentions is True
+    assert TELEGRAM_CAPABILITIES.images is True
+    assert TELEGRAM_CAPABILITIES.stickers is True
+    assert TELEGRAM_CAPABILITIES.voice_messages is True
+
+
+def test_telegram_outbound_encoder_selects_bot_api_methods() -> None:
+    plan = ReplyPlan(
+        text_segments=("hello",),
+        media_segments=(
+            ImageSegment(url="https://img.example/cat.png"),
+            StickerSegment(id="tg-file://sticker-1"),
+            VoiceSegment(url="tg-file://voice-1"),
+        ),
+    )
+
+    actions = encode_telegram_reply(
+        plan,
+        capabilities=TELEGRAM_CAPABILITIES,
+        reply_to_message_id="77",
+    )
+
+    assert [action["method"] for action in actions] == [
+        "sendMessage",
+        "sendPhoto",
+        "sendSticker",
+        "sendVoice",
+    ]
+    assert actions[0]["body"]["reply_to_message_id"] == "77"

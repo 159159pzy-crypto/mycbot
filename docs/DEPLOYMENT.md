@@ -30,9 +30,17 @@ production:
   OpenAI-compatible endpoint.
 - `MYBOT_EMBEDDING_*` — an embeddings-capable endpoint, or leave both empty
   to run without memory.
+- `MYBOT_MODEL_API_KEYS` — optional JSON secret map for channels managed in
+  the Models panel. Channel configuration stores only reference names.
 - Platform credentials: `MYBOT_TELEGRAM_BOT_TOKEN` and/or `NAPCAT_WS_URL` +
   `MYBOT_QQ_ACCESS_TOKEN`.
 - `SEARXNG_IMAGE_TAG` — pin to a reviewed digest (see §6).
+
+For image understanding, keep `MYBOT_VISION_MODE=describe` unless the selected
+chat channel itself accepts OpenAI `image_url` content parts; only then use
+`direct`. The channel configuration must expose a `vision` model purpose for
+descriptor mode. The five `MYBOT_FALLBACK_*` values are operator-controlled
+Chinese degraded-mode replies and contain no secrets.
 
 ## 3. External NapCat (QQ only)
 
@@ -41,6 +49,12 @@ v11 WebSocket to a loopback or docker-network address (never the public
 internet), set a narrowly scoped access token, and point `NAPCAT_WS_URL`
 at it. From the gateway container the host is reachable as
 `host.docker.internal` (the compose file adds the mapping on Linux).
+
+Keep a reviewed Lagrange.OneBot configuration as a hot spare. Both endpoints
+must pass the fixture-backed OneBot v11 conformance set. During a NapCat
+incident, stop the old protocol endpoint, start Lagrange.OneBot with the same
+access policy, update only `NAPCAT_WS_URL`, and restart `gateway`; do not
+change contracts, workers, or conversation storage.
 
 ## 4. First boot
 
@@ -54,6 +68,12 @@ curl -s http://127.0.0.1:8000/health/ready
 
 Expect `{"status": "ready", ...}`. The web console is on
 `http://127.0.0.1:4173` until the proxy from §5 fronts it.
+
+After unlocking the console, use **Sandbox** for the first functional smoke:
+send text, optionally add an HTTP(S) image URL, wait for the persisted reply,
+then open its conversation and expand **追踪**. A sandbox session is ephemeral:
+it is intentionally visible for debugging but never participates in memory or
+proactive messaging.
 
 ## 5. TLS reverse proxy
 

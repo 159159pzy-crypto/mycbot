@@ -79,8 +79,36 @@ async def test_registration_lists_tools_and_health_surfaces_review_data(
     assert tools[0]["spec"]["id"] == "roll_dice"
     health = (await client.get("/plugin-broker/health")).json()
     assert health["runners"] == 1
+    assert health["protocol_version"] == 2
+    assert health["runner_protocol_versions"] == {"runner-1": 1}
     assert health["plugins"][0]["version"] == "1.0.0"
     assert health["plugins"][0]["granted_capabilities"] == []
+
+
+@pytest.mark.asyncio
+async def test_registration_negotiates_plugin_transport_version(
+    client: httpx.AsyncClient,
+) -> None:
+    current = await client.post(
+        "/plugin-broker/register",
+        json={
+            "runner_id": "runner-current",
+            "protocol_version": 1,
+            "manifests": [manifest_payload()],
+        },
+    )
+    unsupported = await client.post(
+        "/plugin-broker/register",
+        json={
+            "runner_id": "runner-future",
+            "protocol_version": 99,
+            "manifests": [manifest_payload(plugin_id="future.plugin")],
+        },
+    )
+
+    assert current.status_code == 200
+    assert unsupported.status_code == 409
+    assert "protocol" in unsupported.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -210,6 +238,60 @@ async def test_events_fan_out_to_hooked_runners(client: httpx.AsyncClient) -> No
     assert work["events"] == [
         {"kind": "message", "payload": {"envelope_id": "qq:qq-main:1"}}
     ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_runner_receives_new_segments_as_readable_text(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.post(
+        "/plugin-broker/register",
+        json={"runner_id": "legacy", "manifests": [manifest_payload()]},
+    )
+    await client.post(
+        "/plugin-broker/register",
+        json={
+            "runner_id": "current",
+            "protocol_version": 2,
+            "manifests": [manifest_payload(plugin_id="current.plugin")],
+        },
+    )
+    await client.post(
+        "/plugin-broker/events",
+        json={
+            "kind": "message",
+            "payload": {
+                "envelope": {
+                    "trace_id": "trace-1",
+                    "ephemeral": True,
+                    "segments": [
+                        {"type": "sticker", "id": "14", "name": "smile"}
+                    ]
+                }
+            },
+        },
+    )
+
+    legacy = (
+        await client.get(
+            "/plugin-broker/work",
+            params={"runner_id": "legacy", "wait_seconds": 0.05},
+        )
+    ).json()
+    current = (
+        await client.get(
+            "/plugin-broker/work",
+            params={"runner_id": "current", "wait_seconds": 0.05},
+        )
+    ).json()
+
+    assert legacy["events"][0]["payload"]["envelope"]["segments"] == [
+        {"type": "text", "text": "[sticker: smile]"}
+    ]
+    assert "trace_id" not in legacy["events"][0]["payload"]["envelope"]
+    assert "ephemeral" not in legacy["events"][0]["payload"]["envelope"]
+    assert current["events"][0]["payload"]["envelope"]["segments"][0]["type"] == "sticker"
+    assert current["events"][0]["payload"]["envelope"]["trace_id"] == "trace-1"
 
 
 @pytest.mark.asyncio
