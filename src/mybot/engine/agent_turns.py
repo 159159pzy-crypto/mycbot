@@ -132,6 +132,10 @@ class VisionPreparer(Protocol):
     async def prepare(self, envelope: MessageEnvelope) -> EnvelopePrompt: ...
 
 
+class SkillPromptSource(Protocol):
+    def prompt_catalog(self, *, max_chars: int) -> str: ...
+
+
 class TraceSink(Protocol):
     async def record(
         self,
@@ -197,6 +201,8 @@ class AgentTurnEngine:
     memory: MemoryHooks | None = None
     vision: VisionPreparer | None = None
     vision_llm: LlmCompleter | None = None
+    skills: SkillPromptSource | None = None
+    skill_prompt_max_chars: int = 4_000
     traces: TraceSink | None = None
     not_configured_fallback: str = NOT_CONFIGURED_FALLBACK
     llm_failure_fallback: str = LLM_FAILURE_FALLBACK
@@ -744,17 +750,24 @@ class AgentTurnEngine:
 
     async def _system_prompt(self, runtime_prompt: str | None = None) -> str:
         if runtime_prompt is not None and runtime_prompt.strip():
-            return runtime_prompt.strip()
-        try:
-            override = await self.persona.get(PERSONA_KEY)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("agent_persona_lookup_failed")
-            return self.default_system_prompt
-        if isinstance(override, str) and override.strip():
-            return override.strip()
-        return self.default_system_prompt
+            resolved = runtime_prompt.strip()
+        else:
+            try:
+                override = await self.persona.get(PERSONA_KEY)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("agent_persona_lookup_failed")
+                override = None
+            resolved = (
+                override.strip()
+                if isinstance(override, str) and override.strip()
+                else self.default_system_prompt
+            )
+        if self.skills is None:
+            return resolved
+        catalog = self.skills.prompt_catalog(max_chars=self.skill_prompt_max_chars)
+        return f"{resolved}\n\n{catalog}" if catalog else resolved
 
     async def _prepare_inbound(self, envelope: MessageEnvelope) -> EnvelopePrompt:
         if self.vision is None:

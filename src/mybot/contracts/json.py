@@ -61,6 +61,12 @@ class _JsonValueInput(RootModel[JsonValue]):
     pass
 
 
+def parse_json(payload: str | bytes | bytearray) -> JsonValue:
+    """Parse untrusted JSON without leaking Any/Unknown across typed boundaries."""
+
+    return _JsonValueInput.model_validate_json(payload).root
+
+
 def freeze_validated_json(value: _JsonValueInput) -> FrozenJsonValue:
     return freeze_json(value.root)
 

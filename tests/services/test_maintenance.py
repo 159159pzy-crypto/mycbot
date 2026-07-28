@@ -2,11 +2,12 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from mybot.repositories.memory import LifecycleReport
 from mybot.runtime import ProcessMode
-from mybot.services.maintenance import MaintenanceWorkerService
+from mybot.services.maintenance import MaintenanceWorkerService, PluginTaskScheduler
 
 NOW = datetime(2026, 7, 26, 12, tzinfo=UTC)
 
@@ -137,3 +138,45 @@ async def test_cancellation_propagates() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_plugin_task_scheduler_dispatches_due_tasks_and_obeys_intervals() -> None:
+    now = [100.0]
+    dispatched: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tasks"):
+            return httpx.Response(
+                200,
+                json={
+                    "tasks": [
+                        {
+                            "plugin_id": "example.jobs",
+                            "task_id": "refresh",
+                            "interval_seconds": 60,
+                        }
+                    ]
+                },
+            )
+        body = __import__("json").loads(request.content)
+        dispatched.append((body["plugin_id"], body["task_id"]))
+        return httpx.Response(200, json={"delivered": 1})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://api"
+    ) as client:
+        scheduler = PluginTaskScheduler(
+            client=client,
+            broker_url="http://api",
+            clock=lambda: now[0],
+        )
+        assert await scheduler.run_pass() == 1
+        assert await scheduler.run_pass() == 0
+        now[0] += 60
+        assert await scheduler.run_pass() == 1
+
+    assert dispatched == [
+        ("example.jobs", "refresh"),
+        ("example.jobs", "refresh"),
+    ]

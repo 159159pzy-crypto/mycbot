@@ -7,7 +7,7 @@ from crash_plugin_fixture import PLUGIN as CRASH_PLUGIN
 from pydantic import JsonValue
 
 from mybot.api import create_app
-from mybot.contracts import PluginManifest, ToolRisk, ToolSpec
+from mybot.contracts import PluginManifest, PluginTaskSpec, ToolRisk, ToolSpec
 from mybot.infrastructure.health import ReadinessService
 from mybot.plugins.examples import dice
 from mybot.plugins.runner import PluginRunnerService, load_plugins
@@ -193,6 +193,54 @@ async def test_events_reach_hooked_plugins(client: httpx.AsyncClient) -> None:
     finally:
         stop_event.set()
         await asyncio.wait_for(task, timeout=3.0)
+
+
+@pytest.mark.asyncio
+async def test_runner_applies_config_and_dispatches_declared_tasks(
+    client: httpx.AsyncClient,
+) -> None:
+    observed: list[object] = []
+
+    async def configure(config: Mapping[str, JsonValue]) -> None:
+        observed.append(("config", dict(config)))
+
+    async def refresh() -> None:
+        observed.append(("task", "refresh"))
+
+    plugin = SimplePlugin(
+        manifest=PluginManifest(
+            id="test.managed",
+            version="1.0.0",
+            entrypoint="test.managed:PLUGIN",
+            tasks=(PluginTaskSpec(id="refresh", interval_seconds=60),),
+            config_schema={
+                "type": "object",
+                "properties": {"endpoint": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        task_handlers={"refresh": refresh},
+        config_handler=configure,
+    )
+    runner = make_runner(client, [plugin])
+
+    await runner._deliver_event(  # pyright: ignore[reportPrivateUsage]
+        {
+            "kind": "plugin.config.changed",
+            "payload": {"plugin_id": "test.managed", "config": {"endpoint": "local"}},
+        }
+    )
+    await runner._deliver_event(  # pyright: ignore[reportPrivateUsage]
+        {
+            "kind": "plugin.task",
+            "payload": {"plugin_id": "test.managed", "task_id": "refresh"},
+        }
+    )
+
+    assert observed == [
+        ("config", {"endpoint": "local"}),
+        ("task", "refresh"),
+    ]
 
 
 def test_load_plugins_skips_broken_entries_and_keeps_the_rest() -> None:

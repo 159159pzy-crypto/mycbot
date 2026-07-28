@@ -2,6 +2,7 @@
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
 
 import uvicorn
 
@@ -29,6 +30,23 @@ def _run_non_api(mode: ProcessMode, settings: Settings) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    if argv is None:
+        import sys
+
+        argv = sys.argv[1:]
+    if argv and argv[0] == "plugin":
+        plugin_parser = argparse.ArgumentParser(prog="mybot plugin")
+        plugin_subcommands = plugin_parser.add_subparsers(dest="command", required=True)
+        new_parser = plugin_subcommands.add_parser("new")
+        new_parser.add_argument("name")
+        new_parser.add_argument("--root", default="plugins")
+        parsed_plugin = plugin_parser.parse_args(argv[1:])
+        if parsed_plugin.command == "new":
+            from mybot.plugins.tooling import scaffold_plugin
+
+            created = scaffold_plugin(parsed_plugin.name, Path(parsed_plugin.root))
+            print(created)
+            return
     parser = argparse.ArgumentParser(prog="mybot")
     parser.add_argument("mode", choices=[mode.value for mode in ProcessMode])
     parsed = parser.parse_args(argv)

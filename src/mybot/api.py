@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Response
@@ -32,6 +33,7 @@ def create_app(
     plugin_broker = PluginBroker(
         grants=resolved_settings.plugin_grants(),
         invoke_timeout_seconds=resolved_settings.plugin_invoke_timeout_seconds,
+        service_quota_per_minute=resolved_settings.plugin_service_quota_per_minute,
     )
     operator_model_client = httpx.AsyncClient()
 
@@ -80,6 +82,7 @@ def create_app(
     from mybot.infrastructure.database import create_database_engine, create_session_factory
     from mybot.infrastructure.model_routing import (
         MemoryModelCooldowns,
+        ModelPurpose,
         ModelRouter,
         legacy_model_channels,
         openai_client_factory,
@@ -99,7 +102,7 @@ def create_app(
     operator_backend = create_redis_backend(resolved_settings.redis_url.get_secret_value())
     operator_config = SystemKvRepository(operator_sessions)
     operator_attempts = LlmCallLogRepository(operator_sessions)
-    operator_embeddings = ModelRouter(
+    operator_model_router = ModelRouter(
         config=operator_config,
         fallback_channels=legacy_model_channels(resolved_settings),
         cooldowns=MemoryModelCooldowns(),
@@ -113,7 +116,25 @@ def create_app(
         secret_lookup=resolved_settings.model_secret,
         cache_ttl_seconds=resolved_settings.model_channels_cache_ttl_seconds,
         cooldown_seconds=resolved_settings.model_channel_cooldown_seconds,
-    ).embeddings()
+    )
+    operator_embeddings = operator_model_router.embeddings()
+    operator_memory = MemoryRepository(operator_sessions)
+    from mybot.plugins.control import PluginControlStore
+    from mybot.plugins.services import plugin_services
+    from mybot.plugins.tooling import PluginInstaller
+    from mybot.repositories.pairing import PairingRepository
+    from mybot.skills import SkillStore
+
+    plugin_control = PluginControlStore(Path(resolved_settings.plugin_data_dir))
+
+    plugin_broker.set_services(
+        plugin_services(
+            kv=operator_config,
+            llm=operator_model_router.for_purpose(ModelPurpose.CHAT),
+            memory=operator_memory,
+            embeddings=operator_embeddings,
+        )
+    )
     app.include_router(
         create_operator_router(
             OperatorContext(
@@ -126,10 +147,19 @@ def create_app(
                 model_client=operator_model_client,
                 model_attempts=operator_attempts,
                 profiles=ProfileRepository(operator_sessions, legacy_persona=operator_config),
-                memory=MemoryRepository(operator_sessions),
+                memory=operator_memory,
                 willingness=WillingnessAuditRepository(operator_sessions),
                 knowledge=KnowledgeRepository(operator_sessions),
                 embeddings=operator_embeddings,
+                skills=SkillStore(Path(resolved_settings.skills_dir)),
+                plugin_control=plugin_control,
+                plugin_installer=PluginInstaller(
+                    registry_path=Path(resolved_settings.plugin_registry_path),
+                    store=plugin_control,
+                    client=operator_model_client,
+                    max_bytes=resolved_settings.plugin_install_max_bytes,
+                ),
+                pairing=PairingRepository(operator_sessions),
                 sandbox=StreamPublisher(
                     backend=operator_backend,
                     stream=resolved_settings.ingest_stream,

@@ -15,7 +15,9 @@ function stubClient(routes: Record<string, unknown>): OperatorClient & {
 } {
   const sent: Array<{ method: string; path: string; body: unknown }> = [];
   const resolve = (path: string): unknown => {
-    const match = Object.entries(routes).find(([prefix]) => path.startsWith(prefix));
+    const match = Object.entries(routes)
+      .sort(([left], [right]) => right.length - left.length)
+      .find(([prefix]) => path.startsWith(prefix));
     if (!match) throw new Error(`no stub for ${path}`);
     return typeof match[1] === 'function' ? (match[1] as (p: string) => unknown)(path) : match[1];
   };
@@ -341,6 +343,7 @@ describe('PluginsPanel', () => {
     const client = stubClient({
       '/operator/plugins': {
         runners: 1,
+        services: [],
         plugins: [
           {
             id: 'example.dice',
@@ -349,10 +352,16 @@ describe('PluginsPanel', () => {
             tools: ['roll_dice'],
             event_hooks: ['message'],
             granted_capabilities: [],
+            tasks: [],
+            config_schema: { type: 'object', additionalProperties: false },
+            state: 'running',
           },
         ],
       },
       '/operator/config/approvals': { approved_ids: ['danger_tool'] },
+      '/operator/skills': { skills: [] },
+      '/operator/plugins/registry': { plugins: [] },
+      '/operator/pairing': { policies: [], requests: [] },
     });
 
     render(<PluginsPanel client={client} />);

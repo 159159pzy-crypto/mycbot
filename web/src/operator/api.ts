@@ -158,6 +158,46 @@ export type PluginView = {
   tools: string[];
   event_hooks: string[];
   granted_capabilities: string[];
+  tasks?: Array<{ id: string; interval_seconds: number }>;
+  config_schema?: Record<string, unknown>;
+  config?: Record<string, unknown>;
+  requires?: Record<string, string>;
+  state?: 'running' | 'disabled' | 'backoff' | 'circuit_open' | 'load_error' | 'stopped';
+  pid?: number | null;
+  restart_count?: number;
+  last_error?: string | null;
+  enabled?: boolean;
+};
+
+export type SkillView = {
+  name: string;
+  description: string;
+  trigger: string;
+  content: string;
+  enabled: boolean;
+};
+
+export type RegistryPluginView = {
+  name: string;
+  version: string;
+  source_url: string;
+  manifest_sha256: string;
+};
+
+export type PairingPolicyView = {
+  platform: 'qq' | 'telegram';
+  connection_id: string;
+  policy: 'open' | 'paired' | 'allowlist';
+  allowlist: string[];
+};
+
+export type PairingRequestView = {
+  id: string;
+  platform: string;
+  connection_id: string;
+  subject_identity_id: string;
+  code: string;
+  expires_at: string;
 };
 
 export type PersonaConfig = { override: string | null; default: string };

@@ -39,7 +39,7 @@ from mybot.contracts.messages import (
     TextSegment,
     VoiceSegment,
 )
-from mybot.contracts.plugins import PluginManifest
+from mybot.contracts.plugins import PluginManifest, PluginTaskSpec
 from mybot.contracts.profiles import (
     AgentProfile,
     PersonaVersion,
@@ -81,6 +81,7 @@ __all__ = [
     "Platform",
     "PlatformCapabilities",
     "PluginManifest",
+    "PluginTaskSpec",
     "ProfileMemoryPolicy",
     "ReferenceSegment",
     "RelationshipMemory",

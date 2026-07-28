@@ -78,7 +78,8 @@ def test_worker_gateway_and_maintenance_modes_get_real_services() -> None:
 def test_plugin_runner_mode_gets_a_real_service_when_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mybot.plugins.runner import PluginRunnerService
+    from mybot.plugins.control import PluginSource
+    from mybot.plugins.supervisor import PluginSupervisorService
 
     monkeypatch.setenv("MYBOT_PLUGIN_BROKER_URL", "http://api:8000")
     monkeypatch.setenv(
@@ -87,5 +88,7 @@ def test_plugin_runner_mode_gets_a_real_service_when_configured(
     )
     service = create_service(ProcessMode.PLUGIN_RUNNER, Settings())
 
-    assert isinstance(service, PluginRunnerService)
-    assert [plugin.manifest.id for plugin in service.plugins] == ["example.dice"]
+    assert isinstance(service, PluginSupervisorService)
+    assert service.store.sources(service.config_json) == (
+        PluginSource(entrypoint="mybot.plugins.examples.dice:PLUGIN"),
+    )
