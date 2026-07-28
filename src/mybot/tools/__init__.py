@@ -70,6 +70,15 @@ class ApprovalSource(Protocol):
     async def is_approved(self, tool_id: str) -> bool: ...
 
 
+class ApprovalRequestSource(Protocol):
+    async def request_approval(
+        self,
+        tool_id: str,
+        context: ToolContext,
+        arguments: Mapping[str, JsonValue],
+    ) -> str: ...
+
+
 @dataclass(slots=True)
 class ToolExecutor:
     """Enforces capability/approval policy and a per-tool timeout on execution."""
@@ -77,6 +86,7 @@ class ToolExecutor:
     registry: ToolCatalog
     timeout_seconds: float = 15.0
     approvals: ApprovalSource | None = None
+    approval_requests: ApprovalRequestSource | None = None
 
     async def execute(
         self,
@@ -94,10 +104,20 @@ class ToolExecutor:
                 f"missing required capabilities: {', '.join(sorted(missing))}",
             )
         if tool.spec.approval_required and not await self._approved(tool_id):
-            return _fail(
-                "approval_required",
-                "this tool requires operator approval; grant it in the operator console",
-            )
+            if self.approval_requests is None:
+                return _fail(
+                    "approval_required",
+                    "this tool requires operator approval",
+                )
+            status = await self._request_approval(tool_id, context, arguments)
+            if status != "APPROVED":
+                code = "approval_timeout" if status == "EXPIRED" else "approval_rejected"
+                message = (
+                    "operator approval timed out"
+                    if status == "EXPIRED"
+                    else "the operator rejected this tool call"
+                )
+                return _fail(code, message)
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 return await tool.run(context, arguments)
@@ -123,6 +143,23 @@ class ToolExecutor:
         except Exception:
             logger.exception("approval_lookup_failed", tool_id=tool_id)
             return False
+
+    async def _request_approval(
+        self,
+        tool_id: str,
+        context: ToolContext,
+        arguments: Mapping[str, JsonValue],
+    ) -> str:
+        assert self.approval_requests is not None
+        try:
+            return await self.approval_requests.request_approval(
+                tool_id, context, arguments
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("approval_request_failed", tool_id=tool_id)
+            return "REJECTED"
 
 
 def collect_citations(result: ToolResult) -> list[Citation]:

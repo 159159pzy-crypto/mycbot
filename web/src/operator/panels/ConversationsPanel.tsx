@@ -36,6 +36,7 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
   const [detail, setDetail] = useState<DetailState>({ kind: 'idle' });
   const [error, setError] = useState<string | null>(null);
   const [annotationNotice, setAnnotationNotice] = useState<string | null>(null);
+  const [feedbackNotes, setFeedbackNotes] = useState<Record<string, string>>({});
   const openSeq = useRef(0);
 
   const open = async (conversation: ConversationSummary) => {
@@ -113,18 +114,58 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
 
   const selectedId = detail.kind === 'idle' ? null : detail.conversation.id;
 
-  const saveAnnotation = async (conversationId: string, messageId: string) => {
+  const saveAnnotation = async (
+    conversationId: string,
+    messageId: string,
+    answer?: string,
+  ) => {
     setAnnotationNotice(null);
     try {
       await client.send(
         'POST',
         `/operator/conversations/${conversationId}/messages/${messageId}/annotation`,
-        { threshold: 0.92 },
+        { threshold: 0.92, answer },
       );
       setAnnotationNotice('已将这条 Bot 回复与上一条用户问题保存为会话标注。');
     } catch (cause) {
       setAnnotationNotice(`保存标注失败：${String(cause)}`);
     }
+  };
+
+  const saveFeedback = async (
+    messageId: string,
+    rating: 'POSITIVE' | 'NEGATIVE',
+  ) => {
+    const note = feedbackNotes[messageId] ?? '';
+    await client.send('PUT', `/operator/messages/${messageId}/feedback`, { rating, note });
+    if (detail.kind === 'ready') {
+      setDetail({
+        ...detail,
+        messages: detail.messages.map((item) =>
+          item.id === messageId ? { ...item, feedback: { rating, note } } : item,
+        ),
+      });
+    }
+  };
+
+  const saveRegression = async (message: MessageView, index: number) => {
+    if (detail.kind !== 'ready' || !message.id) return;
+    const previous = [...detail.messages.slice(0, index)]
+      .reverse()
+      .find((item) => item.direction === 'inbound' && item.text);
+    if (!previous) {
+      setAnnotationNotice('没有找到这条回复之前的用户问题。');
+      return;
+    }
+    await client.send('POST', '/operator/evaluations/cases', {
+      id: `feedback-${message.id}`,
+      name: `差评回归 ${message.id.slice(0, 8)}`,
+      question: previous.text,
+      history: [],
+      expected: { must_not_contain: [message.text || '[非文本]'] },
+      tags: ['feedback', 'negative'],
+    });
+    setAnnotationNotice('已把这条差评和上一条用户问题加入回归用例。');
   };
 
   return (
@@ -196,13 +237,22 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
                           <small>{outbound ? 'bot' : message.sender_identity_id}</small>
                           <div className="bubble">{message.text || '[非文本]'}</div>
                           {outbound && message.id && (
-                            <button
-                              className="annotation-save"
-                              type="button"
-                              onClick={() => void saveAnnotation(detail.conversation.id, message.id!)}
-                            >
-                              存为标注
-                            </button>
+                            <div className="feedback-tools">
+                              <div className="inline-actions">
+                                <button type="button" className="annotation-save" aria-pressed={message.feedback?.rating === 'POSITIVE'} onClick={() => void saveFeedback(message.id!, 'POSITIVE')}>好评</button>
+                                <button type="button" className="annotation-save" aria-pressed={message.feedback?.rating === 'NEGATIVE'} onClick={() => void saveFeedback(message.id!, 'NEGATIVE')}>差评</button>
+                              </div>
+                              <input
+                                aria-label="反馈备注或精修答案"
+                                placeholder="备注；也可填写精修后的答案"
+                                value={feedbackNotes[message.id] ?? message.feedback?.note ?? ''}
+                                onChange={(event) => setFeedbackNotes({ ...feedbackNotes, [message.id!]: event.target.value })}
+                              />
+                              <div className="inline-actions">
+                                <button className="annotation-save" type="button" onClick={() => void saveRegression(message, index)}>转回归用例</button>
+                                <button className="annotation-save" type="button" disabled={!(feedbackNotes[message.id] ?? message.feedback?.note ?? '').trim()} onClick={() => void saveAnnotation(detail.conversation.id, message.id!, (feedbackNotes[message.id!] ?? message.feedback?.note ?? '').trim())}>精修为标注</button>
+                              </div>
+                            </div>
                           )}
                         </div>
                       </div>

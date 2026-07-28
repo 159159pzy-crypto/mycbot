@@ -110,6 +110,12 @@ export function OverviewPanel({ client }: { client: OperatorClient }) {
   const maxOutcome = Math.max(...outcomes.map(([, count]) => count), 1);
   const queues = Object.entries(state.metrics.queues);
   const willingness = state.metrics.willingness ?? { allowed: 0, blocked: 0 };
+  const feedback = state.metrics.feedback ?? {
+    positive: 0,
+    negative: 0,
+    total: 0,
+    negative_rate: 0,
+  };
 
   return (
     <div className="overview-view view-enter">
@@ -117,6 +123,13 @@ export function OverviewPanel({ client }: { client: OperatorClient }) {
         <section className="card stat-tile">
           <small>Token 用量 · 14 天</small>
           <strong>{totalTokens.toLocaleString()}</strong>
+        </section>
+        <section className="card stat-tile">
+          <small>差评率 · 30 天</small>
+          <strong>
+            {(feedback.negative_rate * 100).toFixed(1)}
+            <span className="stat-unit">% · {feedback.negative}/{feedback.total}</span>
+          </strong>
         </section>
         <section className="card stat-tile">
           <small>对话轮次 · 14 天</small>

@@ -549,19 +549,21 @@ class KnowledgeRepository:
         threshold: float,
         embedding: Sequence[float],
         embedding_model: str,
+        answer: str | None = None,
     ) -> AnnotationReply | None:
         pair = await self.message_annotation_pair(conversation_id, message_id)
         if pair is None:
             return None
-        previous_question, answer = pair
+        previous_question, stored_answer = pair
         resolved_question = (question or previous_question).strip()
-        if not resolved_question:
+        resolved_answer = (answer or stored_answer).strip()
+        if not resolved_question or not resolved_answer:
             return None
         annotation = AnnotationReply(
             scope=KnowledgeScope.CONVERSATION,
             conversation_id=conversation_id,
             question=resolved_question,
-            answer=answer,
+            answer=resolved_answer,
             threshold=threshold,
             source_message_id=message_id,
         )

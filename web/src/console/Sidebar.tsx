@@ -40,6 +40,7 @@ const NAV_GROUPS: Array<{
       { id: 'plugins', icon: <PlusBoxIcon /> },
       { id: 'models', icon: <ModelIcon /> },
       { id: 'persona', icon: <PersonIcon /> },
+      { id: 'safety', icon: <LockIcon /> },
     ],
   },
 ];

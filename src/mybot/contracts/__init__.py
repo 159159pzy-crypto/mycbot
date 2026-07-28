@@ -50,6 +50,19 @@ from mybot.contracts.profiles import (
     WillingnessScore,
 )
 from mybot.contracts.replies import Citation, ReplyPlan, TypingProfile
+from mybot.contracts.safety import (
+    EvaluationAssertion,
+    EvaluationCase,
+    EvaluationExpected,
+    EvaluationHistoryItem,
+    EvaluationOutcome,
+    MessageFeedbackRating,
+    ModerationAction,
+    ModerationDecision,
+    ModerationPoint,
+    ModerationRequest,
+    ToolApprovalStatus,
+)
 from mybot.contracts.tools import ToolContext, ToolError, ToolResult, ToolRisk, ToolSpec
 
 __all__ = [
@@ -62,6 +75,11 @@ __all__ = [
     "ConversationKey",
     "CoreBlock",
     "CoreBlockLabel",
+    "EvaluationAssertion",
+    "EvaluationCase",
+    "EvaluationExpected",
+    "EvaluationHistoryItem",
+    "EvaluationOutcome",
     "FileSegment",
     "ImageSegment",
     "KnowledgeChunkLevel",
@@ -77,6 +95,11 @@ __all__ = [
     "MemoryPrivacy",
     "MemoryScope",
     "MessageEnvelope",
+    "MessageFeedbackRating",
+    "ModerationAction",
+    "ModerationDecision",
+    "ModerationPoint",
+    "ModerationRequest",
     "PersonaVersion",
     "Platform",
     "PlatformCapabilities",
@@ -89,6 +112,7 @@ __all__ = [
     "ReplyWillingnessPolicy",
     "StickerSegment",
     "TextSegment",
+    "ToolApprovalStatus",
     "ToolContext",
     "ToolError",
     "ToolResult",

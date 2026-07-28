@@ -24,6 +24,7 @@ x-app-environment: &app-environment
   MYBOT_SKILLS_PROMPT_MAX_CHARS: ${MYBOT_SKILLS_PROMPT_MAX_CHARS:-4000}
   MYBOT_PLUGIN_DATA_DIR: /app/plugins-data
   MYBOT_PLUGIN_REGISTRY_PATH: /app/registry.json
+  MYBOT_EVALUATION_CASES_DIR: /app/evals
 
 x-app-service: &app-service
   build:
@@ -48,6 +49,7 @@ x-app-service: &app-service
     - ./skills:/app/skills
     - ./plugins-data:/app/plugins-data
     - ./registry.json:/app/registry.json:ro
+    - ./evals:/app/evals
   depends_on:
     postgres:
       condition: service_healthy
@@ -156,6 +158,7 @@ services:
       MYBOT_LLM_API_KEY: ${MYBOT_LLM_API_KEY:-}
       MYBOT_LLM_BASE_URL: ${MYBOT_LLM_BASE_URL:-}
       MYBOT_LLM_MODEL: ${MYBOT_LLM_MODEL:-deepseek-chat}
+      MYBOT_EVALUATION_JUDGE_ENABLED: ${MYBOT_EVALUATION_JUDGE_ENABLED:-false}
       MYBOT_MODEL_API_KEYS: ${MYBOT_MODEL_API_KEYS:-}
       # An empty grants value falls back to the application default of {}.
       MYBOT_PLUGIN_CAPABILITY_GRANTS: ${MYBOT_PLUGIN_CAPABILITY_GRANTS:-}
@@ -232,6 +235,13 @@ services:
       MYBOT_FALLBACK_BUDGET_EXCEEDED: ${MYBOT_FALLBACK_BUDGET_EXCEEDED:-本会话今天的 token 预算已用完, 明天再继续聊吧。}
       MYBOT_FALLBACK_EMPTY_REPLY: ${MYBOT_FALLBACK_EMPTY_REPLY:-抱歉, 这次没能组织好回复, 请稍后再试。}
       MYBOT_FALLBACK_MODERATION: ${MYBOT_FALLBACK_MODERATION:-回复触发了内容策略, 已停止发送。}
+      MYBOT_MODERATION_ENABLED: ${MYBOT_MODERATION_ENABLED:-true}
+      MYBOT_MODERATION_API_BASE_URL: ${MYBOT_MODERATION_API_BASE_URL:-}
+      MYBOT_MODERATION_API_KEY: ${MYBOT_MODERATION_API_KEY:-}
+      MYBOT_MODERATION_API_MODEL: ${MYBOT_MODERATION_API_MODEL:-omni-moderation-latest}
+      MYBOT_MODERATION_TIMEOUT_SECONDS: ${MYBOT_MODERATION_TIMEOUT_SECONDS:-3}
+      MYBOT_TOOL_APPROVAL_TIMEOUT_SECONDS: ${MYBOT_TOOL_APPROVAL_TIMEOUT_SECONDS:-60}
+      MYBOT_TOOL_APPROVAL_POLL_SECONDS: ${MYBOT_TOOL_APPROVAL_POLL_SECONDS:-0.5}
       MYBOT_MEMORY_ENABLED: ${MYBOT_MEMORY_ENABLED:-true}
       MYBOT_MEMORY_MIN_CONFIDENCE: ${MYBOT_MEMORY_MIN_CONFIDENCE:-0.6}
       MYBOT_MEMORY_RETRIEVAL_LIMIT: ${MYBOT_MEMORY_RETRIEVAL_LIMIT:-5}

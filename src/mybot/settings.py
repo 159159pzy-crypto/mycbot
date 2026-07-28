@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     fallback_budget_exceeded: str = "本会话今天的 token 预算已用完, 明天再继续聊吧。"
     fallback_empty_reply: str = "抱歉, 这次没能组织好回复, 请稍后再试。"
     fallback_moderation: str = "回复触发了内容策略, 已停止发送。"
+    moderation_enabled: bool = True
+    moderation_api_base_url: str | None = None
+    moderation_api_key: SecretStr | None = None
+    moderation_api_model: str = "omni-moderation-latest"
+    moderation_timeout_seconds: float = Field(default=3.0, gt=0.0, le=30.0)
     embedding_base_url: str | None = None
     embedding_api_key: SecretStr | None = None
     embedding_model: str = "text-embedding-3-small"
@@ -135,6 +140,10 @@ class Settings(BaseSettings):
     operator_auth_max_failures: int = Field(default=10, ge=1, le=1_000)
     operator_auth_window_seconds: float = Field(default=60.0, ge=1.0, le=3_600.0)
     tool_approvals_cache_ttl_seconds: float = Field(default=10.0, ge=1.0, le=600.0)
+    tool_approval_timeout_seconds: float = Field(default=60.0, ge=5.0, le=3_600.0)
+    tool_approval_poll_seconds: float = Field(default=0.5, ge=0.1, le=5.0)
+    evaluation_cases_dir: str = "evals"
+    evaluation_judge_enabled: bool = False
     plugin_broker_url: str | None = None
     plugin_config: str | None = None
     plugin_capability_grants: str = "{}"
@@ -234,6 +243,8 @@ class Settings(BaseSettings):
         "llm_base_url",
         "embedding_api_key",
         "embedding_base_url",
+        "moderation_api_key",
+        "moderation_api_base_url",
         "plugin_broker_url",
         "plugin_config",
         "operator_token",

@@ -12,6 +12,8 @@ from mybot.contracts import (
     ChatKind,
     ConversationKey,
     MessageEnvelope,
+    ModerationAction,
+    ModerationDecision,
     PersonaVersion,
     Platform,
     PlatformCapabilities,
@@ -573,8 +575,63 @@ class FakeGuards:
 
 @dataclass
 class RejectingModeration:
-    async def allows(self, text: str) -> bool:
-        return "禁词" not in text
+    async def moderate(self, request, **_kwargs):  # type: ignore[no-untyped-def]
+        from mybot.contracts import ModerationDecision
+        from mybot.services.agent_worker import MODERATION_NOTICE
+
+        text = str(request.params.get("text", ""))
+        flagged = "禁词" in text
+        return ModerationDecision(
+            flagged=flagged,
+            preset_response=MODERATION_NOTICE if flagged else "",
+        )
+
+
+@dataclass
+class InboundModeration:
+    action: ModerationAction
+    preset_response: str
+
+    async def moderate(self, request, **_kwargs):  # type: ignore[no-untyped-def]
+        return ModerationDecision(
+            flagged=request.point.value == "inbound",
+            action=self.action,
+            preset_response=self.preset_response,
+        )
+
+
+@pytest.mark.asyncio
+async def test_inbound_direct_output_stops_before_persistence_and_agent() -> None:
+    backend = MemoryStreamBackend()
+    service, messages, engine = build_service(backend)
+    service.moderation = InboundModeration(
+        action=ModerationAction.DIRECT_OUTPUT,
+        preset_response="blocked inbound",
+    )
+
+    await service.handle_payload(InboundEvent(envelope=envelope()).model_dump_json())
+
+    assert service.conversations.calls == []  # type: ignore[attr-defined]
+    assert messages.inbound == []
+    assert engine.calls == []
+    outbound = await outbound_messages(backend)
+    assert outbound[0].reply_plan.text_segments == ("blocked inbound",)
+
+
+@pytest.mark.asyncio
+async def test_inbound_override_persists_and_runs_with_replacement_text() -> None:
+    backend = MemoryStreamBackend()
+    service, messages, engine = build_service(backend)
+    service.moderation = InboundModeration(
+        action=ModerationAction.OVERRIDDEN,
+        preset_response="safe replacement",
+    )
+    original = envelope()
+
+    await service.handle_payload(InboundEvent(envelope=original).model_dump_json())
+
+    assert engine.calls == [original.id]
+    assert messages.inbound[0].segments == (TextSegment(text="safe replacement"),)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ export type MessageView = {
   occurred_at: string | null;
   trace_id?: string | null;
   segments?: Array<Record<string, unknown>>;
+  feedback?: { rating: 'POSITIVE' | 'NEGATIVE'; note: string } | null;
 };
 
 export type TraceSpanView = {
@@ -112,6 +113,88 @@ export type MetricsView = {
   queues: Record<string, number>;
   willingness: { allowed: number; blocked: number };
   annotations?: { hit: number; miss: number; error: number; total: number; hit_rate: number };
+  feedback?: { positive: number; negative: number; total: number; negative_rate: number };
+};
+
+export type ModerationPolicyView = {
+  enabled: boolean;
+  backends: Array<'local' | 'api' | 'plugin'>;
+  fail_mode: 'open' | 'closed';
+  keywords: string[];
+  inbound: { enabled: boolean; action: 'direct_output' | 'overridden'; preset_response: string };
+  outbound: { enabled: boolean; action: 'direct_output' | 'overridden'; preset_response: string };
+};
+
+export type ModerationAuditView = {
+  id: string;
+  point: 'inbound' | 'outbound';
+  backend: string;
+  flagged: boolean;
+  reason: string;
+  content_preview: string;
+  duration_ms: number;
+  created_at: string;
+};
+
+export type ApprovalRequestView = {
+  id: string;
+  tool_id: string;
+  conversation_stable_key: string;
+  actor_identity_id: string;
+  arguments: Record<string, unknown>;
+  requested_at: string;
+  expires_at: string;
+};
+
+export type EvaluationCaseView = {
+  id: string;
+  name: string;
+  question: string;
+  expected: Record<string, unknown>;
+  tags: string[];
+};
+
+export type EvaluationRunView = {
+  id: string;
+  name: string;
+  status: string;
+  total: number;
+  completed: number;
+  passed: number;
+  failed: number;
+  profile_id?: string | null;
+  persona_version_id?: string | null;
+  model_channel?: string | null;
+  judge_enabled?: boolean;
+  created_at: string;
+};
+
+export type EvaluationAssertionView = {
+  kind: string;
+  expected: unknown;
+  actual: unknown;
+  passed: boolean;
+};
+
+export type EvaluationResultView = {
+  id: string;
+  case_id: string;
+  case_snapshot: EvaluationCaseView;
+  status: string;
+  response?: string | null;
+  passed?: boolean | null;
+  assertions: EvaluationAssertionView[];
+  tool_calls: string[];
+  citations: string[];
+  judge_score?: number | null;
+  judge_reason?: string | null;
+  model_channel?: string | null;
+  model?: string | null;
+};
+
+export type EvaluationRunDetailView = {
+  run: EvaluationRunView;
+  results: EvaluationResultView[];
 };
 
 export type KnowledgeDocumentView = {

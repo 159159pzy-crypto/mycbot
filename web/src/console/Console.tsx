@@ -10,6 +10,7 @@ import { OverviewPanel } from '../operator/panels/OverviewPanel';
 import { PersonaPanel } from '../operator/panels/PersonaPanel';
 import { PluginsPanel } from '../operator/panels/PluginsPanel';
 import { SandboxPanel } from '../operator/panels/SandboxPanel';
+import { SafetyPanel } from '../operator/panels/SafetyPanel';
 import { LockScreen } from './LockScreen';
 import { readinessView } from './readiness';
 import { Sidebar } from './Sidebar';
@@ -87,6 +88,7 @@ export function Console({ health }: { health: HealthState }) {
           {view === 'plugins' && <PluginsPanel client={client} />}
           {view === 'models' && <ModelsPanel client={client} />}
           {view === 'persona' && <PersonaPanel client={client} />}
+          {view === 'safety' && <SafetyPanel client={client} />}
         </main>
       </div>
     </div>

@@ -513,14 +513,16 @@ types projected to readable text so strict older SDK models do not fail.
 The web shell is now an authenticated operations console. Set
 `MYBOT_OPERATOR_TOKEN` to a long random value and open the web UI: below the
 readiness deck, the console unlocks with that token (held in memory only —
-never in browser storage) and exposes five panels. Overview shows a 14-day
+never in browser storage). Overview shows a 14-day
 token-usage sparkline, turn outcomes, average/p95 turn latency, and live
 queue and dead-letter depths. Conversations lists chats by latest activity
 and opens any of them into full message and turn detail, including per-turn
 tool invocations. Memories filters by scope and revocation state and revokes
 any item with one click. Plugins mirrors the broker view and edits the
 standing tool approvals. Persona edits the agent's system prompt; workers
-pick the change up on their next turn without a restart.
+pick the change up on their next turn without a restart. Safety & Evaluation
+edits moderation policy, resolves pending per-call approvals, runs shadow
+regression suites, and shows assertion-level diffs.
 
 The auth model is deliberately small: every `/operator/*` request requires
 `Authorization: Bearer $MYBOT_OPERATOR_TOKEN`; with the token unset the
@@ -531,12 +533,13 @@ internal networks as documented since Milestone 1. Every mutation — persona
 change, approvals change, memory revocation — is recorded in the
 `operator_audit` table and visible via `GET /operator/audit`.
 
-Approval-required tools use standing grants rather than interactive
-prompts: a tool whose spec sets `approval_required` is refused by the
-executor until its id appears in the console's approved list (stored in
-`system_kv` under `tools.approved_ids`); workers refresh that list on a
-short TTL, so an approval takes effect within seconds and revoking it
-blocks the tool again.
+Approval-required tools first honor standing grants stored in `system_kv`
+under `tools.approved_ids`. Without a standing grant, each invocation is
+persisted in the Safety & Evaluation queue and the worker pauses until an
+operator approves or rejects that one call. `MYBOT_TOOL_APPROVAL_TIMEOUT_SECONDS`
+defaults to 60 seconds; timeout is an audited automatic rejection and the
+agent receives the normal tool-error result so its existing fallback path can
+continue. `MYBOT_TOOL_APPROVAL_POLL_SECONDS` controls database polling.
 
 ## Abuse guards and moderation
 
@@ -558,10 +561,38 @@ refused deterministically without reaching the model.
 | `MYBOT_INPUT_MAX_CHARS` | 4000 | Size cap on agent-turn input |
 | `MYBOT_LOOP_GUARD_ENABLED` | true | Ignore bot senders and echoed replies |
 
-Ahead of delivery, every reply passes a `ModerationHook`. The default
-accepts everything; deployments needing a moderation backend implement
-the one-method protocol, and rejected text is replaced with a
-deterministic notice and logged.
+Both inbound user content and outbound reply plans pass the single-method
+`ModerationHook` contract. The policy in `system_kv` under
+`moderation.policy` selects an editable Aho-Corasick keyword backend, an
+optional OpenAI-compatible `/moderations` backend, and/or a plugin tool whose
+capabilities include `moderation`. Every backend decision is audited. Backend
+errors follow the policy's explicit `open` or `closed` fail mode.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `MYBOT_MODERATION_ENABLED` | true | Global worker switch for inbound/outbound moderation |
+| `MYBOT_MODERATION_API_BASE_URL` | empty | Optional OpenAI-compatible API root ending before `/moderations` |
+| `MYBOT_MODERATION_API_KEY` | empty | Bearer token for the moderation endpoint; never stored in the database |
+| `MYBOT_MODERATION_API_MODEL` | `omni-moderation-latest` | Remote moderation model name |
+| `MYBOT_MODERATION_TIMEOUT_SECONDS` | 3 | Per-backend timeout before fail-mode handling |
+
+## Regression evaluation and feedback
+
+Evaluation cases are JSON files under `MYBOT_EVALUATION_CASES_DIR` (default
+`evals`). Each case carries question/history plus deterministic
+`must_contain`, `must_not_contain`, `must_call_tool`, and `must_cite`
+assertions. `mybot eval --offline --cases evals` runs only cases with an
+`offline_response`, so CI does not spend model tokens. Console runs use an
+ephemeral sandbox conversation, traverse the real agent/tool/moderation
+pipeline, and intercept the reply before the outbound platform stream.
+
+Run and result records retain the persona version, selected profile tier,
+actual model channel/model, tool calls, citations, assertions, and optional
+judge score. LLM judging requires both `MYBOT_EVALUATION_JUDGE_ENABLED=true`
+and the per-run checkbox. Bot messages accept positive/negative feedback and
+notes; negative replies can be converted into repo regression cases or
+refined into annotation replies, and the 30-day negative rate appears in
+Overview metrics.
 
 ## Proactive check-ins
 

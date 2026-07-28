@@ -61,10 +61,12 @@ class OperatorViews:
                     await session.execute(
                         sa.text(
                             """
-                        SELECT id, direction, sender_identity_id, segments, occurred_at, trace_id
-                        FROM messages
-                        WHERE conversation_id = :conversation_id
-                        ORDER BY occurred_at ASC
+                        SELECT m.id, m.direction, m.sender_identity_id, m.segments,
+                               m.occurred_at, m.trace_id, f.rating, f.note
+                        FROM messages AS m
+                        LEFT JOIN message_feedback AS f ON f.message_id = m.id
+                        WHERE m.conversation_id = :conversation_id
+                        ORDER BY m.occurred_at ASC
                         LIMIT :limit
                         """
                         ),
@@ -83,6 +85,14 @@ class OperatorViews:
                     "occurred_at": _iso(row["occurred_at"]),
                     "trace_id": row["trace_id"],
                     "segments": cast(JsonValue, row["segments"]),
+                    "feedback": (
+                        {
+                            "rating": row["rating"],
+                            "note": row["note"] or "",
+                        }
+                        if row["rating"] is not None
+                        else None
+                    ),
                 }
                 for row in rows
             ]

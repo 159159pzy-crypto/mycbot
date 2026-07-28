@@ -8,6 +8,7 @@ export const VIEWS = {
   plugins: { title: '插件', subtitle: '插件注册状态与工具审批' },
   models: { title: '模型', subtitle: '模型路由、连接状态与近 30 天用量' },
   persona: { title: '档位与人设', subtitle: '会话策略、人格版本、关系与群聊参与度' },
+  safety: { title: '安全与评测', subtitle: '双向审核、逐次工具审批与回归防线' },
 } as const;
 
 export type ViewId = keyof typeof VIEWS;

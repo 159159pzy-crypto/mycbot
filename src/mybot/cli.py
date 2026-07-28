@@ -47,6 +47,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             created = scaffold_plugin(parsed_plugin.name, Path(parsed_plugin.root))
             print(created)
             return
+    if argv and argv[0] == "eval":
+        eval_parser = argparse.ArgumentParser(prog="mybot eval")
+        eval_parser.add_argument("--offline", action="store_true", required=True)
+        eval_parser.add_argument("--cases", default="evals")
+        parsed_eval = eval_parser.parse_args(argv[1:])
+        from mybot.evaluation import EvaluationCaseStore, run_offline_cases
+
+        passed, failed = run_offline_cases(EvaluationCaseStore(Path(parsed_eval.cases)))
+        print(f"offline evaluation: {passed} passed, {failed} failed")
+        if failed:
+            raise SystemExit(1)
+        return
     parser = argparse.ArgumentParser(prog="mybot")
     parser.add_argument("mode", choices=[mode.value for mode in ProcessMode])
     parsed = parser.parse_args(argv)

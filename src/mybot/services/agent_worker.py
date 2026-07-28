@@ -20,6 +20,10 @@ from mybot.contracts import (
     ChatKind,
     ConversationKey,
     MessageEnvelope,
+    ModerationAction,
+    ModerationDecision,
+    ModerationPoint,
+    ModerationRequest,
     Platform,
     PlatformCapabilities,
     ReplyPlan,
@@ -178,7 +182,14 @@ class GuardVerdictLike(Protocol):
 
 
 class ModerationHook(Protocol):
-    async def allows(self, text: str) -> bool: ...
+    async def moderate(
+        self,
+        request: ModerationRequest,
+        *,
+        conversation_stable_key: str | None = None,
+        message_id: UUID | None = None,
+        trace_id: str | None = None,
+    ) -> ModerationDecision: ...
 
 
 class AnnotationEngine(Protocol):
@@ -203,6 +214,18 @@ class TraceSink(Protocol):
         message_id: UUID | None = None,
         attributes: Mapping[str, JsonValue] | None = None,
     ) -> UUID: ...
+
+
+class EvaluationSink(Protocol):
+    async def complete_shadow(
+        self,
+        *,
+        result_id: UUID,
+        conversation_id: UUID,
+        inbound_message_id: UUID,
+        response: str,
+        citations: tuple[str, ...],
+    ) -> None: ...
 
 
 class AccessDecisionLike(Protocol):
@@ -246,6 +269,7 @@ class AgentWorkerService:
     moderation_notice: str = MODERATION_NOTICE
     traces: TraceSink | None = None
     access: InboundAccess | None = None
+    evaluations: EvaluationSink | None = None
     _conversation_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
 
     async def run(self, mode: ProcessMode, stop_event: asyncio.Event) -> None:
@@ -286,6 +310,17 @@ class AgentWorkerService:
                     reason=access.reason,
                 )
                 return
+        inbound_decision = await self._moderate_inbound(envelope, key)
+        if inbound_decision is not None:
+            if inbound_decision.action is ModerationAction.DIRECT_OUTPUT:
+                response = inbound_decision.preset_response or self.moderation_notice
+                await self._publish_access_reply(envelope, response)
+                return
+            envelope = _override_envelope_text(
+                envelope,
+                inbound_decision.preset_response or self.moderation_notice,
+            )
+            event = event.model_copy(update={"envelope": envelope})
         conversation = await self.conversations.get_or_create(
             key, platform=envelope.platform, ephemeral=envelope.ephemeral
         )
@@ -453,6 +488,23 @@ class AgentWorkerService:
                 )
         assert plan is not None
         plan = await self._moderated(plan, capabilities, envelope, conversation.id)
+        evaluation_result_id = _evaluation_result_id(envelope)
+        if evaluation_result_id is not None and self.evaluations is not None:
+            await self.evaluations.complete_shadow(
+                result_id=evaluation_result_id,
+                conversation_id=conversation.id,
+                inbound_message_id=stored.id,
+                response="\n\n".join(plan.text_segments),
+                citations=tuple(citation.uri for citation in plan.citations),
+            )
+            await self._trace(
+                envelope,
+                conversation.id,
+                "evaluation.shadow",
+                message_id=stored.id,
+                attributes={"result_id": str(evaluation_result_id)},
+            )
+            return
         outbound_id = await self.messages.record_outbound(
             conversation.id, plan, trace_id=envelope.trace_id
         )
@@ -646,7 +698,21 @@ class AgentWorkerService:
             return plan
         started = monotonic()
         try:
-            approved = await self.moderation.allows("\n\n".join(plan.text_segments))
+            decision = await self.moderation.moderate(
+                ModerationRequest.model_validate(
+                    {
+                        "point": ModerationPoint.OUTBOUND,
+                        "params": {"text": "\n\n".join(plan.text_segments)},
+                    }
+                ),
+                conversation_stable_key=ConversationKey(
+                    connection_id=envelope.connection_id,
+                    chat_kind=envelope.chat_kind,
+                    chat_id=envelope.chat_id,
+                    thread_id=envelope.thread_id,
+                ).stable_key,
+                trace_id=envelope.trace_id,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -660,13 +726,13 @@ class AgentWorkerService:
                 attributes={"error_code": "moderation_hook_failed"},
             )
             return plan
-        if approved:
+        if not decision.flagged:
             await self._trace(
                 envelope,
                 conversation_id,
                 "moderation.outbound",
                 duration_ms=int((monotonic() - started) * 1_000),
-                attributes={"approved": True},
+                attributes={"approved": True, "backend": decision.backend},
             )
             return plan
         from mybot.contracts import TypingProfile
@@ -678,12 +744,54 @@ class AgentWorkerService:
             "moderation.outbound",
             status="error",
             duration_ms=int((monotonic() - started) * 1_000),
-            attributes={"approved": False},
+            attributes={
+                "approved": False,
+                "backend": decision.backend,
+                "action": decision.action.value,
+            },
         )
         return ReplyPlan(
-            text_segments=(self.moderation_notice,),
+            text_segments=(decision.preset_response or self.moderation_notice,),
             typing=TypingProfile(enabled=capabilities.typing),
         )
+
+    async def _moderate_inbound(
+        self, envelope: MessageEnvelope, key: ConversationKey
+    ) -> ModerationDecision | None:
+        if self.moderation is None:
+            return None
+        from mybot.engine.prompt import envelope_text
+
+        started = monotonic()
+        try:
+            decision = await self.moderation.moderate(
+                ModerationRequest.model_validate(
+                    {
+                        "point": ModerationPoint.INBOUND,
+                        "params": {
+                            "text": envelope_text(envelope),
+                            "sender_identity_id": envelope.sender_identity_id,
+                            "platform": envelope.platform.value,
+                        },
+                    }
+                ),
+                conversation_stable_key=key.stable_key,
+                trace_id=envelope.trace_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("inbound_moderation_hook_failed")
+            return None
+        if not decision.flagged:
+            return None
+        logger.warning(
+            "inbound_message_flagged",
+            backend=decision.backend,
+            action=decision.action.value,
+            duration_ms=int((monotonic() - started) * 1_000),
+        )
+        return decision
 
     async def _post_event(self, envelope: MessageEnvelope, decision: TurnDecision) -> None:
         """Read-only turn notification for plugin event hooks; never blocks a reply."""
@@ -775,6 +883,28 @@ def _envelope_dedupe_key(payload: str) -> str:
     return InboundEvent.model_validate_json(payload).envelope.id
 
 
+def _override_envelope_text(envelope: MessageEnvelope, text: str) -> MessageEnvelope:
+    from mybot.contracts import TextSegment
+
+    remaining = tuple(segment for segment in envelope.segments if segment.type != "text")
+    return envelope.model_copy(update={"segments": (TextSegment(text=text), *remaining)})
+
+
+def _evaluation_result_id(envelope: MessageEnvelope) -> UUID | None:
+    from collections.abc import Mapping
+
+    raw = envelope.raw_ref
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get("evaluation_result_id")
+    if not isinstance(value, str):
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
 def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     """Build the production worker from settings-backed Redis and PostgreSQL."""
 
@@ -810,7 +940,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.security.pairing import PairingGate
     from mybot.skills import SkillStore
     from mybot.tools import Tool, ToolExecutor, ToolRegistry
-    from mybot.tools.approvals import SystemKvApprovals
+    from mybot.tools.approvals import DatabaseToolApprovals, SystemKvApprovals
     from mybot.tools.fetch import UrlFetchTool
     from mybot.tools.knowledge import KnowledgeSearchTool
     from mybot.tools.memory import MemoryAppendTool, MemoryReplaceTool
@@ -835,6 +965,42 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         claim_min_idle_ms=settings.stream_claim_min_idle_ms,
     )
     config = SystemKvRepository(sessions)
+    moderation = None
+    if settings.moderation_enabled:
+        from mybot.repositories.safety import ModerationAuditRepository
+        from mybot.security.moderation import (
+            LocalKeywordModeration,
+            ModerationBackend,
+            ModerationService,
+            OpenAIModerationBackend,
+            PluginModerationBackend,
+        )
+
+        moderation_backends: dict[str, ModerationBackend] = {
+            "local": LocalKeywordModeration()
+        }
+        if settings.moderation_api_base_url is not None:
+            moderation_backends["api"] = OpenAIModerationBackend(
+                client=httpx.AsyncClient(timeout=settings.moderation_timeout_seconds),
+                base_url=settings.moderation_api_base_url,
+                api_key=(
+                    settings.moderation_api_key.get_secret_value()
+                    if settings.moderation_api_key is not None
+                    else None
+                ),
+                model=settings.moderation_api_model,
+            )
+        if settings.plugin_broker_url is not None:
+            moderation_backends["plugin"] = PluginModerationBackend(
+                client=httpx.AsyncClient(timeout=settings.moderation_timeout_seconds),
+                broker_url=settings.plugin_broker_url,
+            )
+        moderation = ModerationService(
+            policies=config,
+            backends=moderation_backends,
+            audit=ModerationAuditRepository(sessions),
+            timeout_seconds=settings.moderation_timeout_seconds,
+        )
     profiles = ProfileRepository(sessions, legacy_persona=config)
     def secret_lookup(name: str) -> str | None:
         return settings.model_secret(name)
@@ -876,6 +1042,11 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     memory: MemoryService | None = None
     core_memory = CoreBlockRepository(sessions)
     knowledge = KnowledgeRepository(sessions)
+    from mybot.evaluation import ShadowEvaluationSink
+    from mybot.repositories.safety import EvaluationRepository, ToolApprovalRepository
+
+    approval_repository = ToolApprovalRepository(sessions)
+    evaluation_repository = EvaluationRepository(sessions)
     if settings.memory_enabled:
         memory = MemoryService(
             embeddings=model_router.embeddings(),
@@ -974,6 +1145,11 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
                 config=config,
                 ttl_seconds=settings.tool_approvals_cache_ttl_seconds,
             ),
+            approval_requests=DatabaseToolApprovals(
+                repository=approval_repository,
+                timeout_seconds=settings.tool_approval_timeout_seconds,
+                poll_seconds=settings.tool_approval_poll_seconds,
+            ),
         ),
         granted_capabilities=settings.granted_capabilities(),
         max_tool_calls=settings.tool_max_calls_per_turn,
@@ -1033,6 +1209,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             loop_guard_enabled=settings.loop_guard_enabled,
         ),
         moderation_notice=settings.fallback_moderation,
+        moderation=moderation,
         annotations=(
             AnnotationMatcher(
                 store=knowledge,
@@ -1044,4 +1221,8 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         ),
         traces=traces,
         access=PairingGate(PairingRepository(sessions)),
+        evaluations=ShadowEvaluationSink(
+            repository=evaluation_repository,
+            judge=model_router.for_purpose(ModelPurpose.CHAT),
+        ),
     )

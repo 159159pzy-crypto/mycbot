@@ -1,11 +1,14 @@
 """Standing tool approvals sourced from operator config in system_kv."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Protocol
 
 from pydantic import JsonValue
+
+from mybot.contracts import ToolContext
+from mybot.repositories.safety import ToolApprovalRepository
 
 APPROVALS_KEY = "tools.approved_ids"
 
@@ -36,3 +39,41 @@ class SystemKvApprovals:
         if isinstance(value, list):
             return frozenset(str(item) for item in value)  # pyright: ignore[reportUnknownArgumentType]
         return frozenset()
+
+
+@dataclass(slots=True)
+class DatabaseToolApprovals:
+    """Persist one invocation and wait for an operator decision."""
+
+    repository: ToolApprovalRepository
+    timeout_seconds: float = 60.0
+    poll_seconds: float = 0.5
+
+    async def request_approval(
+        self,
+        tool_id: str,
+        context: ToolContext,
+        arguments: Mapping[str, JsonValue],
+    ) -> str:
+        await self.repository.request(
+            invocation_id=context.invocation_id,
+            tool_id=tool_id,
+            conversation_stable_key=context.conversation.stable_key,
+            actor_identity_id=context.actor_identity_id,
+            correlation_id=context.correlation_id,
+            arguments=arguments,
+            timeout_seconds=self.timeout_seconds,
+        )
+        decision = await self.repository.wait(
+            context.invocation_id,
+            timeout_seconds=self.timeout_seconds,
+            poll_seconds=self.poll_seconds,
+        )
+        return decision.status
+
+
+__all__ = [
+    "APPROVALS_KEY",
+    "DatabaseToolApprovals",
+    "SystemKvApprovals",
+]

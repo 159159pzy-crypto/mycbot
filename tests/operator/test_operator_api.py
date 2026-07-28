@@ -20,6 +20,9 @@ from mybot.contracts import (
     MemoryPrivacy,
     MemoryScope,
     MessageEnvelope,
+    ModerationDecision,
+    ModerationPoint,
+    ModerationRequest,
     Platform,
     ReplyPlan,
     TextSegment,
@@ -33,6 +36,7 @@ from mybot.repositories.conversations import ConversationRepository
 from mybot.repositories.llm_calls import LlmCallLogRepository
 from mybot.repositories.memory import MemoryRepository
 from mybot.repositories.messages import MessageRepository
+from mybot.repositories.safety import ModerationAuditRepository, ToolApprovalRepository
 from mybot.repositories.tool_invocations import (
     ToolInvocationRecord,
     ToolInvocationRepository,
@@ -82,7 +86,9 @@ async def client(migrated: str) -> AsyncIterator[httpx.AsyncClient]:
     async with engine.begin() as connection:
         await connection.execute(
             sa.text(
-                "TRUNCATE operator_audit, tool_invocations, turns, memory_items, "
+                "TRUNCATE moderation_audit, tool_approval_request, evaluation_result, "
+                "evaluation_run, message_feedback, operator_audit, tool_invocations, "
+                "turns, memory_items, "
                 "agent_profiles, messages, conversations, system_kv CASCADE"
             )
         )
@@ -278,6 +284,123 @@ async def test_persona_and_approvals_round_trip_with_audit(
         for entry in (await client.get("/operator/audit", headers=AUTH)).json()["entries"]
     }
     assert {"persona.update", "approvals.update"} <= actions
+
+
+@pytest.mark.asyncio
+async def test_m7_policy_per_call_approval_and_feedback(
+    client: httpx.AsyncClient, migrated: str
+) -> None:
+    saved_policy = (
+        await client.put(
+            "/operator/safety/moderation-policy",
+            headers=AUTH,
+            json={
+                "enabled": True,
+                "backends": ["local"],
+                "fail_mode": "closed",
+                "keywords": ["blocked-term"],
+                "inbound": {
+                    "enabled": True,
+                    "action": "direct_output",
+                    "preset_response": "blocked inbound",
+                },
+                "outbound": {
+                    "enabled": True,
+                    "action": "overridden",
+                    "preset_response": "safe outbound",
+                },
+            },
+        )
+    ).json()["policy"]
+    assert saved_policy["fail_mode"] == "closed"
+    assert saved_policy["outbound"]["action"] == "overridden"
+    loaded_policy = (
+        await client.get("/operator/safety/moderation-policy", headers=AUTH)
+    ).json()["policy"]
+    assert loaded_policy == saved_policy
+
+    engine = create_async_engine(migrated)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    await ModerationAuditRepository(sessions).record(
+        ModerationRequest(point=ModerationPoint.INBOUND, params={"text": "hello"}),
+        ModerationDecision(backend="local", reason="clear"),
+        content_sha256="0" * 64,
+        content_preview="hello",
+        duration_ms=1,
+    )
+    moderation_entries = (
+        await client.get("/operator/safety/moderation-audit", headers=AUTH)
+    ).json()["entries"]
+    assert moderation_entries[0]["backend"] == "local"
+    assert isinstance(moderation_entries[0]["id"], str)
+    approvals = ToolApprovalRepository(sessions)
+    approval_id = uuid4()
+    await approvals.request(
+        invocation_id=approval_id,
+        tool_id="memory.append",
+        conversation_stable_key="v1:telegram-main:DIRECT:777:0",
+        actor_identity_id="telegram:777",
+        correlation_id="message-1",
+        arguments={"content": "likes coffee"},
+        timeout_seconds=30,
+    )
+    pending = (
+        await client.get("/operator/safety/approvals", headers=AUTH)
+    ).json()["requests"]
+    assert pending[0]["id"] == str(approval_id)
+    decision = await client.post(
+        f"/operator/safety/approvals/{approval_id}",
+        headers=AUTH,
+        json={"approved": True, "note": "one call"},
+    )
+    assert decision.status_code == 200
+    assert (await approvals.status(approval_id)).status == "APPROVED"
+
+    conversation_id, _ = await _seed(migrated)
+    messages = (
+        await client.get(
+            f"/operator/conversations/{conversation_id}/messages", headers=AUTH
+        )
+    ).json()["messages"]
+    outbound_id = next(
+        item["id"] for item in messages if item["direction"] == "outbound"
+    )
+    feedback = await client.put(
+        f"/operator/messages/{outbound_id}/feedback",
+        headers=AUTH,
+        json={"rating": "NEGATIVE", "note": "too verbose"},
+    )
+    assert feedback.status_code == 200
+    refreshed = (
+        await client.get(
+            f"/operator/conversations/{conversation_id}/messages", headers=AUTH
+        )
+    ).json()["messages"]
+    outbound = next(item for item in refreshed if item["direction"] == "outbound")
+    assert outbound["feedback"] == {"rating": "NEGATIVE", "note": "too verbose"}
+    metrics = (await client.get("/operator/metrics", headers=AUTH)).json()["feedback"]
+    assert metrics["negative_rate"] == 1.0
+
+    cases = (await client.get("/operator/evaluations/cases", headers=AUTH)).json()["cases"]
+    assert cases
+    run_response = await client.post(
+        "/operator/evaluations/runs",
+        headers=AUTH,
+        json={
+            "name": "M7 smoke",
+            "case_ids": [cases[0]["id"]],
+            "judge_enabled": True,
+        },
+    )
+    assert run_response.status_code == 200
+    run_id = run_response.json()["run_id"]
+    detail = (
+        await client.get(f"/operator/evaluations/runs/{run_id}", headers=AUTH)
+    ).json()
+    assert detail["run"]["judge_enabled"] is False
+    assert detail["results"][0]["status"] == "RUNNING"
+    assert detail["results"][0]["conversation_id"] is not None
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

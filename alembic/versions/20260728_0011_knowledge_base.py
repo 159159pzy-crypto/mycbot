@@ -214,7 +214,10 @@ def upgrade() -> None:
             server_default=sa.text("CURRENT_TIMESTAMP"),
             nullable=False,
         ),
-        sa.CheckConstraint("outcome IN ('HIT', 'MISS', 'ERROR')", name="ck_annotation_audit_outcome"),
+        sa.CheckConstraint(
+            "outcome IN ('HIT', 'MISS', 'ERROR')",
+            name="ck_annotation_audit_outcome",
+        ),
     )
     op.create_index(
         "ix_annotation_match_audit_created", "annotation_match_audit", ["created_at"]
