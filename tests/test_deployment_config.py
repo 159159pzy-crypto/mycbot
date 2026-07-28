@@ -77,7 +77,10 @@ def test_plugin_runner_has_only_internal_control_plane_access() -> None:
     assert "MYBOT_REDIS_URL" not in plugin
     assert "MYBOT_PLUGIN_BROKER_URL:" in plugin
     assert "MYBOT_PLUGIN_CONFIG:" in plugin
-    assert "volumes:" not in plugin
+    assert "volumes:" in plugin
+    assert "- ./plugins-data:/app/plugins-data" in plugin
+    assert "/var/run/docker.sock" not in plugin
+    assert "/app/.env" not in plugin
     assert "ports:" not in plugin
     assert "extra_hosts:" not in plugin
     assert "- backend" not in plugin

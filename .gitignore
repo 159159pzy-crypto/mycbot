@@ -45,6 +45,9 @@ Thumbs.db
 *.pid
 *.tmp
 tmp/
+skills/.mybot-skills.json
+plugins-data/*
+!plugins-data/.gitkeep
 
 # Local feature worktrees
 .worktrees/

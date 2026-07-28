@@ -6,7 +6,7 @@ import pytest
 
 from mybot.api import create_app
 from mybot.infrastructure.health import ReadinessService
-from mybot.plugins.broker import PluginBroker
+from mybot.plugins.broker import PluginBroker, PluginService
 from mybot.settings import Settings
 
 
@@ -313,3 +313,87 @@ async def test_reregistration_replaces_a_restarted_runners_tools(
     tools = (await client.get("/plugin-broker/tools")).json()["tools"]
 
     assert [tool["spec"]["id"] for tool in tools] == ["flip_coin"]
+
+
+@pytest.mark.asyncio
+async def test_manifest_service_requirements_are_negotiated_authorized_and_quoted() -> None:
+    async def handler(plugin_id: str, arguments: dict[str, object]) -> dict[str, object]:
+        return {"plugin_id": plugin_id, "value": arguments["value"]}
+
+    broker = PluginBroker(
+        grants={"example.dice": ("kv.store",)},
+        services=(
+            PluginService(
+                name="kv.store",
+                version=1,
+                capability="kv.store",
+                handler=handler,
+            ),
+        ),
+        service_quota_per_minute=1,
+    )
+    manifest = manifest_payload(requested=["kv.store"])
+    manifest["requires"] = {"kv.store": "1"}
+    broker.register("runner-1", [manifest])
+
+    assert broker.service_catalog() == [
+        {"name": "kv.store", "version": 1, "capability": "kv.store"}
+    ]
+    result = await broker.invoke_service(
+        runner_id="runner-1",
+        plugin_id="example.dice",
+        service="kv.store",
+        version="1",
+        arguments={"value": "ok"},
+    )
+    assert result == {"plugin_id": "example.dice", "value": "ok"}
+    with pytest.raises(Exception, match="quota"):
+        await broker.invoke_service(
+            runner_id="runner-1",
+            plugin_id="example.dice",
+            service="kv.store",
+            version="1",
+            arguments={"value": "again"},
+        )
+    assert [entry.reason for entry in broker.audit_log][-2:] == [
+        "service_invoked",
+        "service_quota_exceeded",
+    ]
+
+    unsupported = manifest_payload(plugin_id="example.unsupported")
+    unsupported["requires"] = {"memory.search": "2"}
+    with pytest.raises(Exception, match=r"memory\.search"):
+        broker.register("runner-2", [unsupported])
+    assert broker.health()["load_errors"]
+
+
+@pytest.mark.asyncio
+async def test_config_and_tasks_are_validated_and_delivered_only_to_target_runner() -> None:
+    broker = PluginBroker(grants={})
+    target = manifest_payload()
+    target["config_schema"] = {
+        "type": "object",
+        "properties": {"endpoint": {"type": "string"}},
+        "required": ["endpoint"],
+        "additionalProperties": False,
+    }
+    target["tasks"] = [{"id": "refresh", "interval_seconds": 60}]
+    broker.register("runner-1", [target])
+    broker.register("runner-2", [manifest_payload(plugin_id="example.other")])
+
+    assert broker.update_config("example.dice", {"endpoint": "https://example.test"}) == 1
+    assert broker.dispatch_task("example.dice", "refresh") == 1
+    work = await broker.work("runner-1", wait_seconds=0)
+    other = await broker.work("runner-2", wait_seconds=0)
+
+    assert [event["kind"] for event in work["events"]] == [
+        "plugin.config.changed",
+        "plugin.task",
+    ]
+    assert other["events"] == []
+    with pytest.raises(Exception, match="required"):
+        broker.update_config("example.dice", {})
+    assert broker.task_catalog()[0]["interval_seconds"] == 60
+
+    assert broker.unregister("runner-1") is True
+    assert all(tool["plugin_id"] != "example.dice" for tool in broker.tool_catalog())

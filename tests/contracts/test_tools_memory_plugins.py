@@ -17,6 +17,7 @@ from mybot.contracts import (
     MemoryScope,
     Platform,
     PluginManifest,
+    PluginTaskSpec,
     ToolContext,
     ToolError,
     ToolResult,
@@ -260,11 +261,16 @@ def test_plugin_manifest_is_frozen_and_validates_requested_surfaces() -> None:
         ),
         tasks=("search.refresh_index",),
         config_schema={"type": "object", "additionalProperties": False},
+        requires={"memory.search": "1"},
         platforms=frozenset({Platform.QQ, Platform.TELEGRAM}),
         requested_capabilities=("network.http",),
     )
 
     assert manifest.version == "1.2.3"
+    assert manifest.tasks == (
+        PluginTaskSpec(id="search.refresh_index", interval_seconds=3600),
+    )
+    assert manifest.requires["memory.search"] == "1"
     with pytest.raises(ValidationError):
         manifest.version = "2.0.0"  # type: ignore[misc]
 
@@ -273,4 +279,22 @@ def test_plugin_manifest_is_frozen_and_validates_requested_surfaces() -> None:
             id="com.example.bad",
             version="latest",
             entrypoint="bad.plugin:create",
+        )
+
+
+def test_plugin_manifest_rejects_invalid_tasks_and_service_requirements() -> None:
+    with pytest.raises(ValidationError, match="interval_seconds"):
+        PluginManifest(
+            id="com.example.bad-task",
+            version="1.0.0",
+            entrypoint="bad.plugin:create",
+            tasks=({"id": "refresh", "interval_seconds": 0},),
+        )
+
+    with pytest.raises(ValidationError, match="requires"):
+        PluginManifest(
+            id="com.example.bad-service",
+            version="1.0.0",
+            entrypoint="bad.plugin:create",
+            requires={"shell.exec": 1},
         )

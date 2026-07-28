@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import json
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import cast
@@ -19,6 +20,43 @@ from mybot.runtime import ProcessMode
 from mybot.settings import Settings
 
 logger = structlog.get_logger("mybot.plugins.runner")
+
+
+@dataclass(slots=True)
+class BrokerServiceClient:
+    client: httpx.AsyncClient
+    broker_url: str
+    runner_id: str
+    plugin_id: str
+
+    async def invoke(
+        self, service: str, version: str, arguments: Mapping[str, JsonValue]
+    ) -> dict[str, JsonValue]:
+        try:
+            response = await self.client.post(
+                f"{self.broker_url.rstrip('/')}/plugin-broker/services/invoke",
+                json={
+                    "runner_id": self.runner_id,
+                    "plugin_id": self.plugin_id,
+                    "service": service,
+                    "version": version,
+                    "arguments": dict(arguments),
+                },
+                timeout=30.0,
+            )
+        except httpx.HTTPError as error:
+            raise PluginToolError(
+                "service_unreachable", f"service broker failed: {type(error).__name__}"
+            ) from error
+        if response.status_code >= 400:
+            raise PluginToolError(
+                "service_refused", f"service broker returned HTTP {response.status_code}"
+            )
+        body = as_string_mapping(response.json()) or {}
+        result = as_string_mapping(body.get("result"))
+        if result is None:
+            raise PluginToolError("service_invalid_result", "service returned invalid data")
+        return dict(cast(Mapping[str, JsonValue], result))
 
 
 def load_plugins(config_json: str) -> list[SimplePlugin]:
@@ -38,19 +76,28 @@ def load_plugins(config_json: str) -> list[SimplePlugin]:
         if not isinstance(raw, str) or ":" not in raw:
             logger.warning("plugin_entrypoint_invalid", entry=str(raw))
             continue
-        module_name, _, attribute = raw.partition(":")
         try:
-            module = importlib.import_module(module_name)
-            plugin = getattr(module, attribute)
+            plugin = load_plugin_entrypoint(raw)
         except Exception:
             logger.exception("plugin_import_failed", entry=raw)
-            continue
-        if not isinstance(plugin, SimplePlugin):
-            logger.warning("plugin_entrypoint_not_a_plugin", entry=raw)
             continue
         plugins.append(plugin)
         logger.info("plugin_loaded", plugin_id=plugin.manifest.id, version=plugin.manifest.version)
     return plugins
+
+
+def load_plugin_entrypoint(entrypoint: str, python_path: str | None = None) -> SimplePlugin:
+    if ":" not in entrypoint:
+        raise ValueError("plugin entrypoint must be module:attribute")
+    if python_path and python_path not in sys.path:
+        sys.path.insert(0, python_path)
+    importlib.invalidate_caches()
+    module_name, _, attribute = entrypoint.partition(":")
+    module = importlib.import_module(module_name)
+    plugin = getattr(module, attribute)
+    if not isinstance(plugin, SimplePlugin):
+        raise TypeError("plugin entrypoint does not expose a SimplePlugin")
+    return plugin
 
 
 @dataclass(slots=True)
@@ -68,6 +115,15 @@ class PluginRunnerService:
     runner_id: str = field(default_factory=lambda: f"runner-{uuid4()}")
 
     async def run(self, mode: ProcessMode, stop_event: asyncio.Event) -> None:
+        for plugin in self.plugins:
+            plugin.bind_services(
+                BrokerServiceClient(
+                    client=self.client,
+                    broker_url=self.broker_url,
+                    runner_id=self.runner_id,
+                    plugin_id=plugin.manifest.id,
+                )
+            )
         logger.info(
             "plugin_runner_started",
             mode=mode.value,
@@ -155,12 +211,39 @@ class PluginRunnerService:
         event = as_string_mapping(raw_event)
         if event is None:
             return
+        kind = get_str(event, "kind") or ""
+        payload = as_string_mapping(event.get("payload")) or {}
+        target = get_str(payload, "plugin_id")
         for plugin in self.plugins:
-            kind = get_str(event, "kind") or ""
+            if target is not None and target != plugin.manifest.id:
+                continue
+            if kind == "plugin.config.changed":
+                config = as_string_mapping(payload.get("config")) or {}
+                try:
+                    await plugin.update_config(cast(Mapping[str, JsonValue], config))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("plugin_config_handler_failed", plugin_id=plugin.manifest.id)
+                continue
+            if kind == "plugin.task":
+                task_id = get_str(payload, "task_id")
+                if task_id is None or task_id not in plugin.task_handlers:
+                    continue
+                try:
+                    await plugin.run_task(task_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "plugin_task_handler_failed",
+                        plugin_id=plugin.manifest.id,
+                        task_id=task_id,
+                    )
+                continue
             if kind not in plugin.manifest.event_hooks:
                 continue
             try:
-                payload = as_string_mapping(event.get("payload")) or {}
                 await plugin.deliver_event({"kind": kind, **cast(Mapping[str, JsonValue], payload)})
             except asyncio.CancelledError:
                 raise
@@ -223,19 +306,28 @@ class PluginRunnerService:
         return {"ok": True, "data": data, "error": None}
 
 
-def create_plugin_runner_service(settings: Settings) -> "PluginRunnerService | None":
-    if settings.plugin_broker_url is None or settings.plugin_config is None:
+def create_plugin_runner_service(settings: Settings):  # type: ignore[no-untyped-def]
+    if settings.plugin_broker_url is None:
         return None
-    plugins = load_plugins(settings.plugin_config)
-    return PluginRunnerService(
+    from pathlib import Path
+
+    from mybot.plugins.control import PluginControlStore
+    from mybot.plugins.supervisor import (
+        PluginSupervisorService,
+        SubprocessPluginInspector,
+        SubprocessPluginSpawner,
+    )
+
+    return PluginSupervisorService(
         broker_url=settings.plugin_broker_url,
-        plugins=plugins,
+        config_json=settings.plugin_config,
+        store=PluginControlStore(Path(settings.plugin_data_dir)),
         client=httpx.AsyncClient(),
-        poll_wait_seconds=settings.plugin_poll_wait_seconds,
-        call_timeout_seconds=settings.tool_timeout_seconds,
-        result_max_chars=settings.plugin_result_max_chars,
-        reconnect_initial_seconds=settings.gateway_reconnect_initial_seconds,
-        reconnect_max_seconds=settings.gateway_reconnect_max_seconds,
+        inspector=SubprocessPluginInspector(),
+        spawner=SubprocessPluginSpawner(settings.plugin_broker_url),
+        poll_seconds=settings.plugin_supervisor_poll_seconds,
+        crash_limit=settings.plugin_crash_limit,
+        crash_window_seconds=settings.plugin_crash_window_seconds,
     )
 
 

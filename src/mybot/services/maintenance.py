@@ -4,8 +4,10 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol
+from time import monotonic
+from typing import Protocol, cast
 
+import httpx
 import structlog
 
 from mybot.repositories.memory import LifecycleReport
@@ -39,8 +41,83 @@ class PersonalityJob(Protocol):
     async def run_pass(self) -> int: ...
 
 
+class PluginTaskJob(Protocol):
+    async def run_pass(self) -> int: ...
+
+
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+@dataclass(slots=True)
+class PluginTaskScheduler:
+    client: httpx.AsyncClient
+    broker_url: str
+    clock: Callable[[], float] = monotonic
+    _next_due: dict[tuple[str, str], float] = field(
+        default_factory=lambda: dict[tuple[str, str], float]()
+    )
+
+    async def run_pass(self) -> int:
+        try:
+            response = await self.client.get(
+                f"{self.broker_url.rstrip('/')}/plugin-broker/tasks", timeout=5.0
+            )
+            response.raise_for_status()
+            payload = cast(object, response.json())
+            document = cast(dict[str, object], payload) if isinstance(payload, dict) else {}
+            raw_tasks = document.get("tasks", [])
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, ValueError, AttributeError):
+            logger.warning("plugin_task_catalog_unavailable")
+            return 0
+        if not isinstance(raw_tasks, list):
+            return 0
+        now = self.clock()
+        dispatched = 0
+        active: set[tuple[str, str]] = set()
+        for raw in cast(list[object], raw_tasks):
+            if not isinstance(raw, dict):
+                continue
+            task = cast(dict[str, object], raw)
+            plugin_id = task.get("plugin_id")
+            task_id = task.get("task_id")
+            interval = task.get("interval_seconds")
+            if (
+                not isinstance(plugin_id, str)
+                or not isinstance(task_id, str)
+                or not isinstance(interval, int)
+                or interval < 1
+            ):
+                continue
+            key = (plugin_id, task_id)
+            active.add(key)
+            if now < self._next_due.get(key, 0.0):
+                continue
+            try:
+                result = await self.client.post(
+                    f"{self.broker_url.rstrip('/')}/plugin-broker/tasks/dispatch",
+                    json={"plugin_id": plugin_id, "task_id": task_id},
+                    timeout=5.0,
+                )
+                result.raise_for_status()
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPError:
+                logger.warning(
+                    "plugin_task_dispatch_failed",
+                    plugin_id=plugin_id,
+                    task_id=task_id,
+                )
+                self._next_due[key] = now + min(interval, 30)
+                continue
+            self._next_due[key] = now + interval
+            dispatched += 1
+        self._next_due = {
+            key: due for key, due in self._next_due.items() if key in active
+        }
+        return dispatched
 
 
 @dataclass(slots=True)
@@ -56,10 +133,17 @@ class MaintenanceWorkerService:
     consolidation: ConsolidationJob | None = None
     personality: PersonalityJob | None = None
     proactive: ProactiveJob | None = None
+    plugin_tasks: PluginTaskJob | None = None
+    plugin_task_poll_seconds: float = 5.0
     now: Callable[[], datetime] = field(default=_utc_now)
 
     async def run(self, mode: ProcessMode, stop_event: asyncio.Event) -> None:
         logger.info("maintenance_worker_started", mode=mode.value)
+        plugin_loop = (
+            asyncio.create_task(self._run_plugin_tasks(stop_event), name="plugin-tasks")
+            if self.plugin_tasks is not None
+            else None
+        )
         try:
             while not stop_event.is_set():
                 await self._run_pass()
@@ -69,7 +153,25 @@ class MaintenanceWorkerService:
                 except TimeoutError:
                     continue
         finally:
+            if plugin_loop is not None:
+                plugin_loop.cancel()
+                await asyncio.gather(plugin_loop, return_exceptions=True)
             logger.info("maintenance_worker_stopped", mode=mode.value)
+
+    async def _run_plugin_tasks(self, stop_event: asyncio.Event) -> None:
+        assert self.plugin_tasks is not None
+        while not stop_event.is_set():
+            try:
+                await self.plugin_tasks.run_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("plugin_task_pass_failed")
+            try:
+                async with asyncio.timeout(self.plugin_task_poll_seconds):
+                    await stop_event.wait()
+            except TimeoutError:
+                continue
 
     async def _run_pass(self) -> None:
         try:
@@ -256,4 +358,13 @@ def create_maintenance_service(settings: Settings) -> MaintenanceWorkerService:
         consolidation=consolidation,
         personality=personality,
         proactive=proactive,
+        plugin_tasks=(
+            PluginTaskScheduler(
+                client=httpx.AsyncClient(),
+                broker_url=settings.plugin_broker_url,
+            )
+            if settings.plugin_broker_url is not None
+            else None
+        ),
+        plugin_task_poll_seconds=settings.plugin_task_poll_seconds,
     )

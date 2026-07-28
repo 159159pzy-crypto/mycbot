@@ -37,6 +37,7 @@ from mybot.repositories.conversations import ConversationRecord
 from mybot.repositories.messages import StoredMessage
 from mybot.repositories.profiles import ResolvedProfile
 from mybot.runtime import ProcessMode
+from mybot.security.pairing import PairingDecision
 from mybot.services.agent_worker import DEFAULT_CAPABILITIES, AgentWorkerService
 
 
@@ -211,6 +212,16 @@ class FakeAnnotations:
         )
 
 
+@dataclass
+class FakeAccess:
+    decision: PairingDecision
+    calls: int = 0
+
+    async def check(self, envelope: MessageEnvelope) -> PairingDecision:
+        self.calls += 1
+        return self.decision
+
+
 def envelope(
     *,
     text: str = "hello",
@@ -239,6 +250,7 @@ def build_service(
     profiles: FakeProfiles | None = None,
     willingness: FakeWillingness | None = None,
     annotations: FakeAnnotations | None = None,
+    access: FakeAccess | None = None,
 ) -> tuple[AgentWorkerService, FakeMessages, FakeAgentEngine]:
     conversations = FakeConversations(
         record=ConversationRecord(id=uuid4(), stable_key="v1:qq-main:DIRECT:10001:0")
@@ -270,6 +282,7 @@ def build_service(
         profiles=profiles,
         willingness=willingness,
         annotations=annotations,
+        access=access,
     )
     return service, messages, engine
 
@@ -297,6 +310,31 @@ async def test_direct_message_flows_through_the_agent_engine() -> None:
     assert outbound[0].chat_id == "10001"
     assert outbound[0].reply_to_platform_message_id == "901"
     assert outbound[0].reply_plan.text_segments == ("agent-reply:qq:qq-main:901",)
+
+
+@pytest.mark.asyncio
+async def test_unknown_direct_pairing_stops_before_conversation_message_and_agent() -> None:
+    backend = MemoryStreamBackend()
+    access = FakeAccess(
+        PairingDecision(
+            allowed=False,
+            reply_text="配对码: ABCD2345",
+            reason="pairing_required",
+        )
+    )
+    service, messages, engine = build_service(backend, access=access)
+    conversations = service.conversations
+
+    await service.handle_payload(InboundEvent(envelope=envelope()).model_dump_json())
+
+    assert access.calls == 1
+    assert messages.inbound == []
+    assert messages.outbound == []
+    assert engine.calls == []
+    assert isinstance(conversations, FakeConversations)
+    assert conversations.calls == []
+    outbound = await outbound_messages(backend)
+    assert outbound[0].reply_plan.text_segments == ("配对码: ABCD2345",)
 
 
 @pytest.mark.asyncio

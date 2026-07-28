@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from time import monotonic
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 from pydantic import JsonValue
@@ -205,6 +205,21 @@ class TraceSink(Protocol):
     ) -> UUID: ...
 
 
+class AccessDecisionLike(Protocol):
+    @property
+    def allowed(self) -> bool: ...
+
+    @property
+    def reply_text(self) -> str | None: ...
+
+    @property
+    def reason(self) -> str: ...
+
+
+class InboundAccess(Protocol):
+    async def check(self, envelope: MessageEnvelope) -> AccessDecisionLike: ...
+
+
 MODERATION_NOTICE = "回复触发了内容策略, 已停止发送。"
 
 
@@ -230,6 +245,7 @@ class AgentWorkerService:
     annotations: AnnotationEngine | None = None
     moderation_notice: str = MODERATION_NOTICE
     traces: TraceSink | None = None
+    access: InboundAccess | None = None
     _conversation_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
 
     async def run(self, mode: ProcessMode, stop_event: asyncio.Event) -> None:
@@ -258,6 +274,18 @@ class AgentWorkerService:
 
     async def _handle_serialized(self, event: InboundEvent, key: ConversationKey) -> None:
         envelope = event.envelope
+        if self.access is not None:
+            access = await self.access.check(envelope)
+            if not access.allowed:
+                if access.reply_text:
+                    await self._publish_access_reply(envelope, access.reply_text)
+                logger.info(
+                    "inbound_access_denied",
+                    platform=envelope.platform.value,
+                    subject_identity_id=envelope.sender_identity_id,
+                    reason=access.reason,
+                )
+                return
         conversation = await self.conversations.get_or_create(
             key, platform=envelope.platform, ephemeral=envelope.ephemeral
         )
@@ -486,6 +514,19 @@ class AgentWorkerService:
                 if profile_context is not None:
                     reset_model_profile(profile_context)
                 reset_model_conversation(model_context)
+
+    async def _publish_access_reply(self, envelope: MessageEnvelope, text: str) -> None:
+        message = OutboundMessage(
+            internal_message_id=uuid4(),
+            platform=envelope.platform,
+            connection_id=envelope.connection_id,
+            chat_kind=envelope.chat_kind,
+            chat_id=envelope.chat_id,
+            reply_plan=ReplyPlan(text_segments=(text,)),
+            reply_to_platform_message_id=platform_message_id_from_envelope(envelope),
+            trace_id=envelope.trace_id,
+        )
+        await self.outbound.publish(message.model_dump_json())
 
     async def _resolve_profile(self, conversation_id: UUID) -> ResolvedProfile | None:
         if self.profiles is None:
@@ -759,12 +800,15 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.messages import MessageRepository
+    from mybot.repositories.pairing import PairingRepository
     from mybot.repositories.participation import WillingnessAuditRepository
     from mybot.repositories.profiles import ProfileRepository
     from mybot.repositories.system_kv import SystemKvRepository
     from mybot.repositories.tool_invocations import ToolInvocationRepository
     from mybot.repositories.traces import TraceSpanRepository
     from mybot.repositories.turns import TurnRepository
+    from mybot.security.pairing import PairingGate
+    from mybot.skills import SkillStore
     from mybot.tools import Tool, ToolExecutor, ToolRegistry
     from mybot.tools.approvals import SystemKvApprovals
     from mybot.tools.fetch import UrlFetchTool
@@ -772,6 +816,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.tools.memory import MemoryAppendTool, MemoryReplaceTool
     from mybot.tools.plugins import BrokerEventSink, BrokerToolCatalog
     from mybot.tools.search import SearxngSearchTool
+    from mybot.tools.skills import LoadSkillTool
 
     backend = create_redis_backend(settings.redis_url.get_secret_value())
     sessions = create_session_factory(create_database_engine(settings))
@@ -847,7 +892,9 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             token_budget=settings.memory_token_budget,
         )
     tool_http_timeout = httpx.Timeout(min(settings.tool_timeout_seconds, 30.0))
+    skill_store = SkillStore(settings.skills_dir)
     builtin_tools: list[Tool] = [
+        LoadSkillTool(skill_store),
         SearxngSearchTool(
             client=httpx.AsyncClient(timeout=tool_http_timeout),
             searxng_url=settings.searxng_url,
@@ -940,6 +987,8 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             image_resolver=telegram_image_resolver,
         ),
         vision_llm=model_router.for_purpose(ModelPurpose.VISION),
+        skills=skill_store,
+        skill_prompt_max_chars=settings.skills_prompt_max_chars,
         not_configured_fallback=settings.fallback_not_configured,
         llm_failure_fallback=settings.fallback_llm_failure,
         budget_fallback=settings.fallback_budget_exceeded,
@@ -994,4 +1043,5 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             else None
         ),
         traces=traces,
+        access=PairingGate(PairingRepository(sessions)),
     )

@@ -1653,6 +1653,62 @@
   margin-top: 12px;
 }
 
+.status-dot {
+  margin-left: auto;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(52, 199, 89, 0.12);
+  color: #177a35;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.status-dot--backoff,
+.status-dot--stopped { background: rgba(255, 149, 0, 0.14); color: #9a5a00; }
+.status-dot--circuit_open,
+.status-dot--load_error { background: rgba(255, 59, 48, 0.12); color: #b42318; }
+.status-dot--disabled { background: rgba(120, 120, 128, 0.12); color: var(--gray); }
+
+.plugin-actions,
+.service-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.service-strip { margin-top: 16px; }
+.service-strip code { padding: 5px 8px; border-radius: 7px; background: rgba(0, 0, 0, 0.045); font-size: 11px; }
+
+.schema-form,
+.skill-list,
+.pairing-policies,
+.pairing-requests {
+  display: grid;
+  gap: 10px;
+}
+
+.schema-form { padding-top: 10px; border-top: 1px solid var(--hairline); }
+.schema-form label,
+.pairing-policies label { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
+.schema-form input:not([type='checkbox']),
+.pairing-policies select { min-width: 120px; padding: 7px 9px; border: 1px solid var(--hairline); border-radius: 8px; background: #fff; }
+
+.skill-list { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.skill-editor { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--hairline); border-radius: 14px; }
+.skill-editor > div:first-child { display: grid; gap: 4px; }
+.skill-editor small { color: var(--gray); }
+.skill-editor textarea { width: 100%; min-height: 170px; resize: vertical; padding: 10px; border: 1px solid var(--hairline); border-radius: 10px; font: 12px/1.5 var(--mono); }
+
+.pairing-policies { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); margin-bottom: 16px; }
+.pairing-requests { list-style: none; padding: 0; }
+.pairing-requests li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--hairline); border-radius: 10px; }
+.pairing-requests li > span { display: grid; gap: 3px; }
+.pairing-requests li > div { display: flex; gap: 6px; }
+
+@media (max-width: 620px) {
+  .pairing-requests li { align-items: flex-start; flex-direction: column; }
+}
+
 /* ---------- persona view ---------- */
 
 .persona-view {

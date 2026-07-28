@@ -343,6 +343,74 @@ so `/forget`, revocation, history, and decay use the same M3 lifecycle.
 
 ## Plugins
 
+M6 provides two extension levels. Markdown skills live under
+`skills/<name>/SKILL.md` with `name`, `description`, and `trigger` frontmatter.
+The agent prompt receives only a bounded catalog; the model loads full
+instructions through the read-only `load_skill` tool when needed. The operator
+console can edit and enable or disable skills, and the next turn sees the
+updated catalog.
+
+Code plugins are a `PluginManifest` plus `SimplePlugin` handlers. Create a local
+plugin skeleton with:
+
+```powershell
+uv run mybot plugin new weather_digest
+```
+
+The scaffold includes `plugin.json`, a Python entrypoint, a scheduled task,
+configuration schema, and a pytest skeleton. `config_schema`, structured
+`tasks`, and `requires` are enforced at runtime; legacy string task ids remain
+accepted. The first injected service versions are deliberately limited to
+`memory.search@1`, `llm.complete@1`, and `kv.store@1`. Registration fails if a
+required service version is unavailable or requested capabilities exceed
+`MYBOT_PLUGIN_CAPABILITY_GRANTS`; calls are identity checked, rate limited by
+`MYBOT_PLUGIN_SERVICE_QUOTA_PER_MINUTE`, and audited.
+
+`plugin-runner` now supervises one child process per plugin. Source changes or
+an operator reload restart only that plugin. Repeated crashes use exponential
+backoff and then open a circuit until manual reload. Control, status, managed
+installs, and per-plugin configuration are written atomically under
+`MYBOT_PLUGIN_DATA_DIR`. The container receives no database or Redis
+credentials, exposes no ports, and reaches the API only through the internal
+`plugin-control` network.
+
+`registry.json` is a trusted operator-maintained index, not a public market.
+Installation accepts HTTPS archives only, enforces
+`MYBOT_PLUGIN_INSTALL_MAX_BYTES`, rejects path traversal and symbolic links,
+checks the indexed `plugin.json` SHA-256, installs into a versioned directory,
+and updates `managed.json` only after a complete install. The operator console
+exposes plugin status, configuration forms, reload/enable/disable, and registry
+installation.
+
+Unknown direct messages can be gated per QQ or Telegram connection with
+`open`, `paired`, or `allowlist`. Under `paired`, an unknown sender is stopped
+before conversation/message persistence and LLM use, receives one one-hour
+eight-character pairing prompt, and can continue only after approval. Pending
+requests are capped at three per connection. Group chats remain outside this
+direct-message gate.
+
+Useful M6 endpoints are `GET /operator/skills`, `GET /operator/plugins`,
+`GET /operator/plugins/registry`, and `GET /operator/pairing`. The broker's
+`GET /plugin-broker/health` response includes loaded plugins, services, tasks,
+grants, and load errors.
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `MYBOT_SKILLS_PROMPT_MAX_CHARS` | 4000 | Maximum skill catalog characters injected per turn |
+| `MYBOT_PLUGIN_TASK_POLL_SECONDS` | 5 | Maintenance scheduler poll interval |
+| `MYBOT_PLUGIN_SUPERVISOR_POLL_SECONDS` | 1 | Source and control reconciliation interval |
+| `MYBOT_PLUGIN_CRASH_LIMIT` | 5 | Crashes inside the rolling window before circuit open |
+| `MYBOT_PLUGIN_CRASH_WINDOW_SECONDS` | 60 | Crash circuit rolling window |
+| `MYBOT_PLUGIN_SERVICE_QUOTA_PER_MINUTE` | 30 | Per-plugin, per-service call quota |
+| `MYBOT_PLUGIN_INSTALL_MAX_BYTES` | 10000000 | Maximum trusted registry archive size |
+
+Plugins, skills, remote archives, plugin outputs, and stranger messages are all
+treated as untrusted input. The process and broker boundaries limit mistakes
+and resource runaway; they are not a sandbox for deliberately hostile code.
+
+### Historical M1 broker behavior (superseded by M6)
+
+<!-- Kept only as source-level migration context for older deployments.
 Plugins are ordinary Python objects: a frozen `PluginManifest` plus handler
 callables, wrapped in `SimplePlugin` from `mybot.plugins.sdk`. The isolated
 plugin-runner imports them from `MYBOT_PLUGIN_CONFIG` entrypoints
@@ -372,7 +440,7 @@ the runner loop or the stack down. Be clear about what this is not: the
 container boundary plus broker policy protects against mistakes and
 resource runaway, not against deliberately hostile plugin code. Only run
 plugins you trust, grant capabilities narrowly, and treat anything more as
-requiring real sandboxing.
+requiring real sandboxing. -->
 
 ## Health and migrations
 

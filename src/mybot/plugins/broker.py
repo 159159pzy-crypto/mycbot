@@ -2,7 +2,9 @@
 
 import asyncio
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import cast
 from uuid import uuid4
 
@@ -12,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from mybot.contracts import PluginManifest, ToolSpec
 from mybot.contracts.json import thaw_json_object
+from mybot.plugins.config import PluginConfigError, validate_plugin_config
 
 logger = structlog.get_logger("mybot.plugins.broker")
 
@@ -50,11 +53,47 @@ class EventRequest(BaseModel):
     payload: dict[str, JsonValue]
 
 
+class UnregisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    runner_id: str
+
+
+class TaskDispatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plugin_id: str
+    task_id: str
+
+
+class ServiceInvokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    runner_id: str
+    plugin_id: str
+    service: str
+    version: str
+    arguments: dict[str, JsonValue] = Field(default_factory=dict)
+
+
 @dataclass(slots=True)
 class AuditEntry:
     plugin_id: str
     reason: str
     detail: str
+
+
+type ServiceHandler = Callable[
+    [str, dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]
+]
+
+
+@dataclass(slots=True, frozen=True)
+class PluginService:
+    name: str
+    version: int
+    capability: str
+    handler: ServiceHandler
 
 
 @dataclass(slots=True)
@@ -93,13 +132,24 @@ class PluginBroker:
         *,
         grants: dict[str, tuple[str, ...]],
         invoke_timeout_seconds: float = 20.0,
+        services: tuple[PluginService, ...] = (),
+        service_quota_per_minute: int = 30,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
         self._grants = grants
         self._invoke_timeout_seconds = invoke_timeout_seconds
         self._runners: dict[str, _RunnerState] = {}
         self._tools: dict[str, _RegisteredTool] = {}
         self._pending: dict[str, _PendingInvocation] = {}
+        self._services = {service.name: service for service in services}
+        self._service_quota_per_minute = service_quota_per_minute
+        self._service_calls: dict[tuple[str, str], deque[float]] = {}
+        self._clock = clock
+        self._load_errors: dict[str, str] = {}
         self.audit_log: list[AuditEntry] = []
+
+    def set_services(self, services: tuple[PluginService, ...]) -> None:
+        self._services = {service.name: service for service in services}
 
     def register(
         self, runner_id: str, manifests: list[JsonValue], *, protocol_version: int = 1
@@ -143,6 +193,31 @@ class PluginBroker:
                     status_code=403,
                     detail=f"plugin {manifest.id} requests ungranted capabilities",
                 )
+            for service_name, required_version in manifest.requires.items():
+                service = self._services.get(service_name)
+                detail: str | None = None
+                if service is None:
+                    detail = f"required service {service_name}@{required_version} is unavailable"
+                elif not _supports_version(str(required_version), service.version):
+                    detail = (
+                        f"required service {service_name}@{required_version} is incompatible "
+                        f"with {service_name}@{service.version}"
+                    )
+                elif service.capability not in requested:
+                    detail = (
+                        f"required service {service_name} also requires requested capability "
+                        f"{service.capability}"
+                    )
+                if detail is not None:
+                    self._load_errors[manifest.id] = detail
+                    self.audit_log.append(
+                        AuditEntry(
+                            plugin_id=manifest.id,
+                            reason="service_negotiation_refused",
+                            detail=detail,
+                        )
+                    )
+                    raise HTTPException(status_code=409, detail=detail)
             validated.append(manifest)
 
         previous = self._runners.get(runner_id)
@@ -155,6 +230,7 @@ class PluginBroker:
             }
         self._runners[runner_id] = state
         for manifest in validated:
+            self._load_errors.pop(manifest.id, None)
             state.plugins[manifest.id] = manifest
             for spec in manifest.tools:
                 self._tools[spec.id] = _RegisteredTool(
@@ -169,6 +245,20 @@ class PluginBroker:
             ),
         )
         return [manifest.id for manifest in validated]
+
+    def unregister(self, runner_id: str) -> bool:
+        state = self._runners.pop(runner_id, None)
+        if state is None:
+            return False
+        self._tools = {
+            tool_id: tool
+            for tool_id, tool in self._tools.items()
+            if tool.runner_id != runner_id
+        }
+        for pending in tuple(self._pending.values()):
+            if pending in state.work and not pending.future.done():
+                pending.future.set_exception(RuntimeError("plugin runner disconnected"))
+        return True
 
     def tool_catalog(self) -> list[dict[str, JsonValue]]:
         return [
@@ -258,6 +348,122 @@ class PluginBroker:
             delivered += 1
         return delivered
 
+    def post_plugin_event(
+        self, plugin_id: str, kind: str, payload: dict[str, JsonValue]
+    ) -> int:
+        for runner in self._runners.values():
+            if plugin_id not in runner.plugins:
+                continue
+            runner.events.append(
+                _event_for_protocol(kind, payload, protocol_version=runner.protocol_version)
+            )
+            runner.wakeup.set()
+            return 1
+        return 0
+
+    def update_config(self, plugin_id: str, config: dict[str, JsonValue]) -> int:
+        manifest = self._manifest(plugin_id)
+        try:
+            validate_plugin_config(thaw_json_object(manifest.config_schema), config)
+        except PluginConfigError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return self.post_plugin_event(
+            plugin_id,
+            "plugin.config.changed",
+            {"plugin_id": plugin_id, "config": cast(JsonValue, config)},
+        )
+
+    def task_catalog(self) -> list[dict[str, JsonValue]]:
+        tasks: list[dict[str, JsonValue]] = []
+        for runner in self._runners.values():
+            for manifest in runner.plugins.values():
+                tasks.extend(
+                    {
+                        "plugin_id": manifest.id,
+                        "task_id": task.id,
+                        "interval_seconds": task.interval_seconds,
+                    }
+                    for task in manifest.tasks
+                )
+        return tasks
+
+    def dispatch_task(self, plugin_id: str, task_id: str) -> int:
+        manifest = self._manifest(plugin_id)
+        if task_id not in {task.id for task in manifest.tasks}:
+            raise HTTPException(status_code=404, detail=f"plugin {plugin_id} has no task {task_id}")
+        return self.post_plugin_event(
+            plugin_id,
+            "plugin.task",
+            {"plugin_id": plugin_id, "task_id": task_id},
+        )
+
+    def service_catalog(self) -> list[dict[str, JsonValue]]:
+        return [
+            {
+                "name": service.name,
+                "version": service.version,
+                "capability": service.capability,
+            }
+            for service in sorted(self._services.values(), key=lambda item: item.name)
+        ]
+
+    async def invoke_service(
+        self,
+        *,
+        runner_id: str,
+        plugin_id: str,
+        service: str,
+        version: str,
+        arguments: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        runner = self._runners.get(runner_id)
+        manifest = runner.plugins.get(plugin_id) if runner is not None else None
+        if manifest is None:
+            raise HTTPException(status_code=403, detail="runner does not own this plugin")
+        required = manifest.requires.get(service)
+        definition = self._services.get(service)
+        if required is None or definition is None:
+            raise HTTPException(status_code=404, detail=f"service {service} was not negotiated")
+        if not _supports_version(version, definition.version) or not _supports_version(
+            str(required), definition.version
+        ):
+            raise HTTPException(status_code=409, detail=f"service {service} version mismatch")
+        granted = set(self._grants.get(plugin_id, ()))
+        if definition.capability not in granted:
+            self.audit_log.append(
+                AuditEntry(plugin_id, "service_capability_refused", service)
+            )
+            raise HTTPException(status_code=403, detail="service capability is not granted")
+        self._consume_service_quota(plugin_id, service)
+        result = await definition.handler(plugin_id, arguments)
+        self.audit_log.append(AuditEntry(plugin_id, "service_invoked", f"{service}@{version}"))
+        return result
+
+    def _consume_service_quota(self, plugin_id: str, service: str) -> None:
+        now = self._clock()
+        calls = self._service_calls.setdefault((plugin_id, service), deque())
+        while calls and now - calls[0] >= 60.0:
+            calls.popleft()
+        if len(calls) >= self._service_quota_per_minute:
+            self.audit_log.append(
+                AuditEntry(plugin_id, "service_quota_exceeded", service)
+            )
+            raise HTTPException(status_code=429, detail=f"service {service} quota exceeded")
+        calls.append(now)
+
+    def _manifest(self, plugin_id: str) -> PluginManifest:
+        for runner in self._runners.values():
+            manifest = runner.plugins.get(plugin_id)
+            if manifest is not None:
+                return manifest
+        raise HTTPException(status_code=404, detail=f"unknown plugin {plugin_id}")
+
+    def manifest(self, plugin_id: str) -> PluginManifest | None:
+        try:
+            return self._manifest(plugin_id)
+        except HTTPException:
+            return None
+
     def health(self) -> dict[str, JsonValue]:
         plugins: list[JsonValue] = []
         for runner in self._runners.values():
@@ -269,8 +475,10 @@ class PluginBroker:
                         "runner_id": runner.runner_id,
                         "tools": [spec.id for spec in manifest.tools],
                         "event_hooks": list(manifest.event_hooks),
+                        "tasks": [task.model_dump(mode="json") for task in manifest.tasks],
                         "granted_capabilities": list(self._grants.get(manifest.id, ())),
                         "config_schema": cast(JsonValue, thaw_json_object(manifest.config_schema)),
+                        "requires": cast(JsonValue, thaw_json_object(manifest.requires)),
                     }
                 )
         return {
@@ -280,6 +488,14 @@ class PluginBroker:
                 runner_id: state.protocol_version for runner_id, state in self._runners.items()
             },
             "plugins": plugins,
+            "services": cast(JsonValue, self.service_catalog()),
+            "load_errors": cast(
+                JsonValue,
+                [
+                    {"plugin_id": plugin_id, "detail": detail}
+                    for plugin_id, detail in sorted(self._load_errors.items())
+                ],
+            ),
         }
 
 
@@ -294,6 +510,10 @@ def create_broker_router(broker: PluginBroker) -> APIRouter:
             protocol_version=request.protocol_version,
         )
         return {"accepted": cast(JsonValue, accepted)}
+
+    @router.post("/unregister")
+    def unregister(request: UnregisterRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        return {"removed": broker.unregister(request.runner_id)}
 
     @router.get("/tools")
     def tools() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
@@ -317,6 +537,29 @@ def create_broker_router(broker: PluginBroker) -> APIRouter:
     def events(request: EventRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
         delivered = broker.post_event(request.kind, request.payload)
         return {"delivered": delivered}
+
+    @router.get("/tasks")
+    def tasks() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        return {"tasks": cast(JsonValue, broker.task_catalog())}
+
+    @router.post("/tasks/dispatch")
+    def dispatch_task(request: TaskDispatchRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        return {"delivered": broker.dispatch_task(request.plugin_id, request.task_id)}
+
+    @router.get("/services")
+    def services() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        return {"services": cast(JsonValue, broker.service_catalog())}
+
+    @router.post("/services/invoke")
+    async def invoke_service(request: ServiceInvokeRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        result = await broker.invoke_service(
+            runner_id=request.runner_id,
+            plugin_id=request.plugin_id,
+            service=request.service,
+            version=request.version,
+            arguments=request.arguments,
+        )
+        return {"result": cast(JsonValue, result)}
 
     @router.get("/health")
     def health() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
@@ -344,6 +587,14 @@ def _event_for_protocol(
             )
         projected["envelope"] = cast(JsonValue, compatible_envelope)
     return {"kind": kind, "payload": projected}
+
+
+def _supports_version(requested: str, available: int) -> bool:
+    normalized = requested.strip()
+    if normalized.startswith("^"):
+        normalized = normalized[1:]
+    major = normalized.split(".", 1)[0]
+    return major.isdigit() and int(major) == available
 
 
 def _legacy_segment(raw: object) -> JsonValue:

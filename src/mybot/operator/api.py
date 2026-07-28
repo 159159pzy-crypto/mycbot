@@ -24,9 +24,11 @@ from mybot.contracts import (
     MemoryItem,
     MemoryPrivacy,
     MemoryScope,
+    PluginManifest,
     ProfileMemoryPolicy,
     ReplyWillingnessPolicy,
 )
+from mybot.contracts.json import thaw_json_object
 from mybot.engine.knowledge import KnowledgeSearchService
 from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError
 from mybot.infrastructure.model_routing import (
@@ -40,15 +42,20 @@ from mybot.infrastructure.model_routing import (
     legacy_model_channels,
 )
 from mybot.plugins.broker import PluginBroker
+from mybot.plugins.config import PluginConfigError, validate_plugin_config
+from mybot.plugins.control import PluginControlStore
+from mybot.plugins.tooling import PluginInstaller
 from mybot.repositories.audit import AuditRepository
 from mybot.repositories.knowledge import KnowledgeRepository
 from mybot.repositories.memory import MemoryRepository
 from mybot.repositories.operator_views import OperatorViews
+from mybot.repositories.pairing import PairingRepository
 from mybot.repositories.participation import WillingnessAuditRepository
 from mybot.repositories.profiles import ProfileRepository, ResolvedProfile
 from mybot.repositories.system_kv import SystemKvRepository
 from mybot.services.proactive import OPTIN_KEY
 from mybot.settings import Settings
+from mybot.skills import SkillDocument, SkillStore
 from mybot.tools.approvals import APPROVALS_KEY
 
 PERSONA_KEY = "agent.system_prompt"
@@ -147,6 +154,52 @@ class RelationshipUpdate(BaseModel):
     familiarity: float = Field(ge=0.0, le=100.0)
 
 
+class SkillContentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+
+
+class EnabledUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class PluginActionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["enable", "disable", "reload"]
+
+
+class PluginConfigInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: dict[str, JsonValue]
+
+
+class PluginInstallInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+
+class PairingPolicyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_id: str
+    policy: Literal["open", "paired", "allowlist"]
+    allowlist: list[str] = Field(default_factory=list)
+
+
+class PairingGenerateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    platform: Literal["qq", "telegram"]
+    connection_id: str
+    subject_identity_id: str
+
+
 class KnowledgeSearchInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -200,6 +253,10 @@ class OperatorContext:
     knowledge: KnowledgeRepository | None = None
     knowledge_tasks: SandboxPublisher | None = None
     embeddings: Embeddings | None = None
+    skills: SkillStore | None = None
+    plugin_control: PluginControlStore | None = None
+    plugin_installer: PluginInstaller | None = None
+    pairing: PairingRepository | None = None
 
 
 def create_operator_router(context: OperatorContext) -> APIRouter:
@@ -568,9 +625,268 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
         await context.audit.record("memory.revoke", {"memory_id": str(memory_id)})
         return {"revoked": True}
 
+    @router.get("/skills")
+    async def skills() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        if context.skills is None:
+            return {"skills": []}
+        return {
+            "skills": cast(
+                JsonValue,
+                [
+                    {
+                        "name": skill.name,
+                        "description": skill.description,
+                        "trigger": skill.trigger,
+                        "content": skill.content,
+                        "enabled": skill.enabled,
+                    }
+                    for skill in context.skills.list()
+                ],
+            )
+        }
+
+    @router.put("/skills/{name}")
+    async def save_skill(  # pyright: ignore[reportUnusedFunction]
+        name: str, update: SkillContentUpdate
+    ) -> dict[str, JsonValue]:
+        if context.skills is None:
+            raise HTTPException(status_code=503, detail="skills are unavailable")
+        try:
+            skill = context.skills.save(name, update.content)
+        except (ValueError, OSError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        await context.audit.record("skill.save", {"name": name})
+        return {"skill": cast(JsonValue, _skill_view(skill))}
+
+    @router.put("/skills/{name}/enabled")
+    async def set_skill_enabled(  # pyright: ignore[reportUnusedFunction]
+        name: str, update: EnabledUpdate
+    ) -> dict[str, JsonValue]:
+        if context.skills is None:
+            raise HTTPException(status_code=503, detail="skills are unavailable")
+        try:
+            skill = context.skills.set_enabled(name, update.enabled)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="skill not found") from error
+        await context.audit.record(
+            "skill.enable" if update.enabled else "skill.disable", {"name": name}
+        )
+        return {"skill": cast(JsonValue, _skill_view(skill))}
+
     @router.get("/plugins")
     async def plugins() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
-        return context.broker.health()
+        health = context.broker.health()
+        status_document = context.plugin_control.status() if context.plugin_control else {}
+        statuses = status_document.get("plugins")
+        status_map: dict[str, JsonValue] = statuses if isinstance(statuses, dict) else {}
+        raw_plugins = health.get("plugins")
+        seen: set[str] = set()
+        if isinstance(raw_plugins, list):
+            for raw in raw_plugins:
+                if not isinstance(raw, dict):
+                    continue
+                plugin_id = raw.get("id")
+                if isinstance(plugin_id, str):
+                    seen.add(plugin_id)
+                status = status_map.get(plugin_id) if isinstance(plugin_id, str) else None
+                if isinstance(status, dict):
+                    raw.update(status)
+                if context.plugin_control is not None and isinstance(plugin_id, str):
+                    raw["config"] = context.plugin_control.control(plugin_id).config or {}
+            for plugin_id, status in status_map.items():
+                if (
+                    plugin_id in seen
+                    or not isinstance(status, dict)
+                ):
+                    continue
+                manifest = _plugin_manifest(context, plugin_id)
+                if manifest is None:
+                    continue
+                raw_plugins.append(
+                    {
+                        "id": manifest.id,
+                        "version": manifest.version,
+                        "runner_id": status.get("runner_id", ""),
+                        "tools": [tool.id for tool in manifest.tools],
+                        "event_hooks": list(manifest.event_hooks),
+                        "tasks": [task.model_dump(mode="json") for task in manifest.tasks],
+                        "granted_capabilities": list(
+                            context.settings.plugin_grants().get(manifest.id, ())
+                        ),
+                        "config_schema": thaw_json_object(manifest.config_schema),
+                        "requires": thaw_json_object(manifest.requires),
+                        "config": (
+                            context.plugin_control.control(plugin_id).config
+                            if context.plugin_control is not None
+                            else {}
+                        ),
+                        **status,
+                    }
+                )
+        health["supervision"] = cast(JsonValue, status_map)
+        return health
+
+    @router.post("/plugins/{plugin_id}/action")
+    async def plugin_action(  # pyright: ignore[reportUnusedFunction]
+        plugin_id: str, update: PluginActionInput
+    ) -> dict[str, JsonValue]:
+        if context.plugin_control is None:
+            raise HTTPException(status_code=503, detail="plugin control is unavailable")
+        control = context.plugin_control.request_action(plugin_id, update.action)
+        await context.audit.record(
+            f"plugin.{update.action}", {"plugin_id": plugin_id}
+        )
+        return {
+            "plugin_id": plugin_id,
+            "enabled": control.enabled,
+            "generation": control.generation,
+        }
+
+    @router.put("/plugins/{plugin_id}/config")
+    async def plugin_config(  # pyright: ignore[reportUnusedFunction]
+        plugin_id: str, update: PluginConfigInput
+    ) -> dict[str, JsonValue]:
+        if context.plugin_control is None:
+            raise HTTPException(status_code=503, detail="plugin control is unavailable")
+        manifest = _plugin_manifest(context, plugin_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="plugin not found")
+        try:
+            validate_plugin_config(thaw_json_object(manifest.config_schema), update.config)
+        except PluginConfigError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        context.plugin_control.set_config(plugin_id, update.config)
+        delivered = context.broker.post_plugin_event(
+            plugin_id,
+            "plugin.config.changed",
+            {"plugin_id": plugin_id, "config": cast(JsonValue, update.config)},
+        )
+        await context.audit.record(
+            "plugin.config", {"plugin_id": plugin_id, "delivered": delivered}
+        )
+        return {"plugin_id": plugin_id, "config": cast(JsonValue, update.config)}
+
+    @router.get("/plugins/registry")
+    async def plugin_registry() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        if context.plugin_installer is None:
+            return {"plugins": [], "managed": []}
+        return {
+            "plugins": cast(JsonValue, context.plugin_installer.registry()),
+            "managed": (
+                context.plugin_control.managed().get("plugins", [])
+                if context.plugin_control is not None
+                else []
+            ),
+        }
+
+    @router.post("/plugins/install")
+    async def install_plugin(  # pyright: ignore[reportUnusedFunction]
+        update: PluginInstallInput,
+    ) -> dict[str, JsonValue]:
+        if context.plugin_installer is None:
+            raise HTTPException(status_code=503, detail="plugin installer is unavailable")
+        try:
+            installed = await context.plugin_installer.install(update.name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="registry plugin not found") from error
+        except (ValueError, httpx.HTTPError, OSError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        await context.audit.record(
+            "plugin.install",
+            {"plugin_id": installed.manifest.id, "version": installed.manifest.version},
+        )
+        return {
+            "plugin": cast(JsonValue, installed.manifest.model_dump(mode="json")),
+            "install_dir": str(installed.install_dir),
+        }
+
+    @router.get("/pairing")
+    async def pairing() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        repository = _pairing(context)
+        policies: list[dict[str, JsonValue]] = []
+        for platform, connection_id in (
+            ("qq", context.settings.qq_connection_id),
+            ("telegram", context.settings.telegram_connection_id),
+        ):
+            policy = await repository.policy(platform, connection_id)
+            policies.append(
+                {
+                    "platform": platform,
+                    "connection_id": connection_id,
+                    "policy": policy.policy,
+                    "allowlist": list(policy.allowlist),
+                }
+            )
+        return {
+            "policies": cast(JsonValue, policies),
+            "requests": cast(JsonValue, await repository.pending()),
+        }
+
+    @router.put("/pairing/policies/{platform}")
+    async def pairing_policy(  # pyright: ignore[reportUnusedFunction]
+        platform: Literal["qq", "telegram"], update: PairingPolicyInput
+    ) -> dict[str, JsonValue]:
+        policy = await _pairing(context).set_policy(
+            platform, update.connection_id, update.policy, update.allowlist
+        )
+        await context.audit.record(
+            "pairing.policy",
+            {"platform": platform, "connection_id": update.connection_id, "policy": update.policy},
+        )
+        return {
+            "platform": platform,
+            "connection_id": update.connection_id,
+            "policy": policy.policy,
+            "allowlist": cast(JsonValue, list(policy.allowlist)),
+        }
+
+    @router.post("/pairing/requests")
+    async def generate_pairing(  # pyright: ignore[reportUnusedFunction]
+        update: PairingGenerateInput,
+    ) -> dict[str, JsonValue]:
+        request, created = await _pairing(context).request(
+            update.platform, update.connection_id, update.subject_identity_id
+        )
+        if request is None:
+            raise HTTPException(status_code=429, detail="pending pairing request limit reached")
+        await context.audit.record(
+            "pairing.generate",
+            {"platform": update.platform, "subject_identity_id": update.subject_identity_id},
+        )
+        return {
+            "request": cast(
+                JsonValue,
+                {
+                    "id": request.id,
+                    "platform": request.platform,
+                    "connection_id": request.connection_id,
+                    "subject_identity_id": request.subject_identity_id,
+                    "code": request.code,
+                    "expires_at": request.expires_at,
+                },
+            ),
+            "created": created,
+        }
+
+    @router.post("/pairing/requests/{request_id}/approve")
+    async def approve_pairing(  # pyright: ignore[reportUnusedFunction]
+        request_id: UUID,
+    ) -> dict[str, JsonValue]:
+        approved = await _pairing(context).approve(request_id)
+        if not approved:
+            raise HTTPException(status_code=404, detail="pairing request not found or expired")
+        await context.audit.record("pairing.approve", {"request_id": str(request_id)})
+        return {"approved": True}
+
+    @router.post("/pairing/requests/{request_id}/dismiss")
+    async def dismiss_pairing(  # pyright: ignore[reportUnusedFunction]
+        request_id: UUID,
+    ) -> dict[str, JsonValue]:
+        dismissed = await _pairing(context).dismiss(request_id)
+        if not dismissed:
+            raise HTTPException(status_code=404, detail="pairing request not found")
+        await context.audit.record("pairing.dismiss", {"request_id": str(request_id)})
+        return {"dismissed": True}
 
     @router.get("/usage")
     async def usage(  # pyright: ignore[reportUnusedFunction]
@@ -1047,6 +1363,40 @@ def _embeddings(context: OperatorContext) -> Embeddings:
     if context.embeddings is None:
         raise HTTPException(status_code=503, detail="embedding service is unavailable")
     return context.embeddings
+
+
+def _pairing(context: OperatorContext) -> PairingRepository:
+    if context.pairing is None:
+        raise HTTPException(status_code=503, detail="pairing store is unavailable")
+    return context.pairing
+
+
+def _skill_view(skill: SkillDocument) -> dict[str, JsonValue]:
+    return {
+        "name": skill.name,
+        "description": skill.description,
+        "trigger": skill.trigger,
+        "content": skill.content,
+        "enabled": skill.enabled,
+    }
+
+
+def _plugin_manifest(context: OperatorContext, plugin_id: str) -> PluginManifest | None:
+    registered = context.broker.manifest(plugin_id)
+    if registered is not None:
+        return registered
+    if context.plugin_control is None:
+        return None
+    from mybot.plugins.runner import load_plugin_entrypoint
+
+    for source in context.plugin_control.sources(context.settings.plugin_config):
+        try:
+            plugin = load_plugin_entrypoint(source.entrypoint, source.python_path)
+        except Exception:
+            continue
+        if plugin.manifest.id == plugin_id:
+            return plugin.manifest
+    return None
 
 
 async def _flush_knowledge_outbox(
