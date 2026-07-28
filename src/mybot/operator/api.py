@@ -11,6 +11,14 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from mybot.contracts import (
+    AgentProfile,
+    MemoryItem,
+    MemoryPrivacy,
+    MemoryScope,
+    ProfileMemoryPolicy,
+    ReplyWillingnessPolicy,
+)
 from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError
 from mybot.infrastructure.model_routing import (
     MODEL_CHANNELS_KEY,
@@ -23,7 +31,10 @@ from mybot.infrastructure.model_routing import (
 )
 from mybot.plugins.broker import PluginBroker
 from mybot.repositories.audit import AuditRepository
+from mybot.repositories.memory import MemoryRepository
 from mybot.repositories.operator_views import OperatorViews
+from mybot.repositories.participation import WillingnessAuditRepository
+from mybot.repositories.profiles import ProfileRepository, ResolvedProfile
 from mybot.repositories.system_kv import SystemKvRepository
 from mybot.services.proactive import OPTIN_KEY
 from mybot.settings import Settings
@@ -76,6 +87,55 @@ class CoreBlockUpdate(BaseModel):
     token_budget: int = Field(default=400, ge=50, le=20_000)
 
 
+class ProfileCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str = ""
+    system_prompt: str
+    model_tier: str = "default"
+    tool_capabilities: list[str] = Field(default_factory=list)
+    memory: ProfileMemoryPolicy = Field(default_factory=ProfileMemoryPolicy)
+    willingness: ReplyWillingnessPolicy = Field(default_factory=ReplyWillingnessPolicy)
+
+
+class ProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str = ""
+    model_tier: str = "default"
+    tool_capabilities: list[str] = Field(default_factory=list)
+    memory: ProfileMemoryPolicy = Field(default_factory=ProfileMemoryPolicy)
+    willingness: ReplyWillingnessPolicy = Field(default_factory=ReplyWillingnessPolicy)
+
+
+class PersonaVersionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system_prompt: str
+    change_note: str = ""
+
+
+class PersonaRollback(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_version_id: UUID
+
+
+class ProfileBindingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: UUID | None = None
+
+
+class RelationshipUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    impression: str
+    familiarity: float = Field(ge=0.0, le=100.0)
+
+
 class SandboxPublisher(Protocol):
     async def publish(self, payload: str) -> str: ...
 
@@ -91,6 +151,9 @@ class OperatorContext:
     model_client: httpx.AsyncClient
     model_attempts: ModelAttemptSink
     sandbox: SandboxPublisher | None = None
+    profiles: ProfileRepository | None = None
+    memory: MemoryRepository | None = None
+    willingness: WillingnessAuditRepository | None = None
 
 
 def create_operator_router(context: OperatorContext) -> APIRouter:
@@ -432,10 +495,232 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
                 f"{settings.outbound_stream}:dead"
             ),
         }
+        participation = (
+            await context.willingness.metrics(hours=24)
+            if context.willingness is not None
+            else {"allowed": 0, "blocked": 0}
+        )
         return {
             "turns": cast(JsonValue, await context.views.turn_metrics()),
             "queues": cast(JsonValue, queues),
+            "willingness": cast(JsonValue, participation),
         }
+
+    @router.get("/profiles")
+    async def profiles() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        repository = _profiles(context)
+        rows = await repository.list_all()
+        if not rows:
+            rows = (
+                await repository.ensure_default(
+                    system_prompt=context.settings.agent_system_prompt,
+                    tool_capabilities=context.settings.granted_capabilities(),
+                ),
+            )
+        bindings = await repository.bindings()
+        return {
+            "profiles": cast(JsonValue, [_profile_json(row) for row in rows]),
+            "bindings": cast(
+                JsonValue,
+                [
+                    {"conversation_id": str(conversation_id), "profile_id": str(profile_id)}
+                    for conversation_id, profile_id in bindings
+                ],
+            ),
+        }
+
+    @router.post("/profiles")
+    async def create_profile(  # pyright: ignore[reportUnusedFunction]
+        update: ProfileCreate,
+    ) -> dict[str, JsonValue]:
+        repository = _profiles(context)
+        name = update.name.strip()
+        prompt = update.system_prompt.strip()
+        if not name or not prompt:
+            raise HTTPException(status_code=422, detail="name and system_prompt are required")
+        try:
+            created = await repository.create(
+                AgentProfile(
+                    name=name,
+                    description=update.description.strip(),
+                    model_tier=update.model_tier.strip() or "default",
+                    tool_capabilities=tuple(
+                        dict.fromkeys(
+                            capability.strip()
+                            for capability in update.tool_capabilities
+                            if capability.strip()
+                        )
+                    ),
+                    memory=update.memory,
+                    willingness=update.willingness,
+                ),
+                system_prompt=prompt,
+                change_note="created in operator console",
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        await context.audit.record("profile.create", {"profile_id": str(created.profile.id)})
+        return {"profile": cast(JsonValue, _profile_json(created))}
+
+    @router.put("/profiles/{profile_id}")
+    async def update_profile(  # pyright: ignore[reportUnusedFunction]
+        profile_id: UUID, update: ProfileUpdate
+    ) -> dict[str, JsonValue]:
+        repository = _profiles(context)
+        current = await repository.get(profile_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="profile not found")
+        try:
+            saved = await repository.update(
+                AgentProfile(
+                    id=profile_id,
+                    name=update.name.strip(),
+                    description=update.description.strip(),
+                    active_persona_version_id=current.persona.id,
+                    model_tier=update.model_tier.strip() or "default",
+                    tool_capabilities=tuple(
+                        dict.fromkeys(
+                            capability.strip()
+                            for capability in update.tool_capabilities
+                            if capability.strip()
+                        )
+                    ),
+                    memory=update.memory,
+                    willingness=update.willingness,
+                )
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        await context.audit.record("profile.update", {"profile_id": str(profile_id)})
+        return {"profile": cast(JsonValue, _profile_json(saved))}
+
+    @router.delete("/profiles/{profile_id}")
+    async def delete_profile(  # pyright: ignore[reportUnusedFunction]
+        profile_id: UUID,
+    ) -> dict[str, JsonValue]:
+        try:
+            deleted = await _profiles(context).delete(profile_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if not deleted:
+            raise HTTPException(status_code=404, detail="profile not found")
+        await context.audit.record("profile.delete", {"profile_id": str(profile_id)})
+        return {"deleted": True}
+
+    @router.get("/profiles/{profile_id}/personas")
+    async def persona_versions(  # pyright: ignore[reportUnusedFunction]
+        profile_id: UUID,
+    ) -> dict[str, JsonValue]:
+        versions = await _profiles(context).persona_versions(profile_id)
+        return {
+            "versions": cast(
+                JsonValue,
+                [version.model_dump(mode="json") for version in versions],
+            )
+        }
+
+    @router.post("/profiles/{profile_id}/personas")
+    async def create_persona_version(  # pyright: ignore[reportUnusedFunction]
+        profile_id: UUID, update: PersonaVersionCreate
+    ) -> dict[str, JsonValue]:
+        try:
+            version = await _profiles(context).create_persona_version(
+                profile_id,
+                system_prompt=update.system_prompt,
+                change_note=update.change_note,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        await context.audit.record(
+            "persona.version.create",
+            {"profile_id": str(profile_id), "persona_version_id": str(version.id)},
+        )
+        return {"version": cast(JsonValue, version.model_dump(mode="json"))}
+
+    @router.post("/profiles/{profile_id}/personas/rollback")
+    async def rollback_persona(  # pyright: ignore[reportUnusedFunction]
+        profile_id: UUID, update: PersonaRollback
+    ) -> dict[str, JsonValue]:
+        try:
+            version = await _profiles(context).rollback_persona(
+                profile_id, target_version_id=update.target_version_id
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        await context.audit.record(
+            "persona.version.rollback",
+            {
+                "profile_id": str(profile_id),
+                "target_version_id": str(update.target_version_id),
+                "new_version_id": str(version.id),
+            },
+        )
+        return {"version": cast(JsonValue, version.model_dump(mode="json"))}
+
+    @router.put("/conversations/{conversation_id}/profile")
+    async def bind_profile(  # pyright: ignore[reportUnusedFunction]
+        conversation_id: UUID, update: ProfileBindingUpdate
+    ) -> dict[str, JsonValue]:
+        repository = _profiles(context)
+        if update.profile_id is None:
+            await repository.unbind(conversation_id)
+        else:
+            if await repository.get(update.profile_id) is None:
+                raise HTTPException(status_code=404, detail="profile not found")
+            await repository.bind(conversation_id, update.profile_id)
+        await context.audit.record(
+            "profile.bind",
+            {
+                "conversation_id": str(conversation_id),
+                "profile_id": str(update.profile_id) if update.profile_id else None,
+            },
+        )
+        return {"saved": True}
+
+    @router.get("/relationships")
+    async def relationships(  # pyright: ignore[reportUnusedFunction]
+        limit: int = 200,
+    ) -> dict[str, JsonValue]:
+        return {
+            "relationships": cast(
+                JsonValue, await context.views.relationships(limit=_bound(limit))
+            )
+        }
+
+    @router.put("/relationships/{subject_identity_id}")
+    async def update_relationship(  # pyright: ignore[reportUnusedFunction]
+        subject_identity_id: str, update: RelationshipUpdate
+    ) -> dict[str, JsonValue]:
+        if context.memory is None:
+            raise HTTPException(status_code=503, detail="relationship store is unavailable")
+        subject = subject_identity_id.strip()
+        impression = update.impression.strip()
+        if not subject or not impression:
+            raise HTTPException(status_code=422, detail="subject and impression are required")
+        item = MemoryItem(
+            scope=MemoryScope.SUBJECT,
+            subject_identity_id=subject,
+            kind="RELATIONSHIP",
+            content=impression,
+            source_message_ids=(f"operator:{uuid4()}",),
+            confidence=1.0,
+            relationship_score=update.familiarity,
+            privacy=MemoryPrivacy.PRIVATE,
+        )
+        applied = await context.memory.upsert_relationship(
+            item,
+            source="operator_relationship_edit",
+            now=datetime.now(tz=UTC),
+        )
+        await context.audit.record(
+            "relationship.update",
+            {
+                "subject_identity_id": subject,
+                "memory_id": str(applied.memory_id),
+                "familiarity": update.familiarity,
+            },
+        )
+        return {"saved": True, "memory_id": str(applied.memory_id)}
 
     @router.get("/config/persona")
     async def get_persona() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
@@ -505,6 +790,21 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
 
 def _bound(limit: int) -> int:
     return max(1, min(limit, 500))
+
+
+def _profiles(context: OperatorContext) -> ProfileRepository:
+    if context.profiles is None:
+        raise HTTPException(status_code=503, detail="profile store is unavailable")
+    return context.profiles
+
+
+def _profile_json(resolved: ResolvedProfile) -> dict[str, JsonValue]:
+    return {
+        "profile": cast(JsonValue, resolved.profile.model_dump(mode="json")),
+        "persona": cast(JsonValue, resolved.persona.model_dump(mode="json")),
+        "created_at": resolved.created_at.isoformat(),
+        "updated_at": resolved.updated_at.isoformat(),
+    }
 
 
 def _sandbox_session_id(value: str | None) -> str:

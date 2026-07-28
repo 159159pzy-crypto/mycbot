@@ -258,7 +258,8 @@ class OperatorViews:
                         sa.text(
                             f"""
                         SELECT id, scope, subject_identity_id, conversation_stable_key,
-                               kind, content, confidence, privacy, revoked_at,
+                               kind, content, confidence, relationship_score,
+                               privacy, revoked_at,
                                revoked_reason, invalid_at, invalidated_by, supersedes,
                                created_at, last_accessed_at
                         FROM memory_items
@@ -282,6 +283,11 @@ class OperatorViews:
                     "kind": row["kind"],
                     "content": row["content"],
                     "confidence": float(row["confidence"]),
+                    "relationship_score": (
+                        float(row["relationship_score"])
+                        if row["relationship_score"] is not None
+                        else None
+                    ),
                     "privacy": row["privacy"],
                     "revoked_at": _iso(row["revoked_at"]),
                     "revoked_reason": row["revoked_reason"],
@@ -326,7 +332,8 @@ class OperatorViews:
                     sa.text(
                         """
                         SELECT id, scope, subject_identity_id, conversation_stable_key,
-                               kind, content, confidence, privacy, supersedes,
+                               kind, content, confidence, relationship_score,
+                               privacy, supersedes,
                                invalid_at, invalidated_by, revoked_at, revoked_reason,
                                created_at
                         FROM memory_items
@@ -355,6 +362,11 @@ class OperatorViews:
                 "kind": row["kind"],
                 "content": row["content"],
                 "confidence": float(row["confidence"]),
+                "relationship_score": (
+                    float(row["relationship_score"])
+                    if row["relationship_score"] is not None
+                    else None
+                ),
                 "privacy": row["privacy"],
                 "supersedes": cast(JsonValue, row["supersedes"]),
                 "invalid_at": _iso(row["invalid_at"]),
@@ -376,6 +388,42 @@ class OperatorViews:
             }
             for row in rows
             if row["id"] in connected
+        ]
+
+    async def relationships(self, *, limit: int = 200) -> list[dict[str, JsonValue]]:
+        """List active relationship summaries, one current version per subject."""
+
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT DISTINCT ON (subject_identity_id)
+                               id, subject_identity_id, content, confidence,
+                               relationship_score, source_message_ids, created_at
+                        FROM memory_items
+                        WHERE scope = 'SUBJECT'
+                          AND kind = 'RELATIONSHIP'
+                          AND revoked_at IS NULL
+                          AND invalid_at IS NULL
+                        ORDER BY subject_identity_id, created_at DESC, id DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"limit": limit},
+                )
+            ).mappings().all()
+        return [
+            {
+                "id": str(row["id"]),
+                "subject_identity_id": row["subject_identity_id"],
+                "impression": row["content"],
+                "familiarity": float(row["relationship_score"] or 0.0),
+                "confidence": float(row["confidence"]),
+                "source_message_ids": cast(JsonValue, row["source_message_ids"]),
+                "created_at": _iso(row["created_at"]),
+            }
+            for row in rows
         ]
 
     async def memory_operations(

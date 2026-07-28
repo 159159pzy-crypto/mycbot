@@ -16,14 +16,19 @@ from mybot.adapters import InboundEvent, OutboundMessage
 from mybot.adapters.qq.translate import QQ_CAPABILITIES
 from mybot.adapters.telegram.translate import TELEGRAM_CAPABILITIES
 from mybot.contracts import (
+    ChatKind,
     ConversationKey,
     MessageEnvelope,
     Platform,
     PlatformCapabilities,
     ReplyPlan,
+    ReplyWillingnessPolicy,
     TurnAction,
     TurnDecision,
+    TurnTrigger,
+    WillingnessScore,
 )
+from mybot.engine.agent_turns import AgentRuntime
 from mybot.engine.direct_replies import build_direct_reply
 from mybot.engine.turn_policy import decide_turn, extract_command
 from mybot.infrastructure.health import ReadinessResponse, create_readiness_service
@@ -37,6 +42,7 @@ from mybot.repositories.messages import (
     StoredMessage,
     platform_message_id_from_envelope,
 )
+from mybot.repositories.profiles import ResolvedProfile
 from mybot.repositories.traces import TraceStatus
 from mybot.runtime import ProcessMode
 from mybot.settings import Settings
@@ -101,11 +107,40 @@ class AgentEngine(Protocol):
         decision: TurnDecision,
         inbound_message_id: UUID | None,
         capabilities: PlatformCapabilities,
+        runtime: AgentRuntime | None = None,
     ) -> ReplyPlan: ...
 
     async def after_reply(
-        self, *, envelope: MessageEnvelope, stable_key: str, reply_text: str
+        self,
+        *,
+        envelope: MessageEnvelope,
+        stable_key: str,
+        reply_text: str,
+        runtime: AgentRuntime | None = None,
     ) -> None: ...
+
+
+class ProfileSource(Protocol):
+    async def resolve(
+        self,
+        conversation_id: UUID,
+        *,
+        default_system_prompt: str,
+        default_tool_capabilities: tuple[str, ...],
+    ) -> ResolvedProfile: ...
+
+
+class WillingnessEngine(Protocol):
+    async def evaluate(
+        self,
+        *,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
+        message_id: UUID | None,
+        profile_id: UUID | None,
+        persona: str,
+        policy: ReplyWillingnessPolicy,
+    ) -> WillingnessScore: ...
 
 
 class MemoryCommands(Protocol):
@@ -172,6 +207,10 @@ class AgentWorkerService:
     readiness: ReadinessSource
     agent: AgentEngine
     capabilities: Mapping[Platform, PlatformCapabilities]
+    profiles: ProfileSource | None = None
+    willingness: WillingnessEngine | None = None
+    default_system_prompt: str = "You are MyBot."
+    default_tool_capabilities: tuple[str, ...] = ()
     memory: MemoryCommands | None = None
     events: EventSink | None = None
     guards: Guards | None = None
@@ -225,11 +264,31 @@ class AgentWorkerService:
             },
         )
         own_ids = await self.messages.recent_outbound_platform_ids(conversation.id)
+        resolved_profile = await self._resolve_profile(conversation.id)
+        runtime = (
+            AgentRuntime(
+                system_prompt=resolved_profile.persona.system_prompt,
+                granted_capabilities=resolved_profile.profile.tool_capabilities,
+                memory_enabled=resolved_profile.profile.memory.enabled,
+                memory_retrieval_limit=resolved_profile.profile.memory.retrieval_limit,
+                expression_examples=resolved_profile.profile.memory.expression_examples,
+                relationship_enabled=resolved_profile.profile.memory.relationship_enabled,
+            )
+            if resolved_profile is not None
+            else None
+        )
         decision = decide_turn(
             envelope,
             mentions_self=event.mentions_self,
             replies_to_self=event.replies_to_self,
             own_recent_platform_message_ids=own_ids,
+        )
+        decision = await self._apply_willingness(
+            envelope=envelope,
+            conversation_id=conversation.id,
+            message_id=stored.id,
+            decision=decision,
+            profile=resolved_profile,
         )
         logger.info(
             "turn_decided",
@@ -266,10 +325,21 @@ class AgentWorkerService:
         elif is_agent_turn:
             from mybot.infrastructure.model_routing import (
                 reset_model_conversation,
+                reset_model_profile,
                 set_model_conversation,
+                set_model_profile,
             )
 
             model_context = set_model_conversation(str(conversation.id))
+            profile_context = (
+                set_model_profile(
+                    tier=resolved_profile.profile.model_tier,
+                    profile_id=str(resolved_profile.profile.id),
+                    persona_version_id=str(resolved_profile.persona.id),
+                )
+                if resolved_profile is not None
+                else None
+            )
             try:
                 plan = await self.agent.run_turn(
                     conversation_id=conversation.id,
@@ -278,8 +348,11 @@ class AgentWorkerService:
                     decision=decision,
                     inbound_message_id=stored.id,
                     capabilities=capabilities,
+                    runtime=runtime,
                 )
             finally:
+                if profile_context is not None:
+                    reset_model_profile(profile_context)
                 reset_model_conversation(model_context)
         else:
             command = extract_command(envelope)
@@ -325,22 +398,97 @@ class AgentWorkerService:
         if is_agent_turn:
             from mybot.infrastructure.model_routing import (
                 reset_model_conversation,
+                reset_model_profile,
                 set_model_conversation,
+                set_model_profile,
             )
 
             model_context = set_model_conversation(str(conversation.id))
+            profile_context = (
+                set_model_profile(
+                    tier=resolved_profile.profile.model_tier,
+                    profile_id=str(resolved_profile.profile.id),
+                    persona_version_id=str(resolved_profile.persona.id),
+                )
+                if resolved_profile is not None
+                else None
+            )
             try:
                 await self.agent.after_reply(
                     envelope=envelope,
                     stable_key=key.stable_key,
                     reply_text="\n\n".join(plan.text_segments),
+                    runtime=runtime,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("after_reply_hook_failed", envelope_id=envelope.id)
             finally:
+                if profile_context is not None:
+                    reset_model_profile(profile_context)
                 reset_model_conversation(model_context)
+
+    async def _resolve_profile(self, conversation_id: UUID) -> ResolvedProfile | None:
+        if self.profiles is None:
+            return None
+        try:
+            return await self.profiles.resolve(
+                conversation_id,
+                default_system_prompt=self.default_system_prompt,
+                default_tool_capabilities=self.default_tool_capabilities,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("profile_resolution_failed", conversation_id=str(conversation_id))
+            return None
+
+    async def _apply_willingness(
+        self,
+        *,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
+        message_id: UUID | None,
+        decision: TurnDecision,
+        profile: ResolvedProfile | None,
+    ) -> TurnDecision:
+        if (
+            decision.action is not TurnAction.IGNORE
+            or envelope.chat_kind is ChatKind.DIRECT
+            or envelope.ephemeral
+            or profile is None
+            or not profile.profile.willingness.enabled
+            or self.willingness is None
+        ):
+            return decision
+        try:
+            score = await self.willingness.evaluate(
+                envelope=envelope,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                profile_id=profile.profile.id,
+                persona=profile.persona.system_prompt,
+                policy=profile.profile.willingness,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("reply_willingness_failed", conversation_id=str(conversation_id))
+            return decision
+        if not score.allowed:
+            return TurnDecision(
+                action=TurnAction.IGNORE,
+                reason=f"willingness blocked: {score.score:.4f} < {score.threshold:.4f}",
+                confidence=1.0 - score.score,
+                trigger=TurnTrigger.POLICY,
+            )
+        return TurnDecision(
+            action=TurnAction.AGENT,
+            reason=f"willingness allowed: {score.reason} ({score.score:.4f})",
+            confidence=score.score,
+            trigger=TurnTrigger.POLICY,
+        )
 
     async def _guard_refusal(
         self,
@@ -536,6 +684,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.engine.agent_turns import AgentTurnEngine
     from mybot.engine.memory_service import MemoryService
     from mybot.engine.vision import VisionMode, VisionService
+    from mybot.engine.willingness import ReplyWillingnessScorer
     from mybot.infrastructure.budget import TokenBudget
     from mybot.infrastructure.database import create_database_engine, create_session_factory
     from mybot.infrastructure.model_routing import (
@@ -550,6 +699,8 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.messages import MessageRepository
+    from mybot.repositories.participation import WillingnessAuditRepository
+    from mybot.repositories.profiles import ProfileRepository
     from mybot.repositories.system_kv import SystemKvRepository
     from mybot.repositories.tool_invocations import ToolInvocationRepository
     from mybot.repositories.traces import TraceSpanRepository
@@ -578,6 +729,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         claim_min_idle_ms=settings.stream_claim_min_idle_ms,
     )
     config = SystemKvRepository(sessions)
+    profiles = ProfileRepository(sessions, legacy_persona=config)
     def secret_lookup(name: str) -> str | None:
         return settings.model_secret(name)
 
@@ -736,6 +888,18 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         readiness=create_readiness_service(settings),
         agent=agent,
         capabilities=DEFAULT_CAPABILITIES,
+        profiles=profiles,
+        willingness=(
+            ReplyWillingnessScorer(
+                activity=messages,
+                semantic=memory,
+                audit=WillingnessAuditRepository(sessions),
+            )
+            if memory is not None
+            else None
+        ),
+        default_system_prompt=settings.agent_system_prompt,
+        default_tool_capabilities=settings.granted_capabilities(),
         memory=memory,
         events=events,
         guards=TurnGuards(

@@ -9,8 +9,9 @@ host-run roles.
 ## 1. What must survive
 
 PostgreSQL is the only backup-critical store. It holds conversations,
-messages, turns, memory items, tool invocations, plugin/tool approvals,
-persona and proactive configuration (`system_kv`), and the operator audit
+messages, turns, memory items, profiles, immutable persona versions, bindings,
+willingness/heartbeat audit, tool invocations, plugin/tool approvals,
+proactive configuration (`system_kv`), and the operator audit
 trail. Redis holds transient coordination state — stream entries in
 flight, dedupe keys, rate/budget counters, cooldown and frequency locks —
 all of which the pipeline rebuilds or ages out (losing Redis can, at
@@ -161,6 +162,14 @@ candidates), and remember that switching `MYBOT_EMBEDDING_MODEL` starts
 retrieval fresh — old vectors are never compared across models and age
 out via decay rather than needing manual deletion.
 
+Expression and relationship learning is controlled by
+`MYBOT_PERSONALITY_LEARNING_*` and is off by default. If a group style looks
+wrong, disable the global learning switch first, revoke the affected
+`EXPRESSION` rows, and inspect their source message IDs. Expression recall is
+always keyed by the exact conversation stable key. Relationship edits create a
+new SUBJECT memory version; `/forget` remains authoritative and must not be
+worked around by inserting a replacement manually.
+
 ## 7. Proactive messaging controls
 
 Three nested controls, all of which must agree before the bot ever
@@ -177,12 +186,14 @@ speaks unprompted:
    `MYBOT_PROACTIVE_MIN_INTERVAL_HOURS` caps frequency per conversation
    via a Redis lock (`mybot:proactive:<stable-key>`).
 
-Every proactive send is recorded as a `PROACTIVE`-triggered turn and an
-outbound message, so the Conversations panel shows exactly what was sent
-where. If proactive messages misfire, the order of response is: remove
+Every heartbeat generation is recorded in `proactive_generation_audit` as
+`sent`, `suppressed`, or `error`; `HEARTBEAT_OK` is the expected suppressed
+response. Actual sends also create a `PROACTIVE` turn and outbound message. If
+proactive messages misfire, the order of response is: remove
 the conversation from the opt-in list (surgical), or set
 `MYBOT_PROACTIVE_ENABLED=false` (global), then read the recorded turns to
-understand what happened. To make one conversation eligible again sooner
+understand what happened, including the profile/persona version and recent
+topic used. To make one conversation eligible again sooner
 than its frequency cap allows, delete its `mybot:proactive:<stable-key>`
 Redis key.
 

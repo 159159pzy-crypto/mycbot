@@ -254,3 +254,22 @@ def test_memory_v2_settings_reach_the_correct_workers() -> None:
     assert "MYBOT_LLM_BASE_URL:" in maintenance
     assert "MYBOT_EMBEDDING_BASE_URL:" in maintenance
     assert "memory.write" in environment
+
+
+def test_group_personality_and_heartbeat_settings_reach_maintenance() -> None:
+    compose = source("compose.yaml")
+    environment = source(".env.example")
+    maintenance = indented_block(compose, "  maintenance-worker:")
+
+    for name in (
+        "MYBOT_PERSONALITY_LEARNING_ENABLED",
+        "MYBOT_PERSONALITY_LEARNING_LOOKBACK_HOURS",
+        "MYBOT_PERSONALITY_LEARNING_CONVERSATION_LIMIT",
+        "MYBOT_PERSONALITY_LEARNING_MESSAGE_LIMIT",
+        "MYBOT_PERSONALITY_LEARNING_TOKEN_BUDGET",
+        "MYBOT_PERSONALITY_LEARNING_MIN_CONFIDENCE",
+        "MYBOT_PERSONALITY_LEARNING_DEDUPE_TTL_SECONDS",
+        "MYBOT_PROACTIVE_CONTEXT_MESSAGES",
+    ):
+        assert f"{name}:" in maintenance
+        assert f"{name}=" in environment

@@ -142,6 +142,10 @@ def test_memory_settings_default_bounded_and_blank_embedding_endpoint_is_none(
     assert settings.memory_consolidation_enabled is True
     assert settings.memory_consolidation_interval_seconds >= 3_600
     assert settings.memory_consolidation_token_budget <= 32_000
+    assert settings.personality_learning_enabled is False
+    assert settings.personality_learning_message_limit >= 3
+    assert settings.personality_learning_token_budget <= 32_000
+    assert settings.proactive_context_messages >= 1
 
     monkeypatch.setenv("MYBOT_EMBEDDING_BASE_URL", "   ")
     monkeypatch.setenv("MYBOT_EMBEDDING_API_KEY", "")

@@ -243,3 +243,36 @@ def test_memory_v2_migration_chains_and_preserves_shared_extensions() -> None:
         ("drop_column", "memory_items.invalid_at"),
     ]
     assert all("DROP EXTENSION" not in call[1] for call in operations.calls)
+
+
+def test_group_personality_migration_chains_and_downgrades_cleanly() -> None:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260728_0010_group_personality.py"
+    )
+    namespace = runpy.run_path(str(migration_path))
+    assert namespace["revision"] == "20260728_0010"
+    assert namespace["down_revision"] == "20260728_0009"
+
+    downgrade = namespace["downgrade"]
+    operations = RecordingOperations()
+    downgrade.__globals__["op"] = operations
+    downgrade()
+
+    assert operations.calls == [
+        ("drop_index", "ix_proactive_generation_audit_conversation_created"),
+        ("drop_table", "proactive_generation_audit"),
+        ("drop_index", "ix_reply_willingness_audit_conversation_created"),
+        ("drop_table", "reply_willingness_audit"),
+        ("drop_table", "conversation_profile_bindings"),
+        ("drop_column", "llm_call_log.persona_version_id"),
+        ("drop_column", "llm_call_log.profile_id"),
+        ("drop_constraint", "agent_profiles.fk_agent_profiles_active_persona_version"),
+        ("drop_index", "ix_persona_versions_profile_version"),
+        ("drop_table", "persona_versions"),
+        ("drop_table", "agent_profiles"),
+        ("drop_constraint", "memory_items.ck_memory_items_relationship_score"),
+        ("drop_column", "memory_items.relationship_score"),
+    ]

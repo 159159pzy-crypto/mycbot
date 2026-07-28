@@ -7,15 +7,20 @@ import pytest
 
 from mybot.adapters import InboundEvent, OutboundMessage
 from mybot.contracts import (
+    AgentProfile,
     ChatKind,
     ConversationKey,
     MessageEnvelope,
+    PersonaVersion,
     Platform,
     PlatformCapabilities,
     ReplyPlan,
     TextSegment,
     TurnDecision,
+    WillingnessComponents,
+    WillingnessScore,
 )
+from mybot.engine.agent_turns import AgentRuntime
 from mybot.infrastructure.health import (
     DependencyHealth,
     DependencyStatus,
@@ -29,6 +34,7 @@ from mybot.infrastructure.streams import (
 )
 from mybot.repositories.conversations import ConversationRecord
 from mybot.repositories.messages import StoredMessage
+from mybot.repositories.profiles import ResolvedProfile
 from mybot.runtime import ProcessMode
 from mybot.services.agent_worker import DEFAULT_CAPABILITIES, AgentWorkerService
 
@@ -94,6 +100,7 @@ class FakeAgentEngine:
     calls: list[str] = field(default_factory=list)
     completed: list[str] = field(default_factory=list)
     after_replies: list[tuple[str, str, str]] = field(default_factory=list)
+    runtimes: list[AgentRuntime | None] = field(default_factory=list)
 
     async def run_turn(
         self,
@@ -104,7 +111,9 @@ class FakeAgentEngine:
         decision: TurnDecision,
         inbound_message_id: UUID | None,
         capabilities: PlatformCapabilities,
+        runtime: AgentRuntime | None = None,
     ) -> ReplyPlan:
+        self.runtimes.append(runtime)
         self.calls.append(envelope.id)
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
@@ -112,9 +121,39 @@ class FakeAgentEngine:
         return ReplyPlan(text_segments=(f"agent-reply:{envelope.id}",))
 
     async def after_reply(
-        self, *, envelope: MessageEnvelope, stable_key: str, reply_text: str
+        self,
+        *,
+        envelope: MessageEnvelope,
+        stable_key: str,
+        reply_text: str,
+        runtime: AgentRuntime | None = None,
     ) -> None:
         self.after_replies.append((envelope.id, stable_key, reply_text))
+
+
+@dataclass
+class FakeProfiles:
+    resolved: ResolvedProfile
+
+    async def resolve(self, conversation_id, **kwargs):  # type: ignore[no-untyped-def]
+        return self.resolved
+
+
+@dataclass
+class FakeWillingness:
+    allowed: bool
+    calls: int = 0
+
+    async def evaluate(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        score = 0.82 if self.allowed else 0.2
+        return WillingnessScore(
+            score=score,
+            threshold=0.7,
+            allowed=self.allowed,
+            reason="test relevance",
+            components=WillingnessComponents(),
+        )
 
 
 @dataclass
@@ -162,6 +201,8 @@ def build_service(
     agent: FakeAgentEngine | None = None,
     memory: FakeMemoryCommands | None = None,
     events: FakeEventSink | None = None,
+    profiles: FakeProfiles | None = None,
+    willingness: FakeWillingness | None = None,
 ) -> tuple[AgentWorkerService, FakeMessages, FakeAgentEngine]:
     conversations = FakeConversations(
         record=ConversationRecord(id=uuid4(), stable_key="v1:qq-main:DIRECT:10001:0")
@@ -190,6 +231,8 @@ def build_service(
         capabilities=DEFAULT_CAPABILITIES,
         memory=memory,
         events=events,
+        profiles=profiles,
+        willingness=willingness,
     )
     return service, messages, engine
 
@@ -217,6 +260,69 @@ async def test_direct_message_flows_through_the_agent_engine() -> None:
     assert outbound[0].chat_id == "10001"
     assert outbound[0].reply_to_platform_message_id == "901"
     assert outbound[0].reply_plan.text_segments == ("agent-reply:qq:qq-main:901",)
+
+
+@pytest.mark.asyncio
+async def test_bound_profile_runtime_is_passed_to_the_agent() -> None:
+    backend = MemoryStreamBackend()
+    profile_id = uuid4()
+    persona = PersonaVersion(
+        profile_id=profile_id,
+        version=1,
+        system_prompt="群聊人设",
+    )
+    resolved = ResolvedProfile(
+        profile=AgentProfile(
+            id=profile_id,
+            name="群聊",
+            active_persona_version_id=persona.id,
+            model_tier="economy",
+            tool_capabilities=("web.search",),
+        ),
+        persona=persona,
+        created_at=datetime(2026, 7, 28, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 28, tzinfo=UTC),
+    )
+    service, _, engine = build_service(backend, profiles=FakeProfiles(resolved))
+
+    await service.handle_payload(InboundEvent(envelope=envelope()).model_dump_json())
+
+    runtime = engine.runtimes[0]
+    assert runtime is not None
+    assert runtime.system_prompt == "群聊人设"
+    assert runtime.granted_capabilities == ("web.search",)
+
+
+@pytest.mark.asyncio
+async def test_profile_willingness_can_admit_an_unmentioned_group_message() -> None:
+    backend = MemoryStreamBackend()
+    profile_id = uuid4()
+    persona = PersonaVersion(profile_id=profile_id, version=1, system_prompt="群聊人设")
+    resolved = ResolvedProfile(
+        profile=AgentProfile(
+            id=profile_id,
+            name="群聊",
+            active_persona_version_id=persona.id,
+            willingness={"enabled": True, "threshold": 0.7},
+        ),
+        persona=persona,
+        created_at=datetime(2026, 7, 28, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 28, tzinfo=UTC),
+    )
+    scorer = FakeWillingness(allowed=True)
+    service, messages, engine = build_service(
+        backend,
+        profiles=FakeProfiles(resolved),
+        willingness=scorer,
+    )
+
+    await service.handle_payload(
+        InboundEvent(envelope=envelope(chat_kind=ChatKind.GROUP)).model_dump_json()
+    )
+
+    assert scorer.calls == 1
+    assert len(engine.calls) == 1
+    assert len(messages.outbound) == 1
 
 
 @pytest.mark.asyncio

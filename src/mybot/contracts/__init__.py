@@ -29,10 +29,20 @@ from mybot.contracts.messages import (
     VoiceSegment,
 )
 from mybot.contracts.plugins import PluginManifest
+from mybot.contracts.profiles import (
+    AgentProfile,
+    PersonaVersion,
+    ProfileMemoryPolicy,
+    RelationshipMemory,
+    ReplyWillingnessPolicy,
+    WillingnessComponents,
+    WillingnessScore,
+)
 from mybot.contracts.replies import Citation, ReplyPlan, TypingProfile
 from mybot.contracts.tools import ToolContext, ToolError, ToolResult, ToolRisk, ToolSpec
 
 __all__ = [
+    "AgentProfile",
     "AtSegment",
     "ChatKind",
     "Citation",
@@ -47,11 +57,15 @@ __all__ = [
     "MemoryPrivacy",
     "MemoryScope",
     "MessageEnvelope",
+    "PersonaVersion",
     "Platform",
     "PlatformCapabilities",
     "PluginManifest",
+    "ProfileMemoryPolicy",
     "ReferenceSegment",
+    "RelationshipMemory",
     "ReplyPlan",
+    "ReplyWillingnessPolicy",
     "StickerSegment",
     "TextSegment",
     "ToolContext",
@@ -64,4 +78,6 @@ __all__ = [
     "TurnTrigger",
     "TypingProfile",
     "VoiceSegment",
+    "WillingnessComponents",
+    "WillingnessScore",
 ]

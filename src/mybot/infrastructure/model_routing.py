@@ -27,6 +27,11 @@ _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _conversation_context: ContextVar[str | None] = ContextVar(
     "mybot_model_conversation_id", default=None
 )
+_tier_context: ContextVar[str] = ContextVar("mybot_model_tier", default="default")
+_profile_context: ContextVar[str | None] = ContextVar("mybot_model_profile_id", default=None)
+_persona_version_context: ContextVar[str | None] = ContextVar(
+    "mybot_model_persona_version_id", default=None
+)
 
 
 class ModelPurpose(StrEnum):
@@ -48,6 +53,7 @@ class ModelChannel(FrozenModel):
     api_key_env: NonEmptyStr | None = None
     priority: int = Field(default=0, ge=0, le=10_000)
     weight: int = Field(default=1, ge=1, le=1_000)
+    tier: NonEmptyStr = "default"
     enabled: bool = True
     model_map: Mapping[ModelPurpose, ModelTarget]
 
@@ -81,6 +87,8 @@ class ModelCallAttempt:
     completion_tokens: int = 0
     latency_ms: int = 0
     conversation_id: str | None = None
+    profile_id: str | None = None
+    persona_version_id: str | None = None
     input_price_per_million: Decimal | None = None
     output_price_per_million: Decimal | None = None
     cost_usd_micros: int | None = None
@@ -172,8 +180,11 @@ class ModelRouter:
         *,
         tools: Sequence[dict[str, object]] | None = None,
         conversation_id: str | None = None,
+        tier: str = "default",
+        profile_id: str | None = None,
+        persona_version_id: str | None = None,
     ) -> LlmReply:
-        candidates = await self._candidates(purpose)
+        candidates = await self._candidates(purpose, tier=tier)
         last_error: LlmError | None = None
         for channel in candidates:
             target = channel.model_map[purpose]
@@ -183,12 +194,30 @@ class ModelRouter:
                 reply = await client.complete(messages, tools=tools)
             except LlmError as error:
                 last_error = error
-                await self._record_error(channel, purpose, target, error, started, conversation_id)
+                await self._record_error(
+                    channel,
+                    purpose,
+                    target,
+                    error,
+                    started,
+                    conversation_id,
+                    profile_id,
+                    persona_version_id,
+                )
                 if not error.retryable:
                     raise
                 await self.cooldowns.cool(channel.name, purpose, ttl_seconds=self.cooldown_seconds)
                 continue
-            await self._record_success(channel, purpose, target, reply, started, conversation_id)
+            await self._record_success(
+                channel,
+                purpose,
+                target,
+                reply,
+                started,
+                conversation_id,
+                profile_id,
+                persona_version_id,
+            )
             return reply
         if last_error is not None:
             raise last_error
@@ -199,9 +228,12 @@ class ModelRouter:
         texts: Sequence[str],
         *,
         conversation_id: str | None = None,
+        tier: str = "default",
+        profile_id: str | None = None,
+        persona_version_id: str | None = None,
     ) -> list[list[float]]:
         purpose = ModelPurpose.EMBEDDING
-        candidates = await self._candidates(purpose)
+        candidates = await self._candidates(purpose, tier=tier)
         last_error: EmbeddingError | None = None
         for channel in candidates:
             target = channel.model_map[purpose]
@@ -210,7 +242,15 @@ class ModelRouter:
                 vectors = await self._client(channel, purpose).embed(texts)
             except EmbeddingError as error:
                 last_error = error
-                await self._record_embedding_error(channel, target, error, started, conversation_id)
+                await self._record_embedding_error(
+                    channel,
+                    target,
+                    error,
+                    started,
+                    conversation_id,
+                    profile_id,
+                    persona_version_id,
+                )
                 if not error.retryable:
                     raise
                 await self.cooldowns.cool(channel.name, purpose, ttl_seconds=self.cooldown_seconds)
@@ -225,6 +265,8 @@ class ModelRouter:
                     prompt_tokens=input_tokens,
                     latency_ms=_latency_ms(started, self.clock()),
                     conversation_id=conversation_id,
+                    profile_id=profile_id,
+                    persona_version_id=persona_version_id,
                     input_price_per_million=target.input_price_per_million,
                     output_price_per_million=target.output_price_per_million,
                     cost_usd_micros=calculate_cost_micros(target, input_tokens, 0),
@@ -259,12 +301,21 @@ class ModelRouter:
         self._cache_expires_at = now + self.cache_ttl_seconds
         return channels
 
-    async def _candidates(self, purpose: ModelPurpose) -> tuple[ModelChannel, ...]:
+    async def _candidates(
+        self, purpose: ModelPurpose, *, tier: str = "default"
+    ) -> tuple[ModelChannel, ...]:
         channels = [
             channel
             for channel in await self._channels()
             if channel.enabled and purpose in channel.model_map
         ]
+        matching = [channel for channel in channels if channel.tier == tier]
+        if matching:
+            channels = matching
+        elif tier != "default":
+            defaults = [channel for channel in channels if channel.tier == "default"]
+            if defaults:
+                channels = defaults
         ordered: list[ModelChannel] = []
         for priority in sorted({channel.priority for channel in channels}):
             group = sorted(
@@ -300,6 +351,8 @@ class ModelRouter:
         reply: LlmReply,
         started: float,
         conversation_id: str | None,
+        profile_id: str | None,
+        persona_version_id: str | None,
     ) -> None:
         await self.attempts.record(
             ModelCallAttempt(
@@ -311,6 +364,8 @@ class ModelRouter:
                 completion_tokens=reply.completion_tokens,
                 latency_ms=_latency_ms(started, self.clock()),
                 conversation_id=conversation_id,
+                profile_id=profile_id,
+                persona_version_id=persona_version_id,
                 input_price_per_million=target.input_price_per_million,
                 output_price_per_million=target.output_price_per_million,
                 cost_usd_micros=calculate_cost_micros(
@@ -327,6 +382,8 @@ class ModelRouter:
         error: LlmError,
         started: float,
         conversation_id: str | None,
+        profile_id: str | None,
+        persona_version_id: str | None,
     ) -> None:
         await self.attempts.record(
             ModelCallAttempt(
@@ -336,6 +393,8 @@ class ModelRouter:
                 status="retryable_error" if error.retryable else "permanent_error",
                 latency_ms=_latency_ms(started, self.clock()),
                 conversation_id=conversation_id,
+                profile_id=profile_id,
+                persona_version_id=persona_version_id,
                 input_price_per_million=target.input_price_per_million,
                 output_price_per_million=target.output_price_per_million,
                 error_code=type(error).__name__,
@@ -349,6 +408,8 @@ class ModelRouter:
         error: EmbeddingError,
         started: float,
         conversation_id: str | None,
+        profile_id: str | None,
+        persona_version_id: str | None,
     ) -> None:
         await self.attempts.record(
             ModelCallAttempt(
@@ -358,6 +419,8 @@ class ModelRouter:
                 status="retryable_error" if error.retryable else "permanent_error",
                 latency_ms=_latency_ms(started, self.clock()),
                 conversation_id=conversation_id,
+                profile_id=profile_id,
+                persona_version_id=persona_version_id,
                 input_price_per_million=target.input_price_per_million,
                 output_price_per_million=target.output_price_per_million,
                 error_code=type(error).__name__,
@@ -381,6 +444,9 @@ class RoutedLlmClient:
             messages,
             tools=tools,
             conversation_id=_conversation_context.get(),
+            tier=_tier_context.get(),
+            profile_id=_profile_context.get(),
+            persona_version_id=_persona_version_context.get(),
         )
 
 
@@ -389,7 +455,13 @@ class RoutedEmbeddingClient:
     router: ModelRouter
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return await self.router.embed(texts, conversation_id=_conversation_context.get())
+        return await self.router.embed(
+            texts,
+            conversation_id=_conversation_context.get(),
+            tier=_tier_context.get(),
+            profile_id=_profile_context.get(),
+            persona_version_id=_persona_version_context.get(),
+        )
 
 
 @dataclass(slots=True)
@@ -450,6 +522,26 @@ def set_model_conversation(conversation_id: str) -> Token[str | None]:
 
 def reset_model_conversation(token: Token[str | None]) -> None:
     _conversation_context.reset(token)
+
+
+type ModelProfileToken = tuple[Token[str], Token[str | None], Token[str | None]]
+
+
+def set_model_profile(
+    *, tier: str, profile_id: str | None, persona_version_id: str | None
+) -> ModelProfileToken:
+    return (
+        _tier_context.set(tier),
+        _profile_context.set(profile_id),
+        _persona_version_context.set(persona_version_id),
+    )
+
+
+def reset_model_profile(token: ModelProfileToken) -> None:
+    tier_token, profile_token, persona_token = token
+    _persona_version_context.reset(persona_token)
+    _profile_context.reset(profile_token)
+    _tier_context.reset(tier_token)
 
 
 def legacy_model_channels(settings: Settings) -> tuple[ModelChannel, ...]:

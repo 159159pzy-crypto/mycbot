@@ -10,7 +10,8 @@ from pydantic import JsonValue
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mybot.contracts import MessageEnvelope, ReplyPlan
+from mybot.contracts import ChatKind, ConversationKey, MessageEnvelope, ReplyPlan
+from mybot.engine.willingness import ActivitySnapshot
 from mybot.repositories import conversations_table, messages_table
 
 INBOUND = "inbound"
@@ -36,6 +37,14 @@ class MessageText:
     sender: str
     text: str
     id: UUID | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class GroupLearningContext:
+    conversation_id: UUID
+    conversation: ConversationKey
+    source_message_ids: tuple[str, ...]
+    messages: tuple[MessageText, ...]
 
 
 def _text_from_segments(segments: object) -> str:
@@ -107,6 +116,25 @@ class MessageRepository:
         if inserted is None:
             return StoredMessage(id=message_id, duplicate=True)
         return StoredMessage(id=inserted, duplicate=False)
+
+    async def recent_activity(
+        self, conversation_id: UUID, *, since: datetime, limit: int = 200
+    ) -> ActivitySnapshot:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    sa.select(messages_table.c.direction)
+                    .where(
+                        messages_table.c.conversation_id == conversation_id,
+                        messages_table.c.occurred_at >= since,
+                    )
+                    .order_by(messages_table.c.occurred_at.desc())
+                    .limit(limit)
+                )
+            ).all()
+        inbound = sum(1 for row in rows if row.direction == INBOUND)
+        outbound = sum(1 for row in rows if row.direction == OUTBOUND)
+        return ActivitySnapshot(inbound=inbound, outbound=outbound)
 
     async def record_outbound(
         self,
@@ -208,3 +236,79 @@ class MessageRepository:
                 sa.select(messages_table.c.segments).where(messages_table.c.id == message_id)
             )
             return row.scalar_one()
+
+    async def recent_group_learning_contexts(
+        self,
+        *,
+        since: datetime,
+        conversation_limit: int,
+        message_limit: int,
+    ) -> tuple[GroupLearningContext, ...]:
+        """Return bounded inbound group dialogue for expression/relationship learning."""
+
+        async with self.sessions() as session:
+            conversations = (
+                await session.execute(
+                    sa.select(
+                        conversations_table.c.id,
+                        conversations_table.c.connection_id,
+                        conversations_table.c.chat_id,
+                        conversations_table.c.thread_id,
+                    )
+                    .where(
+                        conversations_table.c.chat_kind == ChatKind.GROUP.value,
+                        conversations_table.c.ephemeral.is_(False),
+                        conversations_table.c.last_message_at >= since,
+                    )
+                    .order_by(conversations_table.c.last_message_at.desc())
+                    .limit(conversation_limit)
+                )
+            ).mappings().all()
+            contexts: list[GroupLearningContext] = []
+            for conversation in conversations:
+                rows = (
+                    await session.execute(
+                        sa.select(
+                            messages_table.c.id,
+                            messages_table.c.sender_identity_id,
+                            messages_table.c.segments,
+                        )
+                        .where(
+                            messages_table.c.conversation_id == conversation["id"],
+                            messages_table.c.direction == INBOUND,
+                            messages_table.c.occurred_at >= since,
+                        )
+                        .order_by(messages_table.c.occurred_at.desc())
+                        .limit(message_limit)
+                    )
+                ).mappings().all()
+                extracted: list[MessageText] = []
+                for row in reversed(rows):
+                    message_text = _text_from_segments(row["segments"])
+                    if message_text:
+                        extracted.append(
+                            MessageText(
+                                id=cast(UUID, row["id"]),
+                                direction=INBOUND,
+                                sender=str(row["sender_identity_id"]),
+                                text=message_text,
+                            )
+                        )
+                if len(extracted) < 3:
+                    continue
+                contexts.append(
+                    GroupLearningContext(
+                        conversation_id=cast(UUID, conversation["id"]),
+                        conversation=ConversationKey(
+                            connection_id=str(conversation["connection_id"]),
+                            chat_kind=ChatKind.GROUP,
+                            chat_id=str(conversation["chat_id"]),
+                            thread_id=cast(str | None, conversation["thread_id"]),
+                        ),
+                        source_message_ids=tuple(
+                            str(message.id) for message in extracted if message.id is not None
+                        ),
+                        messages=tuple(extracted),
+                    )
+                )
+        return tuple(contexts)

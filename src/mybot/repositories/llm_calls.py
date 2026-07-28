@@ -17,6 +17,12 @@ class LlmCallLogRepository:
         conversation_id = (
             UUID(attempt.conversation_id) if attempt.conversation_id is not None else None
         )
+        profile_id = UUID(attempt.profile_id) if attempt.profile_id is not None else None
+        persona_version_id = (
+            UUID(attempt.persona_version_id)
+            if attempt.persona_version_id is not None
+            else None
+        )
         async with self.sessions() as session:
             await session.execute(
                 llm_call_log_table.insert().values(
@@ -33,6 +39,8 @@ class LlmCallLogRepository:
                     output_price_per_million=attempt.output_price_per_million,
                     cost_usd_micros=attempt.cost_usd_micros,
                     error_code=attempt.error_code,
+                    profile_id=profile_id,
+                    persona_version_id=persona_version_id,
                 )
             )
             await session.commit()

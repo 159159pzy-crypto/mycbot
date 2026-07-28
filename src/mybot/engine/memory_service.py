@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -108,6 +109,14 @@ class MemoryStore(Protocol):
         reason: str = "user_forget",
     ) -> int: ...
 
+    async def active_expressions(
+        self, conversation_stable_key: str, *, now: datetime, limit: int = 3
+    ) -> tuple[MemoryRecord, ...]: ...
+
+    async def relationship_for(
+        self, subject_identity_id: str, *, now: datetime
+    ) -> MemoryRecord | None: ...
+
 
 class Embeddings(Protocol):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
@@ -134,6 +143,21 @@ class ExtractionLlm(Protocol):
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 @dataclass(slots=True, frozen=True)
@@ -178,6 +202,76 @@ class MemoryService:
         return "Core memory (durable, operator-visible context):\n\n" + "\n\n".join(
             sections
         )
+
+    async def participation_relevance(
+        self, envelope: MessageEnvelope, text: str, persona: str
+    ) -> tuple[float, float]:
+        """Return persona and visible-memory relevance for willingness scoring."""
+
+        vectors = await self.embeddings.embed([text, persona])
+        persona_score = _cosine_similarity(vectors[0], vectors[1])
+        memories = await self.store.search(
+            query_embedding=vectors[0],
+            query_text=text,
+            embedding_model=self.embedding_model,
+            subject_identity_id=envelope.sender_identity_id,
+            conversation_stable_key=_conversation_key(envelope).stable_key,
+            include_private=envelope.chat_kind is ChatKind.DIRECT,
+            now=self.now(),
+            limit=min(3, self.retrieval_limit),
+        )
+        memory_score = max(
+            (
+                1.0 - memory.distance
+                if memory.distance is not None
+                else min(1.0, memory.rrf_score * 30)
+            )
+            for memory in memories
+        ) if memories else 0.0
+        return _clamp_score(persona_score), _clamp_score(memory_score)
+
+    async def personality_block(
+        self,
+        envelope: MessageEnvelope,
+        *,
+        expression_examples: int,
+        relationship_enabled: bool,
+    ) -> str | None:
+        """Render relationship and same-conversation style without widening privacy."""
+
+        if envelope.ephemeral:
+            return None
+        now = self.now()
+        relationship = (
+            await self.store.relationship_for(envelope.sender_identity_id, now=now)
+            if relationship_enabled
+            else None
+        )
+        expressions = (
+            await self.store.active_expressions(
+                _conversation_key(envelope).stable_key,
+                now=now,
+                limit=expression_examples,
+            )
+            if envelope.chat_kind is ChatKind.GROUP and expression_examples > 0
+            else ()
+        )
+        sections: list[str] = []
+        if relationship is not None:
+            score = relationship.relationship_score or 0.0
+            sections.append(
+                "Your relationship with the current sender "
+                f"(familiarity {score:.1f}/100): {relationship.content} "
+                "Let this affect warmth and form of address, but never reveal the stored note."
+            )
+        if expressions:
+            examples = "\n".join(f"- {item.content}" for item in expressions)
+            sections.append(
+                "Local expression examples from this conversation only. "
+                "Borrow the rhythm lightly; do not quote or impersonate anyone:\n"
+                + examples
+            )
+        return "\n\n".join(sections) or None
 
     async def flush_history(
         self, envelope: MessageEnvelope, history: Sequence[HistoryEntry]
@@ -249,7 +343,13 @@ class MemoryService:
                 stored += 1
         return ExtractionOutcome(stored, prompt_tokens, completion_tokens)
 
-    async def retrieval_block(self, envelope: MessageEnvelope, inbound_text: str) -> str | None:
+    async def retrieval_block(
+        self,
+        envelope: MessageEnvelope,
+        inbound_text: str,
+        *,
+        limit: int | None = None,
+    ) -> str | None:
         """Render relevant memories, or None; privacy is enforced here in code."""
 
         if envelope.ephemeral:
@@ -271,7 +371,7 @@ class MemoryService:
             conversation_stable_key=_conversation_key(envelope).stable_key,
             include_private=include_private,
             now=self.now(),
-            limit=self.retrieval_limit,
+            limit=limit or self.retrieval_limit,
         )
         if not memories:
             return None

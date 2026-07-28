@@ -57,6 +57,9 @@ class FakeStore:
     merges: list[tuple[MemoryItem, MemoryMergeDecision, dict[str, object]]] = field(
         default_factory=list
     )
+    expressions: tuple[MemoryRecord, ...] = ()
+    relationship: MemoryRecord | None = None
+    expression_calls: list[tuple[str, int]] = field(default_factory=list)
 
     async def store(self, item, *, embedding, embedding_model):  # type: ignore[no-untyped-def]
         self.stored.append((item, list(embedding) if embedding else None, embedding_model))
@@ -100,6 +103,13 @@ class FakeStore:
     async def revoke_for(self, **kwargs):  # type: ignore[no-untyped-def]
         self.revoked.append(kwargs)
         return 4
+
+    async def active_expressions(self, conversation_stable_key, *, now, limit):  # type: ignore[no-untyped-def]
+        self.expression_calls.append((conversation_stable_key, limit))
+        return self.expressions[:limit]
+
+    async def relationship_for(self, subject_identity_id, *, now):  # type: ignore[no-untyped-def]
+        return self.relationship
 
 
 @dataclass
@@ -197,6 +207,58 @@ def existing(content: str = "喜欢咖啡") -> MemoryRecord:
         source_message_ids=("old-message",),
         created_at=NOW,
     )
+
+
+@pytest.mark.asyncio
+async def test_personality_block_uses_only_current_group_expressions_and_sender_relation() -> None:
+    group = envelope().model_copy(
+        update={"chat_kind": ChatKind.GROUP, "chat_id": "7788"}
+    )
+    stable_key = "v1:telegram-main:GROUP:7788:0"
+    expression = MemoryRecord(
+        id=uuid4(),
+        scope=MemoryScope.CONVERSATION,
+        subject_identity_id=None,
+        conversation_stable_key=stable_key,
+        privacy=MemoryPrivacy.SHARED,
+        kind="EXPRESSION",
+        content="短句, 轻松收尾",
+        confidence=0.9,
+        source_message_ids=("m1",),
+        created_at=NOW,
+    )
+    relationship = MemoryRecord(
+        id=uuid4(),
+        scope=MemoryScope.SUBJECT,
+        subject_identity_id="telegram:777",
+        conversation_stable_key=None,
+        privacy=MemoryPrivacy.PRIVATE,
+        kind="RELATIONSHIP",
+        content="交流直接, 适合少寒暄",
+        confidence=0.9,
+        source_message_ids=("m2",),
+        created_at=NOW,
+        relationship_score=32.5,
+    )
+    store = FakeStore(expressions=(expression,), relationship=relationship)
+    service = MemoryService(
+        embeddings=FakeEmbeddings(),
+        store=store,
+        llm=None,
+        embedding_model="embed",
+        now=lambda: NOW,
+    )
+
+    block = await service.personality_block(
+        group,
+        expression_examples=2,
+        relationship_enabled=True,
+    )
+
+    assert block is not None
+    assert "32.5/100" in block
+    assert "短句, 轻松收尾" in block
+    assert store.expression_calls == [(stable_key, 2)]
 
 
 def make_service(

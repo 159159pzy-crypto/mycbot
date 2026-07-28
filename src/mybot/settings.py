@@ -90,6 +90,15 @@ class Settings(BaseSettings):
     memory_consolidation_message_limit: int = Field(default=40, ge=2, le=200)
     memory_consolidation_memory_limit: int = Field(default=20, ge=1, le=100)
     memory_consolidation_token_budget: int = Field(default=4_000, ge=256, le=32_000)
+    personality_learning_enabled: bool = False
+    personality_learning_lookback_hours: int = Field(default=24, ge=1, le=720)
+    personality_learning_conversation_limit: int = Field(default=10, ge=1, le=200)
+    personality_learning_message_limit: int = Field(default=80, ge=3, le=500)
+    personality_learning_token_budget: int = Field(default=3_000, ge=256, le=32_000)
+    personality_learning_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    personality_learning_dedupe_ttl_seconds: int = Field(
+        default=86_400, ge=3_600, le=604_800
+    )
     memory_decay_days: int = Field(default=90, ge=1, le=3_650)
     memory_decay_factor: float = Field(default=0.8, gt=0.0, le=1.0)
     memory_confidence_floor: float = Field(default=0.2, ge=0.0, le=1.0)
@@ -105,6 +114,7 @@ class Settings(BaseSettings):
     proactive_quiet_start_hour: int = Field(default=22, ge=0, le=23)
     proactive_quiet_end_hour: int = Field(default=8, ge=0, le=23)
     proactive_message: str = "最近有点安静, 有什么想聊或需要我帮忙的吗?"
+    proactive_context_messages: int = Field(default=12, ge=1, le=100)
     operator_token: SecretStr | None = None
     operator_auth_max_failures: int = Field(default=10, ge=1, le=1_000)
     operator_auth_window_seconds: float = Field(default=60.0, ge=1.0, le=3_600.0)

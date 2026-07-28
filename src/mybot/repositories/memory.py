@@ -37,6 +37,7 @@ class ScoredMemory:
     vector_rank: int | None = None
     text_rank: int | None = None
     rrf_score: float = 0.0
+    relationship_score: float | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -51,6 +52,7 @@ class MemoryRecord:
     confidence: float
     source_message_ids: tuple[str, ...]
     created_at: datetime
+    relationship_score: float | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -134,6 +136,7 @@ class MemoryRepository:
                         f"""
                         WITH eligible AS (
                             SELECT id, scope, privacy, kind, content, confidence,
+                                   relationship_score,
                                    created_at, supersedes, embedding, embedding_model,
                                    embedding <=> CAST(:query AS vector) AS distance,
                                    similarity(content, :query_text) AS text_score
@@ -185,6 +188,7 @@ class MemoryRepository:
                         )
                         SELECT eligible.id, eligible.scope, eligible.privacy,
                                eligible.kind, eligible.content, eligible.confidence,
+                               eligible.relationship_score,
                                eligible.created_at, eligible.supersedes,
                                fused.distance, fused.vector_rank, fused.text_rank,
                                fused.rrf_score
@@ -219,6 +223,11 @@ class MemoryRepository:
                     kind=row["kind"],
                     content=row["content"],
                     confidence=row["confidence"],
+                    relationship_score=(
+                        float(row["relationship_score"])
+                        if row["relationship_score"] is not None
+                        else None
+                    ),
                     created_at=row["created_at"],
                     distance=(
                         float(row["distance"]) if row["distance"] is not None else None
@@ -289,7 +298,8 @@ class MemoryRepository:
                     sa.text(
                         """
                         SELECT id, scope, subject_identity_id, conversation_stable_key,
-                               privacy, kind, content, confidence, source_message_ids,
+                               privacy, kind, content, confidence, relationship_score,
+                               source_message_ids,
                                created_at
                         FROM memory_items
                         WHERE revoked_at IS NULL
@@ -445,13 +455,15 @@ class MemoryRepository:
                 """
                 INSERT INTO memory_items (
                     id, scope, subject_identity_id, conversation_stable_key,
-                    kind, content, source_message_ids, confidence, privacy,
+                    kind, content, source_message_ids, confidence,
+                    relationship_score, privacy,
                     valid_from, valid_until, conflicts_with, supersedes,
                     invalid_at, invalidated_by, revoked_at, revoked_reason,
                     embedding, embedding_model
                 ) VALUES (
                     :id, :scope, :subject, :conversation_key,
-                    :kind, :content, CAST(:sources AS jsonb), :confidence, :privacy,
+                    :kind, :content, CAST(:sources AS jsonb), :confidence,
+                    :relationship_score, :privacy,
                     :valid_from, :valid_until, CAST(:conflicts AS jsonb),
                     CAST(:supersedes AS jsonb), :invalid_at, :invalidated_by,
                     :revoked_at, :revoked_reason,
@@ -470,6 +482,7 @@ class MemoryRepository:
                 "content": item.content,
                 "sources": json.dumps(list(item.source_message_ids)),
                 "confidence": item.confidence,
+                "relationship_score": item.relationship_score,
                 "privacy": item.privacy.value,
                 "valid_from": item.valid_from,
                 "valid_until": item.valid_until,
@@ -563,6 +576,149 @@ class MemoryRepository:
             await session.commit()
             return _rowcount(result)
 
+    async def active_expressions(
+        self, conversation_stable_key: str, *, now: datetime, limit: int = 3
+    ) -> tuple[MemoryRecord, ...]:
+        """Return active shared expression examples from exactly one conversation."""
+
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT id, scope, subject_identity_id, conversation_stable_key,
+                               privacy, kind, content, confidence, relationship_score,
+                               source_message_ids, created_at
+                        FROM memory_items
+                        WHERE scope = 'CONVERSATION'
+                          AND conversation_stable_key = :stable_key
+                          AND privacy = 'SHARED'
+                          AND kind = 'EXPRESSION'
+                          AND revoked_at IS NULL
+                          AND (invalid_at IS NULL OR invalid_at > :now)
+                          AND (valid_from IS NULL OR valid_from <= :now)
+                          AND (valid_until IS NULL OR valid_until > :now)
+                        ORDER BY confidence DESC, created_at DESC, id
+                        LIMIT :limit
+                        """
+                    ),
+                    {"stable_key": conversation_stable_key, "now": now, "limit": limit},
+                )
+            ).mappings().all()
+        return tuple(_memory_record(row) for row in rows)
+
+    async def relationship_for(
+        self, subject_identity_id: str, *, now: datetime
+    ) -> MemoryRecord | None:
+        """Return the current relationship version for one subject."""
+
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT id, scope, subject_identity_id, conversation_stable_key,
+                               privacy, kind, content, confidence, relationship_score,
+                               source_message_ids, created_at
+                        FROM memory_items
+                        WHERE scope = 'SUBJECT'
+                          AND subject_identity_id = :subject
+                          AND kind = 'RELATIONSHIP'
+                          AND revoked_at IS NULL
+                          AND (invalid_at IS NULL OR invalid_at > :now)
+                          AND (valid_from IS NULL OR valid_from <= :now)
+                          AND (valid_until IS NULL OR valid_until > :now)
+                        ORDER BY created_at DESC, id
+                        LIMIT 1
+                        """
+                    ),
+                    {"subject": subject_identity_id, "now": now},
+                )
+            ).mappings().one_or_none()
+        return _memory_record(row) if row is not None else None
+
+    async def upsert_relationship(
+        self,
+        item: MemoryItem,
+        *,
+        source: str,
+        now: datetime,
+    ) -> MergeApplication:
+        """Append a relationship successor and invalidate its previous active version."""
+
+        if (
+            item.scope is not MemoryScope.SUBJECT
+            or item.kind.upper() != "RELATIONSHIP"
+            or item.relationship_score is None
+        ):
+            raise ValueError("relationship item must be SUBJECT/RELATIONSHIP with a score")
+        async with self.sessions() as session, session.begin():
+            previous = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT id
+                        FROM memory_items
+                        WHERE scope = 'SUBJECT'
+                          AND subject_identity_id = :subject
+                          AND kind = 'RELATIONSHIP'
+                          AND revoked_at IS NULL
+                          AND (invalid_at IS NULL OR invalid_at > :now)
+                        ORDER BY created_at DESC, id
+                        LIMIT 1
+                        FOR UPDATE
+                        """
+                    ),
+                    {"subject": item.subject_identity_id, "now": now},
+                )
+            ).mappings().one_or_none()
+            previous_id = cast(UUID | None, previous["id"] if previous else None)
+            successor = item
+            operation = MemoryOperation.ADD
+            if previous_id is not None:
+                operation = MemoryOperation.UPDATE
+                successor = item.model_copy(
+                    update={
+                        "id": uuid4(),
+                        "supersedes": tuple(
+                            dict.fromkeys((*item.supersedes, previous_id))
+                        ),
+                    }
+                )
+            await self._insert(
+                session,
+                successor,
+                embedding=None,
+                embedding_model=None,
+            )
+            if previous_id is not None:
+                await session.execute(
+                    sa.text(
+                        "UPDATE memory_items SET invalid_at = :now, "
+                        "invalidated_by = :successor WHERE id = :previous"
+                    ),
+                    {
+                        "now": now,
+                        "successor": successor.id,
+                        "previous": previous_id,
+                    },
+                )
+            await self._audit(
+                session,
+                operation=operation,
+                source=source,
+                candidate=successor,
+                memory_id=successor.id,
+                previous_id=previous_id,
+                detail={"relationship_score": successor.relationship_score},
+            )
+        return MergeApplication(
+            operation=operation,
+            memory_id=successor.id,
+            previous_memory_id=previous_id,
+            applied=True,
+        )
+
     async def recent_consolidation_contexts(
         self,
         *,
@@ -633,7 +789,8 @@ class MemoryRepository:
                             f"""
                             SELECT id, scope, subject_identity_id,
                                    conversation_stable_key, privacy, kind, content,
-                                   confidence, source_message_ids, created_at
+                                   confidence, relationship_score,
+                                   source_message_ids, created_at
                             FROM memory_items
                             WHERE revoked_at IS NULL
                               AND (invalid_at IS NULL OR invalid_at > :now)
@@ -719,7 +876,9 @@ class MemoryRepository:
             )
             await session.execute(
                 sa.text(
-                    "UPDATE memory_items SET confidence = confidence * :factor "
+                    "UPDATE memory_items SET confidence = confidence * :factor, "
+                    "relationship_score = CASE WHEN relationship_score IS NULL THEN NULL "
+                    "ELSE GREATEST(0, relationship_score * :factor) END "
                     "WHERE revoked_at IS NULL AND invalid_at IS NULL "
                     "AND COALESCE(last_accessed_at, created_at) <= :stale_before"
                 ),
@@ -792,6 +951,11 @@ def _memory_record(row: RowMapping) -> MemoryRecord:
         kind=str(row["kind"]),
         content=str(row["content"]),
         confidence=float(cast(float, row["confidence"])),
+        relationship_score=(
+            float(row["relationship_score"])
+            if row.get("relationship_score") is not None
+            else None
+        ),
         source_message_ids=sources,
         created_at=cast(datetime, row["created_at"]),
     )

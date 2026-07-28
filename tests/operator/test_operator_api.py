@@ -83,7 +83,7 @@ async def client(migrated: str) -> AsyncIterator[httpx.AsyncClient]:
         await connection.execute(
             sa.text(
                 "TRUNCATE operator_audit, tool_invocations, turns, memory_items, "
-                "messages, conversations, system_kv CASCADE"
+                "agent_profiles, messages, conversations, system_kv CASCADE"
             )
         )
     await engine.dispose()
@@ -328,3 +328,71 @@ async def test_revoking_missing_memory_is_404(client: httpx.AsyncClient) -> None
         f"/operator/memories/{uuid4()}/revoke", headers=AUTH
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_profile_persona_binding_and_relationship_management(
+    client: httpx.AsyncClient, migrated: str
+) -> None:
+    conversation_id, _ = await _seed(migrated)
+    created_response = await client.post(
+        "/operator/profiles",
+        headers=AUTH,
+        json={
+            "name": "闲聊群",
+            "description": "轻松但不刷屏",
+            "system_prompt": "你是群里克制而友好的伙伴",
+            "model_tier": "economy",
+            "tool_capabilities": ["web.search"],
+            "memory": {
+                "enabled": True,
+                "retrieval_limit": 5,
+                "expression_examples": 3,
+                "relationship_enabled": True,
+            },
+            "willingness": {
+                "enabled": True,
+                "threshold": 0.8,
+                "sensitivity": 0.9,
+                "keywords": ["MyBot"],
+            },
+        },
+    )
+    assert created_response.status_code == 200
+    profile_id = created_response.json()["profile"]["profile"]["id"]
+
+    bound = await client.put(
+        f"/operator/conversations/{conversation_id}/profile",
+        headers=AUTH,
+        json={"profile_id": profile_id},
+    )
+    assert bound.status_code == 200
+    version = await client.post(
+        f"/operator/profiles/{profile_id}/personas",
+        headers=AUTH,
+        json={"system_prompt": "新版群聊人设", "change_note": "更克制"},
+    )
+    assert version.status_code == 200
+    target_id = version.json()["version"]["id"]
+    rollback = await client.post(
+        f"/operator/profiles/{profile_id}/personas/rollback",
+        headers=AUTH,
+        json={"target_version_id": target_id},
+    )
+    assert rollback.json()["version"]["version"] == 3
+
+    profiles = (await client.get("/operator/profiles", headers=AUTH)).json()
+    assert any(row["profile"]["id"] == profile_id for row in profiles["profiles"])
+    assert profiles["bindings"] == [
+        {"conversation_id": conversation_id, "profile_id": profile_id}
+    ]
+
+    relationship = await client.put(
+        "/operator/relationships/telegram:777",
+        headers=AUTH,
+        json={"impression": "认真准备重要事情", "familiarity": 42.5},
+    )
+    assert relationship.status_code == 200
+    listed = (await client.get("/operator/relationships", headers=AUTH)).json()
+    assert listed["relationships"][0]["familiarity"] == 42.5
+    assert listed["relationships"][0]["subject_identity_id"] == "telegram:777"

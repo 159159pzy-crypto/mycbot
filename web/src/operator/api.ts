@@ -109,6 +109,7 @@ export type MetricsView = {
     p95_latency_ms: number;
   };
   queues: Record<string, number>;
+  willingness: { allowed: number; blocked: number };
 };
 
 export type PluginView = {
@@ -121,6 +122,62 @@ export type PluginView = {
 };
 
 export type PersonaConfig = { override: string | null; default: string };
+
+export type ProfileMemoryPolicy = {
+  enabled: boolean;
+  retrieval_limit: number;
+  expression_examples: number;
+  relationship_enabled: boolean;
+};
+
+export type WillingnessPolicy = {
+  enabled: boolean;
+  threshold: number;
+  sensitivity: number;
+  keywords: string[];
+};
+
+export type AgentProfile = {
+  id: string;
+  name: string;
+  description: string;
+  active_persona_version_id: string | null;
+  model_tier: string;
+  tool_capabilities: string[];
+  memory: ProfileMemoryPolicy;
+  willingness: WillingnessPolicy;
+};
+
+export type PersonaVersion = {
+  id: string;
+  profile_id: string;
+  version: number;
+  system_prompt: string;
+  parent_version_id: string | null;
+  change_note: string;
+};
+
+export type ProfileView = {
+  profile: AgentProfile;
+  persona: PersonaVersion;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProfilesView = {
+  profiles: ProfileView[];
+  bindings: Array<{ conversation_id: string; profile_id: string }>;
+};
+
+export type RelationshipView = {
+  id: string;
+  subject_identity_id: string;
+  impression: string;
+  familiarity: number;
+  confidence: number;
+  source_message_ids: string[];
+  created_at: string;
+};
 
 export type ModelTarget = {
   model: string;
@@ -175,7 +232,7 @@ export type ModelsView = {
 
 export type OperatorClient = {
   get: <T>(path: string) => Promise<T>;
-  send: <T>(method: 'POST' | 'PUT', path: string, body?: unknown) => Promise<T>;
+  send: <T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown) => Promise<T>;
 };
 
 export function createOperatorClient(
@@ -207,7 +264,7 @@ export function createOperatorClient(
   };
   return {
     get: <T>(path: string) => request<T>('GET', path),
-    send: <T>(method: 'POST' | 'PUT', path: string, body?: unknown) =>
+    send: <T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown) =>
       request<T>(method, path, body),
   };
 }
