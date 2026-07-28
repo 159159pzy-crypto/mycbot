@@ -116,6 +116,18 @@ export type MetricsView = {
   feedback?: { positive: number; negative: number; total: number; negative_rate: number };
 };
 
+export type DeadLetterEntry = {
+  id: string;
+  payload: string;
+  preview: string;
+};
+
+export type ProactiveConfig = {
+  enabled_conversations: string[];
+  globally_enabled: boolean;
+  conversations: ConversationSummary[];
+};
+
 export type ModerationPolicyView = {
   enabled: boolean;
   backends: Array<'local' | 'api' | 'plugin'>;

@@ -7,6 +7,7 @@ import { MemoriesPanel } from '../operator/panels/MemoriesPanel';
 import { KnowledgePanel } from '../operator/panels/KnowledgePanel';
 import { ModelsPanel } from '../operator/panels/ModelsPanel';
 import { OverviewPanel } from '../operator/panels/OverviewPanel';
+import { OperationsPanel } from '../operator/panels/OperationsPanel';
 import { PersonaPanel } from '../operator/panels/PersonaPanel';
 import { PluginsPanel } from '../operator/panels/PluginsPanel';
 import { SandboxPanel } from '../operator/panels/SandboxPanel';
@@ -81,6 +82,7 @@ export function Console({ health }: { health: HealthState }) {
         <main id="main-content" className="console-main">
           {view === 'status' && <StatusView readiness={readiness} />}
           {view === 'overview' && <OverviewPanel client={client} />}
+          {view === 'operations' && <OperationsPanel client={client} />}
           {view === 'conversations' && <ConversationsPanel client={client} />}
           {view === 'sandbox' && <SandboxPanel client={client} />}
           {view === 'memories' && <MemoriesPanel client={client} />}

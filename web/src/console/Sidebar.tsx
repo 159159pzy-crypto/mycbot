@@ -23,6 +23,7 @@ const NAV_GROUPS: Array<{
     items: [
       { id: 'status', icon: <StatusIcon /> },
       { id: 'overview', icon: <GridIcon /> },
+      { id: 'operations', icon: <StatusIcon /> },
     ],
   },
   {

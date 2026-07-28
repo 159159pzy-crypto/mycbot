@@ -6,6 +6,7 @@ import { ConversationsPanel } from './ConversationsPanel';
 import { MemoriesPanel } from './MemoriesPanel';
 import { ModelsPanel } from './ModelsPanel';
 import { OverviewPanel } from './OverviewPanel';
+import { OperationsPanel } from './OperationsPanel';
 import { PersonaPanel } from './PersonaPanel';
 import { PluginsPanel } from './PluginsPanel';
 import { SandboxPanel } from './SandboxPanel';
@@ -63,6 +64,59 @@ describe('OverviewPanel', () => {
     expect(screen.getByText('outbound_dead_letter')).toBeInTheDocument();
     expect(screen.getByText('已回复')).toBeInTheDocument();
     expect(screen.getByText('失败')).toBeInTheDocument();
+  });
+});
+
+describe('OperationsPanel', () => {
+  it('replays dead letters and sends a bot message to a selected conversation', async () => {
+    const conversation = {
+      id: 'conv-1',
+      stable_key: 'v1:telegram-main:DIRECT:777:0',
+      platform: 'telegram',
+      chat_kind: 'DIRECT',
+      chat_id: '777',
+      last_message_at: null,
+      message_count: 2,
+    };
+    const client = stubClient({
+      '/operator/operations/dead-letters?': {
+        entries: [{ id: '10-0', payload: '{"bad":true}', preview: '{"bad":true}' }],
+      },
+      '/operator/operations/dead-letters/ingest/10-0/replay': { replayed: true },
+      '/operator/operations/messages': { sent: true },
+      '/operator/conversations': { conversations: [conversation] },
+      '/operator/config/proactive': {
+        enabled_conversations: [],
+        globally_enabled: true,
+        conversations: [conversation],
+      },
+    });
+
+    render(<OperationsPanel client={client} />);
+
+    await waitFor(() => expect(screen.getByText('{"bad":true}')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '重放' }));
+    await waitFor(() =>
+      expect(client.sent).toContainEqual({
+        method: 'POST',
+        path: '/operator/operations/dead-letters/ingest/10-0/replay',
+        body: undefined,
+      }),
+    );
+
+    fireEvent.change(screen.getByPlaceholderText('输入要主动发送的内容'), {
+      target: { value: '维护完成，可以继续使用。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() =>
+      expect(client.sent).toContainEqual({
+        method: 'POST',
+        path: '/operator/operations/messages',
+        body: { conversation_id: 'conv-1', text: '维护完成，可以继续使用。' },
+      }),
+    );
+    expect(screen.getByText(/不再需要手填 stable_key/)).toBeInTheDocument();
   });
 });
 

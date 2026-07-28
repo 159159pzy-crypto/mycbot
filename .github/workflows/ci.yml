@@ -187,6 +187,8 @@ jobs:
       MYBOT_API_PORT: "8000"
       MYBOT_DATABASE_URL: postgresql+psycopg://mybot:mybot-ci@127.0.0.1:5432/mybot
       MYBOT_REDIS_URL: redis://127.0.0.1:6379/0
+      MYBOT_TEST_DATABASE_URL: postgresql+psycopg://mybot:mybot-ci@127.0.0.1:5432/mybot
+      MYBOT_TEST_REDIS_URL: redis://127.0.0.1:6379/1
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -210,6 +212,9 @@ jobs:
           uv run alembic upgrade head
           uv run alembic downgrade base
           uv run alembic upgrade head
+
+      - name: Run stateful integration tests
+        run: uv run pytest -q -m integration
 
       - name: Start API
         run: |

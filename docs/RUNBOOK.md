@@ -88,6 +88,15 @@ Entries that fail five deliveries, or whose payload cannot be parsed at
 all, land in capped dead-letter streams (`mybot:ingest:dead`,
 `mybot:outbound:dead`, 1000 entries max). Inspect them:
 
+The preferred workflow is **控制台 → 运维中心 → 死信检查与重放**. Select the
+stream, inspect the bounded payload preview, fix the root cause, and click
+**重放** for exactly one entry. The API atomically clears the ingest dedupe key,
+adds the payload back to its source stream, removes the dead-letter entry, and
+writes `operations.dead_letter.replay` to `operator_audit`.
+
+The CLI sequence below remains an emergency fallback when the API itself is
+unavailable:
+
 ```console
 docker compose exec redis redis-cli XLEN mybot:ingest:dead
 docker compose exec redis redis-cli XRANGE mybot:ingest:dead - + COUNT 10
@@ -112,6 +121,30 @@ docker compose exec redis redis-cli XADD mybot:ingest '*' payload '<json-payload
 The outbound equivalents are `mybot:seen:outbound:<key>` and
 `mybot:outbound`. Trim a fully handled dead-letter stream with
 `XTRIM mybot:ingest:dead MAXLEN 0`.
+
+## 4.1 Agent snapshot and off-site backup
+
+Create a portable state snapshot before persona, memory, skill, or approval
+changes:
+
+```console
+uv run mybot export --output backups/agent-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+Use `--include-history` when the rollback/audit value of invalidated and revoked
+memory outweighs the larger file. Restore with `uv run mybot import <file>`;
+import merges and does not delete destination-only state. Repeating the same
+import is safe. Always inspect and protect the JSON because memory and persona
+content can be private even though credentials are excluded.
+
+For off-site storage:
+
+```console
+sh scripts/backup-agent.sh backups/agent.json remote-name:mybot/agents
+```
+
+The script requires an existing rclone configuration and never accepts or
+persists cloud credentials itself.
 
 ## 5. Token rotation
 

@@ -2,14 +2,17 @@
 
 import asyncio
 import inspect
+import json
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from time import monotonic
+from time import monotonic, time
 from typing import Protocol, cast
 
 import structlog
 from redis.asyncio import Redis
+
+from mybot.infrastructure.telemetry import start_span
 
 logger = structlog.get_logger("mybot.streams")
 
@@ -17,6 +20,32 @@ type StreamEntry = tuple[str, str]
 type Handler = Callable[[str], Awaitable[None] | None]
 type DedupeKey = Callable[[str], str | None]
 _delivery_attempt: ContextVar[int] = ContextVar("mybot_stream_delivery_attempt", default=1)
+
+_REPLAY_DEAD_LETTER_SCRIPT = """
+local rows = redis.call('XRANGE', KEYS[1], ARGV[1], ARGV[1], 'COUNT', 1)
+if #rows == 0 then
+  return false
+end
+local fields = rows[1][2]
+local payload = nil
+for index = 1, #fields, 2 do
+  if fields[index] == 'payload' then
+    payload = fields[index + 1]
+    break
+  end
+end
+if payload == nil then
+  return redis.error_reply('dead-letter entry has no payload')
+end
+if ARGV[3] ~= '' then
+  redis.call('DEL', ARGV[3])
+end
+local replayed = redis.call(
+  'XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'payload', payload
+)
+redis.call('XDEL', KEYS[1], ARGV[1])
+return replayed
+"""
 
 
 def current_delivery_attempt() -> int:
@@ -47,6 +76,19 @@ class StreamBackend(Protocol):
     async def acquire_once(self, key: str, *, ttl_seconds: int) -> bool: ...
 
     async def has_once(self, key: str) -> bool: ...
+
+    async def entries(self, stream: str, *, count: int = 100) -> list[StreamEntry]: ...
+
+    async def replay_dead_letter(
+        self,
+        dead_stream: str,
+        entry_id: str,
+        source_stream: str,
+        payload: str,
+        *,
+        maxlen: int,
+        dedupe_key: str | None = None,
+    ) -> str: ...
 
 
 @dataclass(slots=True)
@@ -162,40 +204,55 @@ class StreamConsumer:
         *,
         attempts: int,
     ) -> int:
-        completed_key: str | None = None
-        if dedupe_key is not None:
+        attributes: dict[str, object] = {
+            "messaging.system": "redis",
+            "messaging.destination.name": self._stream,
+            "messaging.message.id": entry_id,
+            "messaging.operation.type": "process",
+            "mybot.delivery_attempt": attempts,
+        }
+        queue_wait_ms = _queue_wait_ms(entry_id)
+        if queue_wait_ms is not None:
+            attributes["messaging.message.receive.latency_ms"] = queue_wait_ms
+        with start_span(
+            "stream.consume",
+            trace_id=_payload_trace_id(payload),
+            attributes=attributes,
+        ):
+            completed_key: str | None = None
+            if dedupe_key is not None:
+                try:
+                    key = dedupe_key(payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    await self._dead_letter(entry_id, payload, reason=type(error).__name__)
+                    return 0
+                if key is not None:
+                    completed_key = f"{self._dedupe_prefix}:{key}"
+                    if await self._backend.has_once(completed_key):
+                        await self._backend.ack(self._stream, self._group, entry_id)
+                        return 0
+            token: Token[int] = _delivery_attempt.set(attempts)
             try:
-                key = dedupe_key(payload)
+                result = handler(payload)
+                if inspect.isawaitable(result):
+                    await result
             except asyncio.CancelledError:
                 raise
-            except Exception as error:
-                await self._dead_letter(entry_id, payload, reason=type(error).__name__)
+            except Exception:
+                logger.exception(
+                    "stream_entry_handler_failed", stream=self._stream, entry_id=entry_id
+                )
                 return 0
-            if key is not None:
-                completed_key = f"{self._dedupe_prefix}:{key}"
-                if await self._backend.has_once(completed_key):
-                    await self._backend.ack(self._stream, self._group, entry_id)
-                    return 0
-        token: Token[int] = _delivery_attempt.set(attempts)
-        try:
-            result = handler(payload)
-            if inspect.isawaitable(result):
-                await result
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "stream_entry_handler_failed", stream=self._stream, entry_id=entry_id
-            )
-            return 0
-        finally:
-            _delivery_attempt.reset(token)
-        if completed_key is not None:
-            await self._backend.acquire_once(
-                completed_key, ttl_seconds=self._dedupe_ttl_seconds
-            )
-        await self._backend.ack(self._stream, self._group, entry_id)
-        return 1
+            finally:
+                _delivery_attempt.reset(token)
+            if completed_key is not None:
+                await self._backend.acquire_once(
+                    completed_key, ttl_seconds=self._dedupe_ttl_seconds
+                )
+            await self._backend.ack(self._stream, self._group, entry_id)
+            return 1
 
     async def _dead_letter(self, entry_id: str, payload: str, *, reason: str) -> None:
         logger.warning(
@@ -319,8 +376,34 @@ class MemoryStreamBackend:
         self._counters[key] = (value, expiry)
         return value
 
-    async def entries(self, stream: str) -> list[StreamEntry]:
-        return [(f"{sequence}-0", payload) for sequence, payload in self._streams.get(stream, [])]
+    async def entries(self, stream: str, *, count: int = 100) -> list[StreamEntry]:
+        rows = self._streams.get(stream, [])[-count:]
+        return [(f"{sequence}-0", payload) for sequence, payload in rows]
+
+    async def replay_dead_letter(
+        self,
+        dead_stream: str,
+        entry_id: str,
+        source_stream: str,
+        payload: str,
+        *,
+        maxlen: int,
+        dedupe_key: str | None = None,
+    ) -> str:
+        target = int(entry_id.partition("-")[0])
+        row = next(
+            (item for item in self._streams.get(dead_stream, []) if item[0] == target),
+            None,
+        )
+        if row is None:
+            raise KeyError(entry_id)
+        if dedupe_key is not None:
+            self._once.pop(dedupe_key, None)
+        new_id = await self.add(source_stream, row[1], maxlen=maxlen)
+        self._streams[dead_stream] = [
+            item for item in self._streams.get(dead_stream, []) if item[0] != target
+        ]
+        return new_id
 
     async def stream_len(self, stream: str) -> int:
         return len(self._streams.get(stream, []))
@@ -419,6 +502,45 @@ class RedisStreamBackend:
     async def has_once(self, key: str) -> bool:
         return bool(await self._client.exists(key))
 
+    async def entries(self, stream: str, *, count: int = 100) -> list[StreamEntry]:
+        response = cast(
+            list[tuple[object, dict[object, object]]],
+            await self._client.xrange(stream, min="-", max="+", count=count),
+        )
+        entries: list[StreamEntry] = []
+        for entry_id, fields in response:
+            payload = _payload_from_fields(fields)
+            if payload is not None:
+                entries.append((_as_text(entry_id), payload))
+        return entries
+
+    async def replay_dead_letter(
+        self,
+        dead_stream: str,
+        entry_id: str,
+        source_stream: str,
+        payload: str,
+        *,
+        maxlen: int,
+        dedupe_key: str | None = None,
+    ) -> str:
+        del payload
+        result = await cast(
+            Awaitable[object],
+            self._client.eval(
+                _REPLAY_DEAD_LETTER_SCRIPT,
+                2,
+                dead_stream,
+                source_stream,
+                entry_id,
+                str(maxlen),
+                dedupe_key or "",
+            ),
+        )
+        if not result:
+            raise KeyError(entry_id)
+        return _as_text(result)
+
     async def increment(self, key: str, amount: int, *, ttl_seconds: int) -> int:
         value = await self._client.incrby(  # pyright: ignore[reportUnknownMemberType]
             key, amount
@@ -471,3 +593,31 @@ def _payload_from_fields(fields: dict[object, object]) -> str | None:
         if _as_text(key) == "payload":
             return _as_text(value)
     return None
+
+
+def _payload_trace_id(payload: str) -> str | None:
+    try:
+        decoded = json.loads(payload)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    document = cast(dict[str, object], decoded)
+    direct = document.get("trace_id")
+    if isinstance(direct, str):
+        return direct
+    envelope = document.get("envelope")
+    if isinstance(envelope, dict):
+        nested = cast(dict[str, object], envelope).get("trace_id")
+        return nested if isinstance(nested, str) else None
+    return None
+
+
+def _queue_wait_ms(entry_id: str) -> int | None:
+    milliseconds, separator, _sequence = entry_id.partition("-")
+    if not separator or not milliseconds.isdigit():
+        return None
+    created_ms = int(milliseconds)
+    if created_ms < 1_000_000_000_000:
+        return None
+    return max(0, int(time() * 1_000) - created_ms)

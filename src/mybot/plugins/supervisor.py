@@ -34,6 +34,8 @@ class ChildProcess(Protocol):
 
     def terminate(self) -> None: ...
 
+    def kill(self) -> None: ...
+
     async def wait(self) -> int: ...
 
 
@@ -64,6 +66,9 @@ class _WindowsChildProcess:
 
     def terminate(self) -> None:
         self.process.terminate()
+
+    def kill(self) -> None:
+        self.process.kill()
 
     async def wait(self) -> int:
         return await asyncio.to_thread(self.process.wait)
@@ -196,6 +201,8 @@ class PluginSupervisorService:
     poll_seconds: float = 1.0
     crash_limit: int = 5
     crash_window_seconds: float = 60.0
+    stop_timeout_seconds: float = 5.0
+    kill_timeout_seconds: float = 2.0
     clock: Callable[[], float] = monotonic
     _states: dict[str, _State] = field(
         default_factory=lambda: dict[str, _State](), init=False
@@ -316,10 +323,19 @@ class PluginSupervisorService:
         if process.returncode is None:
             process.terminate()
         try:
-            async with asyncio.timeout(5.0):
+            async with asyncio.timeout(self.stop_timeout_seconds):
                 await process.wait()
         except TimeoutError:
             logger.warning("plugin_child_stop_timed_out", runner_id=state.runner_id)
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                async with asyncio.timeout(self.kill_timeout_seconds):
+                    await process.wait()
+            except TimeoutError:
+                logger.error("plugin_child_kill_timed_out", runner_id=state.runner_id)
         state.process = None
 
     async def _unregister(self, runner_id: str) -> None:

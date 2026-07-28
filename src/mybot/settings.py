@@ -38,7 +38,11 @@ class Settings(BaseSettings):
     stream_dedupe_ttl_seconds: int = Field(default=3_600, ge=60, le=604_800)
     stream_block_ms: int = Field(default=1_000, ge=10, le=60_000)
     stream_claim_min_idle_ms: int = Field(default=30_000, ge=100, le=3_600_000)
+    conversation_lease_ttl_ms: int = Field(default=30_000, ge=1_000, le=600_000)
+    conversation_lease_wait_seconds: float = Field(default=180.0, ge=1.0, le=3_600.0)
+    conversation_lease_retry_seconds: float = Field(default=0.05, ge=0.01, le=5.0)
     otel_exporter_otlp_endpoint: SecretStr | None = None
+    prometheus_enabled: bool = False
     telegram_bot_token: SecretStr | None = None
     telegram_meme_intent_map: dict[str, str] = Field(default_factory=dict)
     qq_access_token: SecretStr | None = None
@@ -150,6 +154,7 @@ class Settings(BaseSettings):
     plugin_invoke_timeout_seconds: float = Field(default=20.0, gt=0.0, le=120.0)
     plugin_poll_wait_seconds: float = Field(default=20.0, gt=0.0, le=60.0)
     plugin_catalog_ttl_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
+    plugin_registration_ttl_seconds: int = Field(default=90, ge=30, le=3_600)
     plugin_result_max_chars: int = Field(default=16_000, ge=1_000, le=200_000)
     skills_dir: str = "skills"
     skills_prompt_max_chars: int = Field(default=4_000, ge=256, le=50_000)

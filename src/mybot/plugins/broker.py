@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from mybot.contracts import ModerationDecision, ModerationRequest, PluginManifest, ToolSpec
 from mybot.contracts.json import thaw_json_object
 from mybot.plugins.config import PluginConfigError, validate_plugin_config
+from mybot.plugins.state import PluginRegistration, PluginRegistrationStore
 
 logger = structlog.get_logger("mybot.plugins.broker")
 
@@ -125,7 +126,7 @@ class _RunnerState:
 
 
 class PluginBroker:
-    """In-process broker state; one API process owns it (documented stance)."""
+    """Broker with externally persisted runner registration metadata."""
 
     def __init__(
         self,
@@ -135,6 +136,7 @@ class PluginBroker:
         services: tuple[PluginService, ...] = (),
         service_quota_per_minute: int = 30,
         clock: Callable[[], float] = monotonic,
+        registrations: PluginRegistrationStore | None = None,
     ) -> None:
         self._grants = grants
         self._invoke_timeout_seconds = invoke_timeout_seconds
@@ -146,10 +148,59 @@ class PluginBroker:
         self._service_calls: dict[tuple[str, str], deque[float]] = {}
         self._clock = clock
         self._load_errors: dict[str, str] = {}
+        self._registrations = registrations
         self.audit_log: list[AuditEntry] = []
 
     def set_services(self, services: tuple[PluginService, ...]) -> None:
         self._services = {service.name: service for service in services}
+
+    def set_registration_store(self, registrations: PluginRegistrationStore) -> None:
+        self._registrations = registrations
+
+    async def restore(self) -> int:
+        if self._registrations is None:
+            return 0
+        restored = 0
+        for registration in await self._registrations.load_all():
+            try:
+                self.register(
+                    registration.runner_id,
+                    registration.manifests,
+                    protocol_version=registration.protocol_version,
+                )
+            except HTTPException:
+                logger.warning(
+                    "plugin_registration_restore_rejected",
+                    runner_id=registration.runner_id,
+                )
+                continue
+            restored += 1
+        return restored
+
+    async def persist(self, runner_id: str) -> None:
+        if self._registrations is None:
+            return
+        state = self._runners.get(runner_id)
+        if state is None:
+            return
+        await self._registrations.save(
+            PluginRegistration(
+                runner_id=runner_id,
+                protocol_version=state.protocol_version,
+                manifests=[
+                    cast(JsonValue, manifest.model_dump(mode="json"))
+                    for manifest in state.plugins.values()
+                ],
+            )
+        )
+
+    async def forget(self, runner_id: str) -> None:
+        if self._registrations is not None:
+            await self._registrations.remove(runner_id)
+
+    async def aclose(self) -> None:
+        if self._registrations is not None:
+            await self._registrations.aclose()
 
     def register(
         self, runner_id: str, manifests: list[JsonValue], *, protocol_version: int = 1
@@ -305,6 +356,8 @@ class PluginBroker:
         runner = self._runners.get(runner_id)
         if runner is None:
             raise HTTPException(status_code=404, detail="unknown runner; register first")
+        if self._registrations is not None:
+            await self._registrations.touch(runner_id)
         if not runner.work and not runner.events:
             runner.wakeup.clear()
             try:
@@ -523,17 +576,20 @@ def create_broker_router(broker: PluginBroker) -> APIRouter:
     router = APIRouter(prefix="/plugin-broker", tags=["plugins"])
 
     @router.post("/register")
-    def register(request: RegisterRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+    async def register(request: RegisterRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
         accepted = broker.register(
             request.runner_id,
             request.manifests,
             protocol_version=request.protocol_version,
         )
+        await broker.persist(request.runner_id)
         return {"accepted": cast(JsonValue, accepted)}
 
     @router.post("/unregister")
-    def unregister(request: UnregisterRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
-        return {"removed": broker.unregister(request.runner_id)}
+    async def unregister(request: UnregisterRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        removed = broker.unregister(request.runner_id)
+        await broker.forget(request.runner_id)
+        return {"removed": removed}
 
     @router.get("/tools")
     def tools() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
