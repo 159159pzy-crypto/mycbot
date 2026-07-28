@@ -14,7 +14,7 @@ import httpx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from mybot.adapters import InboundEvent
+from mybot.adapters import InboundEvent, OutboundMessage
 from mybot.contracts import (
     AgentProfile,
     AnnotationReply,
@@ -86,6 +86,13 @@ class ProactiveUpdate(BaseModel):
     enabled_conversations: list[str]
 
 
+class OperatorMessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: UUID
+    text: str = Field(min_length=1, max_length=20_000)
+
+
 class ApprovalDecisionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -115,6 +122,19 @@ class EvaluationRunInput(BaseModel):
 
 class StreamLengths(Protocol):
     async def stream_len(self, stream: str) -> int: ...
+
+    async def entries(self, stream: str, *, count: int = 100) -> list[tuple[str, str]]: ...
+
+    async def replay_dead_letter(
+        self,
+        dead_stream: str,
+        entry_id: str,
+        source_stream: str,
+        payload: str,
+        *,
+        maxlen: int,
+        dedupe_key: str | None = None,
+    ) -> str: ...
 
 
 class PersonaUpdate(BaseModel):
@@ -294,6 +314,7 @@ class OperatorContext:
     model_client: httpx.AsyncClient
     model_attempts: ModelAttemptSink
     sandbox: SandboxPublisher | None = None
+    outbound: SandboxPublisher | None = None
     profiles: ProfileRepository | None = None
     memory: MemoryRepository | None = None
     willingness: WillingnessAuditRepository | None = None
@@ -313,6 +334,52 @@ class OperatorContext:
     messages: MessageRepository | None = None
 
 
+async def collect_operator_metrics(context: OperatorContext) -> dict[str, JsonValue]:
+    settings = context.settings
+    queues: dict[str, JsonValue] = {
+        "ingest": await context.streams.stream_len(settings.ingest_stream),
+        "outbound": await context.streams.stream_len(settings.outbound_stream),
+        "knowledge": await context.streams.stream_len(settings.knowledge_stream),
+        "ingest_dead_letter": await context.streams.stream_len(f"{settings.ingest_stream}:dead"),
+        "outbound_dead_letter": await context.streams.stream_len(
+            f"{settings.outbound_stream}:dead"
+        ),
+        "knowledge_dead_letter": await context.streams.stream_len(
+            f"{settings.knowledge_stream}:dead"
+        ),
+    }
+    participation = (
+        await context.willingness.metrics(hours=24)
+        if context.willingness is not None
+        else {"allowed": 0, "blocked": 0}
+    )
+    annotation_metrics = (
+        await context.knowledge.annotation_metrics(hours=24)
+        if context.knowledge is not None
+        else {"hit": 0, "miss": 0, "error": 0, "total": 0, "hit_rate": 0.0}
+    )
+    feedback_metrics = (
+        await context.feedback.metrics()
+        if context.feedback is not None
+        else {"positive": 0, "negative": 0, "total": 0, "negative_rate": 0.0}
+    )
+    return {
+        "turns": cast(JsonValue, await context.views.turn_metrics()),
+        "queues": cast(JsonValue, queues),
+        "willingness": cast(JsonValue, participation),
+        "annotations": cast(JsonValue, annotation_metrics),
+        "feedback": cast(JsonValue, feedback_metrics),
+    }
+
+
+def render_prometheus(metrics: dict[str, JsonValue]) -> str:
+    lines: list[str] = []
+    for name, value in _metric_values("mybot", metrics):
+        lines.append(f"# TYPE {name} gauge")
+        lines.append(f"{name} {value}")
+    return "\n".join(lines) + "\n"
+
+
 def create_operator_router(context: OperatorContext) -> APIRouter:
     router = APIRouter(prefix="/operator", tags=["operator"])
 
@@ -326,6 +393,98 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     ) -> dict[str, JsonValue]:
         rows = await context.views.conversations(limit=_bound(limit))
         return {"conversations": cast(JsonValue, rows)}
+
+    @router.get("/operations/dead-letters")
+    async def dead_letters(  # pyright: ignore[reportUnusedFunction]
+        stream: Literal["ingest", "outbound", "knowledge"] = "ingest",
+        limit: int = 50,
+    ) -> dict[str, JsonValue]:
+        source = _stream_name(context.settings, stream)
+        rows = await context.streams.entries(f"{source}:dead", count=_bound(limit))
+        return {
+            "stream": stream,
+            "entries": cast(
+                JsonValue,
+                [
+                    {
+                        "id": entry_id,
+                        "payload": payload,
+                        "preview": payload[:500],
+                    }
+                    for entry_id, payload in rows
+                ],
+            ),
+        }
+
+    @router.post("/operations/dead-letters/{stream}/{entry_id}/replay")
+    async def replay_dead_letter(  # pyright: ignore[reportUnusedFunction]
+        stream: Literal["ingest", "outbound", "knowledge"],
+        entry_id: str,
+    ) -> dict[str, JsonValue]:
+        source = _stream_name(context.settings, stream)
+        dead = f"{source}:dead"
+        rows = await context.streams.entries(dead, count=1_000)
+        payload = next((body for row_id, body in rows if row_id == entry_id), None)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="dead-letter entry not found")
+        dedupe_key = _replay_dedupe_key(stream, payload)
+        try:
+            replayed_id = await context.streams.replay_dead_letter(
+                dead,
+                entry_id,
+                source,
+                payload,
+                maxlen=context.settings.stream_maxlen,
+                dedupe_key=dedupe_key,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="dead-letter entry not found") from error
+        await context.audit.record(
+            "operations.dead_letter.replay",
+            {"stream": stream, "entry_id": entry_id, "replayed_id": replayed_id},
+        )
+        return {"replayed": True, "entry_id": entry_id, "replayed_id": replayed_id}
+
+    @router.post("/operations/messages")
+    async def send_operator_message(  # pyright: ignore[reportUnusedFunction]
+        update: OperatorMessageInput,
+    ) -> dict[str, JsonValue]:
+        if context.conversations is None or context.messages is None or context.outbound is None:
+            raise HTTPException(status_code=503, detail="outbound messaging is unavailable")
+        detail = await context.conversations.by_id(update.conversation_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        if detail.ephemeral or detail.platform == Platform.SANDBOX.value:
+            raise HTTPException(
+                status_code=409, detail="ephemeral conversations cannot be targeted"
+            )
+        trace_id = str(uuid4())
+        plan = ReplyPlan(text_segments=(update.text.strip(),))
+        message_id = await context.messages.record_outbound(
+            detail.id,
+            plan,
+            trace_id=trace_id,
+        )
+        outbound = OutboundMessage(
+            internal_message_id=message_id,
+            platform=Platform(detail.platform),
+            connection_id=detail.connection_id,
+            chat_kind=ChatKind(detail.chat_kind),
+            chat_id=detail.chat_id,
+            reply_plan=plan,
+            trace_id=trace_id,
+        )
+        stream_id = await context.outbound.publish(outbound.model_dump_json())
+        await context.audit.record(
+            "operations.message.send",
+            {"conversation_id": str(detail.id), "message_id": str(message_id)},
+        )
+        return {
+            "sent": True,
+            "message_id": str(message_id),
+            "stream_id": stream_id,
+            "trace_id": trace_id,
+        }
 
     @router.get("/conversations/{conversation_id}/messages")
     async def messages(  # pyright: ignore[reportUnusedFunction]
@@ -1243,46 +1402,7 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
 
     @router.get("/metrics")
     async def metrics() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
-        settings = context.settings
-        queues: dict[str, JsonValue] = {
-            "ingest": await context.streams.stream_len(settings.ingest_stream),
-            "outbound": await context.streams.stream_len(settings.outbound_stream),
-            "knowledge": await context.streams.stream_len(settings.knowledge_stream),
-            "ingest_dead_letter": await context.streams.stream_len(
-                f"{settings.ingest_stream}:dead"
-            ),
-            "outbound_dead_letter": await context.streams.stream_len(
-                f"{settings.outbound_stream}:dead"
-            ),
-            "knowledge_dead_letter": await context.streams.stream_len(
-                f"{settings.knowledge_stream}:dead"
-            ),
-        }
-        participation = (
-            await context.willingness.metrics(hours=24)
-            if context.willingness is not None
-            else {"allowed": 0, "blocked": 0}
-        )
-        annotation_metrics = (
-            await context.knowledge.annotation_metrics(hours=24)
-            if context.knowledge is not None
-            else {"hit": 0, "miss": 0, "error": 0, "total": 0, "hit_rate": 0.0}
-        )
-        feedback_metrics = (
-            await context.feedback.metrics() if context.feedback is not None else {
-                "positive": 0,
-                "negative": 0,
-                "total": 0,
-                "negative_rate": 0.0,
-            }
-        )
-        return {
-            "turns": cast(JsonValue, await context.views.turn_metrics()),
-            "queues": cast(JsonValue, queues),
-            "willingness": cast(JsonValue, participation),
-            "annotations": cast(JsonValue, annotation_metrics),
-            "feedback": cast(JsonValue, feedback_metrics),
-        }
+        return await collect_operator_metrics(context)
 
     @router.get("/profiles")
     async def profiles() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
@@ -1540,9 +1660,15 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
         enabled: list[str] = (
             [str(item) for item in cast(list[object], value)] if isinstance(value, list) else []
         )
+        conversations = [
+            row
+            for row in await context.views.conversations(limit=500)
+            if not bool(row.get("ephemeral"))
+        ]
         return {
             "enabled_conversations": cast(JsonValue, enabled),
             "globally_enabled": context.settings.proactive_enabled,
+            "conversations": cast(JsonValue, conversations),
         }
 
     @router.put("/config/proactive")
@@ -1689,6 +1815,42 @@ def _plugin_manifest(context: OperatorContext, plugin_id: str) -> PluginManifest
         if plugin.manifest.id == plugin_id:
             return plugin.manifest
     return None
+
+
+def _stream_name(
+    settings: Settings, stream: Literal["ingest", "outbound", "knowledge"]
+) -> str:
+    if stream == "ingest":
+        return settings.ingest_stream
+    if stream == "outbound":
+        return settings.outbound_stream
+    return settings.knowledge_stream
+
+
+def _metric_values(prefix: str, value: object) -> list[tuple[str, int | float]]:
+    collected: list[tuple[str, int | float]] = []
+    if isinstance(value, dict):
+        rows = sorted(
+            cast(dict[object, object], value).items(), key=lambda row: str(row[0])
+        )
+        for key, nested in rows:
+            safe = "".join(character if character.isalnum() else "_" for character in str(key))
+            collected.extend(_metric_values(f"{prefix}_{safe}", nested))
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        collected.append((prefix.lower(), value))
+    return collected
+
+
+def _replay_dedupe_key(
+    stream: Literal["ingest", "outbound", "knowledge"], payload: str
+) -> str | None:
+    if stream != "ingest":
+        return None
+    try:
+        event = InboundEvent.model_validate_json(payload)
+    except ValueError:
+        return None
+    return f"mybot:seen:ingest:{event.envelope.id}"
 
 
 async def _flush_knowledge_outbox(

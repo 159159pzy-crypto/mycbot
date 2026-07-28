@@ -19,6 +19,7 @@ from mybot.infrastructure.streams import (
     StreamPublisher,
     create_redis_backend,
 )
+from mybot.infrastructure.telemetry import start_span
 from mybot.repositories.traces import TraceStatus
 from mybot.runtime import ProcessMode
 from mybot.settings import Settings
@@ -120,6 +121,14 @@ class GatewayService:
 
     async def deliver_payload(self, payload: str) -> None:
         message = OutboundMessage.model_validate_json(payload)
+        with start_span(
+            "gateway.delivery",
+            trace_id=message.trace_id,
+            attributes={"mybot.platform": message.platform.value},
+        ):
+            await self._deliver(message)
+
+    async def _deliver(self, message: OutboundMessage) -> None:
         started = monotonic()
         if message.platform is Platform.QQ:
             adapter = self.qq
@@ -153,17 +162,36 @@ class GatewayService:
                 attributes={"error_code": type(error).__name__},
             )
             raise
-        await self.deliveries.mark_delivered(message.internal_message_id, platform_message_id)
-        await self._trace(
-            message,
-            duration_ms=int((monotonic() - started) * 1_000),
-            attributes={"platform": message.platform.value},
+        completion = asyncio.create_task(
+            self._complete_delivery(message, platform_message_id, started),
+            name="gateway-complete-delivery",
         )
+        try:
+            await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            # The platform already accepted the message. Finish persistence and
+            # tracing so the stream handler can ack instead of sending it twice.
+            await completion
         logger.info(
             "reply_delivered",
             platform=message.platform.value,
             chat_id=message.chat_id,
             platform_message_id=platform_message_id,
+        )
+
+    async def _complete_delivery(
+        self,
+        message: OutboundMessage,
+        platform_message_id: str,
+        started: float,
+    ) -> None:
+        await self._trace(
+            message,
+            duration_ms=int((monotonic() - started) * 1_000),
+            attributes={"platform": message.platform.value},
+        )
+        await self.deliveries.mark_delivered(
+            message.internal_message_id, platform_message_id
         )
 
     async def _trace(

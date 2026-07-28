@@ -24,6 +24,7 @@ from mybot.contracts import (
     TextSegment,
 )
 from mybot.repositories.conversations import ConversationRepository
+from mybot.repositories.knowledge import KnowledgeRepository
 from mybot.repositories.messages import MessageRepository
 
 DATABASE_URL = os.environ.get("MYBOT_TEST_DATABASE_URL")
@@ -117,6 +118,14 @@ async def test_by_stable_key_returns_delivery_details_or_none(
     assert detail.chat_kind == ChatKind.GROUP.value
     assert detail.chat_id == "333"
     assert missing is None
+
+
+async def test_pending_knowledge_tasks_accepts_unfiltered_query(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    tasks = await KnowledgeRepository(sessions).pending_ingest_tasks(limit=1)
+
+    assert len(tasks) <= 1
 
 
 async def test_record_inbound_round_trips_segments_and_reports_duplicates(

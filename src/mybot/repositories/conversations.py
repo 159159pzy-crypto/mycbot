@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from mybot.contracts import ConversationKey, Platform
 from mybot.repositories import conversations_table
@@ -64,6 +65,12 @@ class ConversationRepository:
             return ConversationRecord(id=row.id, stable_key=row.stable_key)
 
     async def by_stable_key(self, stable_key: str) -> ConversationDetail | None:
+        return await self._detail(conversations_table.c.stable_key == stable_key)
+
+    async def by_id(self, conversation_id: UUID) -> ConversationDetail | None:
+        return await self._detail(conversations_table.c.id == conversation_id)
+
+    async def _detail(self, where: ColumnElement[bool]) -> ConversationDetail | None:
         async with self.sessions() as session:
             row = (
                 await session.execute(
@@ -75,7 +82,7 @@ class ConversationRepository:
                         conversations_table.c.chat_kind,
                         conversations_table.c.chat_id,
                         conversations_table.c.ephemeral,
-                    ).where(conversations_table.c.stable_key == stable_key)
+                    ).where(where)
                 )
             ).one_or_none()
             if row is None:

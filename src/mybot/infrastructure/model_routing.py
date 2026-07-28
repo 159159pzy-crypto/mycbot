@@ -18,6 +18,7 @@ from redis.asyncio import Redis
 from mybot.contracts.common import FrozenModel, NonEmptyStr
 from mybot.infrastructure.embeddings import EmbeddingClient, EmbeddingError
 from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError, LlmReply
+from mybot.infrastructure.telemetry import start_span
 
 if TYPE_CHECKING:
     from mybot.settings import Settings
@@ -199,7 +200,16 @@ class ModelRouter:
             started = self.clock()
             try:
                 client = self._client(channel, purpose)
-                reply = await client.complete(messages, tools=tools)
+                with start_span(
+                    "llm.call",
+                    attributes={
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.provider.name": channel.name,
+                        "gen_ai.request.model": target.model,
+                        "mybot.model_purpose": purpose.value,
+                    },
+                ):
+                    reply = await client.complete(messages, tools=tools)
             except LlmError as error:
                 last_error = error
                 await self._record_error(
@@ -247,7 +257,16 @@ class ModelRouter:
             target = channel.model_map[purpose]
             started = self.clock()
             try:
-                vectors = await self._client(channel, purpose).embed(texts)
+                with start_span(
+                    "llm.embedding",
+                    attributes={
+                        "gen_ai.operation.name": "embeddings",
+                        "gen_ai.provider.name": channel.name,
+                        "gen_ai.request.model": target.model,
+                        "mybot.embedding_inputs": len(texts),
+                    },
+                ):
+                    vectors = await self._client(channel, purpose).embed(texts)
             except EmbeddingError as error:
                 last_error = error
                 await self._record_embedding_error(

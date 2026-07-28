@@ -41,6 +41,17 @@ class FakeDeliveries:
         self.delivered.append((message_id, platform_message_id))
 
 
+@dataclass
+class BlockingTrace:
+    entered: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def record(self, **_kwargs) -> UUID:  # type: ignore[no-untyped-def]
+        self.entered.set()
+        await self.release.wait()
+        return uuid4()
+
+
 def outbound(
     *,
     platform: Platform = Platform.QQ,
@@ -187,3 +198,21 @@ async def test_sandbox_sender_completes_delivery_without_external_platform() -> 
     assert deliveries.delivered == [
         (message.internal_message_id, f"sandbox:{message.internal_message_id}")
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_platform_send_finishes_trace_and_delivery_state() -> None:
+    backend = MemoryStreamBackend()
+    qq = FakeAdapter()
+    service, deliveries = make_service(backend, qq=qq, telegram=None)
+    trace = BlockingTrace()
+    service.traces = trace
+    message = outbound(platform=Platform.QQ)
+
+    task = asyncio.create_task(service.deliver_payload(message.model_dump_json()))
+    await asyncio.wait_for(trace.entered.wait(), timeout=1.0)
+    task.cancel()
+    trace.release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert deliveries.delivered == [(message.internal_message_id, "7001")]

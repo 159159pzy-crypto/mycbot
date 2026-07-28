@@ -37,12 +37,14 @@ from mybot.engine.agent_turns import AgentRuntime
 from mybot.engine.direct_replies import build_direct_reply
 from mybot.engine.turn_policy import decide_turn, extract_command
 from mybot.infrastructure.health import ReadinessResponse, create_readiness_service
+from mybot.infrastructure.leases import ConversationLease, LeaseManager, MemoryLeaseBackend
 from mybot.infrastructure.streams import (
     StreamConsumer,
     StreamPublisher,
     create_redis_backend,
     current_delivery_attempt,
 )
+from mybot.infrastructure.telemetry import start_span
 from mybot.repositories.conversations import ConversationRecord
 from mybot.repositories.messages import (
     StoredMessage,
@@ -270,7 +272,9 @@ class AgentWorkerService:
     traces: TraceSink | None = None
     access: InboundAccess | None = None
     evaluations: EvaluationSink | None = None
-    _conversation_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
+    leases: ConversationLease = field(
+        default_factory=lambda: LeaseManager(MemoryLeaseBackend())
+    )
 
     async def run(self, mode: ProcessMode, stop_event: asyncio.Event) -> None:
         logger.info("agent_worker_started", mode=mode.value)
@@ -292,9 +296,19 @@ class AgentWorkerService:
             chat_id=envelope.chat_id,
             thread_id=envelope.thread_id,
         )
-        # Serialize turns per conversation so one slow turn cannot reorder a chat.
-        async with self._lock_for(key.stable_key):
-            await self._handle_serialized(event, key)
+        with start_span(
+            "agent.turn",
+            trace_id=envelope.trace_id,
+            attributes={
+                "mybot.platform": envelope.platform.value,
+                "mybot.chat_kind": envelope.chat_kind.value,
+            },
+        ):
+            # A renewable Redis lease preserves per-conversation order across replicas.
+            await self.leases.run(
+                key.stable_key,
+                lambda: self._handle_serialized(event, key),
+            )
 
     async def _handle_serialized(self, event: InboundEvent, key: ConversationKey) -> None:
         envelope = event.envelope
@@ -834,13 +848,6 @@ class AgentWorkerService:
         )
         return forget_reply(revoked, capabilities=capabilities)
 
-    def _lock_for(self, stable_key: str) -> asyncio.Lock:
-        lock = self._conversation_locks.get(stable_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._conversation_locks[stable_key] = lock
-        return lock
-
     async def _readiness_report(self) -> ReadinessResponse | None:
         try:
             return await self.readiness.check()
@@ -917,6 +924,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.engine.willingness import ReplyWillingnessScorer
     from mybot.infrastructure.budget import TokenBudget
     from mybot.infrastructure.database import create_database_engine, create_session_factory
+    from mybot.infrastructure.leases import create_redis_lease_manager
     from mybot.infrastructure.model_routing import (
         ModelPurpose,
         ModelRouter,
@@ -1224,5 +1232,11 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
         evaluations=ShadowEvaluationSink(
             repository=evaluation_repository,
             judge=model_router.for_purpose(ModelPurpose.CHAT),
+        ),
+        leases=create_redis_lease_manager(
+            settings.redis_url.get_secret_value(),
+            ttl_ms=settings.conversation_lease_ttl_ms,
+            wait_timeout_seconds=settings.conversation_lease_wait_seconds,
+            retry_interval_seconds=settings.conversation_lease_retry_seconds,
         ),
     )

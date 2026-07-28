@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -14,14 +15,36 @@ class FakeProcess:
     pid: int
     returncode: int | None = None
     terminated: bool = False
+    killed: bool = False
 
     def terminate(self) -> None:
         self.terminated = True
         self.returncode = 0
 
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
     async def wait(self) -> int:
         if self.returncode is None:
             self.returncode = 0
+        return self.returncode
+
+
+@dataclass
+class HangingProcess(FakeProcess):
+    exit_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        super().kill()
+        self.exit_event.set()
+
+    async def wait(self) -> int:
+        await self.exit_event.wait()
+        assert self.returncode is not None
         return self.returncode
 
 
@@ -38,6 +61,23 @@ class FakeSpawner:
     ) -> FakeProcess:
         self.calls.append((source, runner_id, config))
         process = FakeProcess(pid=100 + len(self.calls))
+        self.processes.append(process)
+        return process
+
+
+class HangingFirstSpawner(FakeSpawner):
+    async def spawn(
+        self,
+        source: PluginSource,
+        runner_id: str,
+        config: dict[str, JsonValue],
+    ) -> FakeProcess:
+        self.calls.append((source, runner_id, config))
+        process: FakeProcess
+        if not self.processes:
+            process = HangingProcess(pid=100)
+        else:
+            process = FakeProcess(pid=100 + len(self.calls))
         self.processes.append(process)
         return process
 
@@ -99,6 +139,39 @@ async def test_supervisor_reloads_only_target_plugin_and_persists_status(tmp_pat
     assert any(item.startswith("plugin-") for item in unregistered)
     status = store.status()["plugins"]
     assert status["example.dice"]["state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_kills_child_that_ignores_graceful_reload(tmp_path: Path) -> None:
+    store = PluginControlStore(tmp_path)
+    spawner = HangingFirstSpawner()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"removed": True})
+        ),
+        base_url="http://api",
+    ) as client:
+        supervisor = PluginSupervisorService(
+            broker_url="http://api",
+            config_json='{"plugins": ["mybot.plugins.examples.dice:PLUGIN"]}',
+            store=store,
+            client=client,
+            inspector=FakeInspector(),
+            spawner=spawner,
+            stop_timeout_seconds=0.01,
+            kill_timeout_seconds=0.1,
+        )
+        await supervisor.reconcile()
+        first = spawner.processes[0]
+
+        store.request_action("example.dice", "reload")
+        await supervisor.reconcile()
+
+    assert first.terminated is True
+    assert first.killed is True
+    assert len(spawner.processes) == 2
+    assert dict(supervisor.processes())["example.dice"] != first.pid
 
 
 @pytest.mark.asyncio

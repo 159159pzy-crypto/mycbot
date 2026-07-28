@@ -97,19 +97,21 @@ class Clock:
         return self.now
 
 
-def test_rate_limiter_failures_expire_with_the_clock() -> None:
+@pytest.mark.asyncio
+async def test_rate_limiter_failures_expire_with_the_clock() -> None:
     clock = Clock()
     limiter = AuthRateLimiter(max_failures=2, window_seconds=60.0, clock=clock)
 
-    limiter.record_failure("client")
-    limiter.record_failure("client")
-    assert limiter.blocked("client") is True
+    await limiter.record_failure("client")
+    await limiter.record_failure("client")
+    assert await limiter.blocked("client") is True
 
     clock.now += 61.0
-    assert limiter.blocked("client") is False
+    assert await limiter.blocked("client") is False
 
 
-def test_guard_open_paths_never_touch_the_limiter() -> None:
+@pytest.mark.asyncio
+async def test_guard_open_paths_never_touch_the_limiter() -> None:
     from typing import ClassVar
 
     limiter = AuthRateLimiter(max_failures=1)
@@ -123,4 +125,4 @@ def test_guard_open_paths_never_touch_the_limiter() -> None:
         headers: ClassVar[dict[str, str]] = {}
         client = None
 
-    assert auth.guard(FakeRequest()) is None  # type: ignore[arg-type]
+    assert await auth.guard(FakeRequest()) is None  # type: ignore[arg-type]

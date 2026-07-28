@@ -136,7 +136,10 @@ class KnowledgeRepository:
                         SELECT document_id, generation
                         FROM kb_ingest_outbox
                         WHERE published_at IS NULL
-                          AND (:document_id IS NULL OR document_id = :document_id)
+                          AND (
+                              CAST(:document_id AS UUID) IS NULL
+                              OR document_id = CAST(:document_id AS UUID)
+                          )
                         ORDER BY created_at
                         LIMIT :limit
                         """

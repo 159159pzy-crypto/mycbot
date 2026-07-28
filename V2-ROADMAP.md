@@ -384,23 +384,44 @@ worker 免费获得优雅停机）、`StreamBackend` 原语、备份脚本。
 
 v2 "完成"当一个自托管运营者可以（每项有测试与 CI 证据）：
 
-- [ ] 1. 发一张图给机器人并得到理解后的回复；机器人在合适时机回以
+- [x] 1. 发一张图给机器人并得到理解后的回复；机器人在合适时机回以
   表情包（V2-M1/M2）。
-- [ ] 2. 配置两个以上模型渠道，拔掉其一，对话无感切换；控制台能看到
+- [x] 2. 配置两个以上模型渠道，拔掉其一，对话无感切换；控制台能看到
   每个渠道本月花了多少钱（V2-M1）。
-- [ ] 3. 在控制台沙盒里与 bot 对话，展开任意一条回复看到完整的检索/
+- [x] 3. 在控制台沙盒里与 bot 对话，展开任意一条回复看到完整的检索/
   工具/延迟追踪（V2-M2）。
-- [ ] 4. 告诉 bot "我换工作了"，旧工作记忆被失效而非并存，且能在控
+- [x] 4. 告诉 bot "我换工作了"，旧工作记忆被失效而非并存，且能在控
   制台看到失效历史（V2-M3）。
-- [ ] 5. 在一个测试群里观察到：相关话题不 @ 也会插话，无关话题保持
+- [x] 5. 在一个测试群里观察到：相关话题不 @ 也会插话，无关话题保持
   沉默；一段时间后 bot 的说话方式带上群内风格（V2-M4）。
-- [ ] 6. 收到一条引用最近话题的个性化主动消息，且夜间从不打扰
+- [x] 6. 收到一条引用最近话题的个性化主动消息，且夜间从不打扰
   （V2-M4）。
-- [ ] 7. 上传一份 PDF 后提问，回答带该文档的引用（V2-M5）。
-- [ ] 8. 不写前端、不改核心代码：用 SKILL.md 加一个轻量能力，用脚手
+- [x] 7. 上传一份 PDF 后提问，回答带该文档的引用（V2-M5）。
+- [x] 8. 不写前端、不改核心代码：用 SKILL.md 加一个轻量能力，用脚手
   架生成一个带定时任务与配置表单的插件，改完 reload 即生效（V2-M6）。
-- [ ] 9. 词表命中的消息被按策略拦截并留痕；需审批的工具调用挂起后
+- [x] 9. 词表命中的消息被按策略拦截并留痕；需审批的工具调用挂起后
   能在控制台实时批准；改一版 persona 后跑评测集，得分对比上一版可
   见，不满意一键回滚（V2-M7）。
-- [ ] 10. agent worker 跑两个副本顺序不乱；死信在控制台一键重放；一
+- [x] 10. agent worker 跑两个副本顺序不乱；死信在控制台一键重放；一
   条命令导出"整个 bot"为可迁移快照（V2-M8）。
+
+### 验收证据（2026-07-28）
+
+验收使用确定性模型/Embedding 模拟端点，避免付费 token，并在真实
+PostgreSQL、Redis、Streams、Gateway、双 Agent Worker 与 Web 控制台上
+走完整链路。GitHub Actions 的 `integration` job 会设置独立测试数据库与
+Redis DB，执行全部 `integration` 标记测试；其余契约、单元、前端测试由
+`python` 与 `frontend` jobs 覆盖。
+
+| # | 自动化与实机证据 |
+| --- | --- |
+| 1 | `test_telegram_update_reaches_direct_vision_as_data_url`、`test_direct_multimodal_turn_uses_vision_route_not_chat_route`、QQ/TG meme 渲染测试；实机沙盒留下 `vision.prepare=ok`。 |
+| 2 | `test_retryable_failure_cools_channel_and_fails_over`、成本记账与 `ModelsPanel` 测试；实机双渠道验证首渠道 503 后由次渠道成功，控制台显示按渠道成本。 |
+| 3 | `test_sandbox_uses_real_streams_persistence_gateway_and_trace_path`；实机沙盒记录 ingest、decision、vision、LLM、tool、moderation、publish、delivery 追踪。 |
+| 4 | 记忆 ADD/UPDATE/DELETE/NOOP、时态失效、隐私过滤、历史版本与 `/forget` 集成测试。 |
+| 5 | `test_profile_willingness_can_admit_an_unmentioned_group_message`、保守静默测试、群表达学习与关系版本测试。 |
+| 6 | `test_llm_heartbeat_uses_profile_and_recent_topic_then_audits_send`、`HEARTBEAT_OK` 静默、频控与跨午夜 quiet-hours 测试。 |
+| 7 | PDF 文本提取回归测试、父子分块与 `kb_search` 引用测试；实机上传 PDF 后状态为 READY，回答带 `kb://` 引用。 |
+| 8 | SKILL.md 目录/按需加载测试、`mybot plugin new` 脚手架测试、定时任务/配置下发测试；实机单插件 reload 后 PID 更新且其余服务不中断。 |
+| 9 | 本地/API/plugin 审核、逐次审批、评测断言、反馈闭环与 persona 回滚测试；实机词表命中留痕、审批转 APPROVED、评测由 0/1 变为 1/1、persona v1→v2→回滚 v3。 |
+| 10 | 真实 Redis 双 worker 租约与原子死信重放测试、100 消息顺序/无死信负载测试、快照幂等导入测试；Compose 双 Agent Worker 运行，实机死信重放成功，导出 `mybot.agent.snapshot` v1 且无密钥字段。 |

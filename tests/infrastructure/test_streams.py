@@ -43,6 +43,37 @@ async def collect(backend: MemoryStreamBackend, stream: str) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_dead_letter_replay_clears_dedupe_and_removes_source_entry() -> None:
+    backend = MemoryStreamBackend()
+    dead_id = await backend.add("mybot:ingest:dead", "payload", maxlen=100)
+    assert await backend.acquire_once("mybot:seen:ingest:event-1", ttl_seconds=60)
+
+    replayed = await backend.replay_dead_letter(
+        "mybot:ingest:dead",
+        dead_id,
+        "mybot:ingest",
+        "payload",
+        maxlen=100,
+        dedupe_key="mybot:seen:ingest:event-1",
+    )
+
+    assert replayed
+    assert not await backend.has_once("mybot:seen:ingest:event-1")
+    assert await backend.entries("mybot:ingest:dead") == []
+    assert [payload for _, payload in await backend.entries("mybot:ingest")] == ["payload"]
+
+    with pytest.raises(KeyError):
+        await backend.replay_dead_letter(
+            "mybot:ingest:dead",
+            dead_id,
+            "mybot:ingest",
+            "payload",
+            maxlen=100,
+            dedupe_key="mybot:seen:ingest:event-1",
+        )
+
+
+@pytest.mark.asyncio
 async def test_publish_appends_and_trims_to_maxlen() -> None:
     backend = MemoryStreamBackend()
     publisher = StreamPublisher(backend=backend, stream="mybot:ingest", maxlen=3)

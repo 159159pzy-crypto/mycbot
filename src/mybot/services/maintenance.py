@@ -10,6 +10,7 @@ from typing import Protocol, cast
 import httpx
 import structlog
 
+from mybot.infrastructure.telemetry import start_span
 from mybot.repositories.memory import LifecycleReport
 from mybot.runtime import ProcessMode
 from mybot.settings import Settings
@@ -174,6 +175,10 @@ class MaintenanceWorkerService:
                 continue
 
     async def _run_pass(self) -> None:
+        with start_span("maintenance.pass"):
+            await self._run_pass_inner()
+
+    async def _run_pass_inner(self) -> None:
         try:
             report = await self.memory.run_lifecycle(
                 now=self.now(),

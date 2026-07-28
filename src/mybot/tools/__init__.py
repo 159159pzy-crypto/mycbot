@@ -16,6 +16,7 @@ from mybot.contracts import (
     ToolSpec,
 )
 from mybot.contracts.json import thaw_json_object
+from mybot.infrastructure.telemetry import start_span
 
 logger = structlog.get_logger("mybot.tools")
 
@@ -89,6 +90,21 @@ class ToolExecutor:
     approval_requests: ApprovalRequestSource | None = None
 
     async def execute(
+        self,
+        tool_id: str,
+        context: ToolContext,
+        arguments: Mapping[str, JsonValue],
+    ) -> ToolResult:
+        with start_span(
+            "tool.execute",
+            attributes={
+                "mybot.tool.id": tool_id,
+                "mybot.tool.argument_count": len(arguments),
+            },
+        ):
+            return await self._execute(tool_id, context, arguments)
+
+    async def _execute(
         self,
         tool_id: str,
         context: ToolContext,

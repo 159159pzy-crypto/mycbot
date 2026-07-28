@@ -39,18 +39,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+        await plugin_broker.restore()
         yield
         if owns_readiness:
             await readiness_service.aclose()
         await operator_model_client.aclose()
         await operator_backend.aclose()
+        await plugin_broker.aclose()
+        if hasattr(operator_auth.limiter, "aclose"):
+            await operator_auth.limiter.aclose()  # type: ignore[attr-defined]
 
     from collections.abc import Awaitable, Callable
 
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
 
-    from mybot.operator.auth import AuthRateLimiter, OperatorAuth
+    from mybot.operator.auth import AuthRateLimiter, OperatorAuth, create_redis_auth_limiter
 
     operator_auth = OperatorAuth(
         token=(
@@ -58,16 +62,24 @@ def create_app(
             if resolved_settings.operator_token is not None
             else None
         ),
-        limiter=AuthRateLimiter(
-            max_failures=resolved_settings.operator_auth_max_failures,
-            window_seconds=resolved_settings.operator_auth_window_seconds,
+        limiter=(
+            create_redis_auth_limiter(
+                resolved_settings.redis_url.get_secret_value(),
+                max_failures=resolved_settings.operator_auth_max_failures,
+                window_seconds=resolved_settings.operator_auth_window_seconds,
+            )
+            if bootstrap
+            else AuthRateLimiter(
+                max_failures=resolved_settings.operator_auth_max_failures,
+                window_seconds=resolved_settings.operator_auth_window_seconds,
+            )
         ),
     )
 
     async def operator_auth_middleware(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        refusal = operator_auth.guard(request)
+        refusal = await operator_auth.guard(request)
         if refusal is not None:
             return refusal
         return await call_next(request)
@@ -88,7 +100,12 @@ def create_app(
         openai_client_factory,
     )
     from mybot.infrastructure.streams import StreamPublisher, create_redis_backend
-    from mybot.operator.api import OperatorContext, create_operator_router
+    from mybot.operator.api import (
+        OperatorContext,
+        collect_operator_metrics,
+        create_operator_router,
+        render_prometheus,
+    )
     from mybot.repositories.audit import AuditRepository
     from mybot.repositories.knowledge import KnowledgeRepository
     from mybot.repositories.llm_calls import LlmCallLogRepository
@@ -106,6 +123,19 @@ def create_app(
 
     operator_sessions = create_session_factory(create_database_engine(resolved_settings))
     operator_backend = create_redis_backend(resolved_settings.redis_url.get_secret_value())
+    from mybot.plugins.state import (
+        MemoryPluginRegistrationStore,
+        create_redis_plugin_registration_store,
+    )
+
+    plugin_broker.set_registration_store(
+        create_redis_plugin_registration_store(
+            resolved_settings.redis_url.get_secret_value(),
+            ttl_seconds=resolved_settings.plugin_registration_ttl_seconds,
+        )
+        if bootstrap
+        else MemoryPluginRegistrationStore()
+    )
     operator_config = SystemKvRepository(operator_sessions)
     operator_attempts = LlmCallLogRepository(operator_sessions)
     operator_model_router = ModelRouter(
@@ -144,53 +174,64 @@ def create_app(
             embeddings=operator_embeddings,
         )
     )
-    app.include_router(
-        create_operator_router(
-            OperatorContext(
-                views=OperatorViews(operator_sessions),
-                audit=AuditRepository(operator_sessions),
-                config=operator_config,
-                broker=plugin_broker,
-                streams=operator_backend,
-                settings=resolved_settings,
-                model_client=operator_model_client,
-                model_attempts=operator_attempts,
-                profiles=ProfileRepository(operator_sessions, legacy_persona=operator_config),
-                memory=operator_memory,
-                willingness=WillingnessAuditRepository(operator_sessions),
-                knowledge=KnowledgeRepository(operator_sessions),
-                embeddings=operator_embeddings,
-                skills=SkillStore(Path(resolved_settings.skills_dir)),
-                plugin_control=plugin_control,
-                plugin_installer=PluginInstaller(
-                    registry_path=Path(resolved_settings.plugin_registry_path),
-                    store=plugin_control,
-                    client=operator_model_client,
-                    max_bytes=resolved_settings.plugin_install_max_bytes,
-                ),
-                pairing=PairingRepository(operator_sessions),
-                moderation_audit=ModerationAuditRepository(operator_sessions),
-                approvals=ToolApprovalRepository(operator_sessions),
-                feedback=FeedbackRepository(operator_sessions),
-                evaluations=EvaluationRepository(operator_sessions),
-                evaluation_cases=EvaluationCaseStore(
-                    Path(resolved_settings.evaluation_cases_dir)
-                ),
-                conversations=ConversationRepository(operator_sessions),
-                messages=MessageRepository(operator_sessions),
-                sandbox=StreamPublisher(
-                    backend=operator_backend,
-                    stream=resolved_settings.ingest_stream,
-                    maxlen=resolved_settings.stream_maxlen,
-                ),
-                knowledge_tasks=StreamPublisher(
-                    backend=operator_backend,
-                    stream=resolved_settings.knowledge_stream,
-                    maxlen=resolved_settings.stream_maxlen,
-                ),
-            )
-        )
+    operator_context = OperatorContext(
+        views=OperatorViews(operator_sessions),
+        audit=AuditRepository(operator_sessions),
+        config=operator_config,
+        broker=plugin_broker,
+        streams=operator_backend,
+        settings=resolved_settings,
+        model_client=operator_model_client,
+        model_attempts=operator_attempts,
+        profiles=ProfileRepository(operator_sessions, legacy_persona=operator_config),
+        memory=operator_memory,
+        willingness=WillingnessAuditRepository(operator_sessions),
+        knowledge=KnowledgeRepository(operator_sessions),
+        embeddings=operator_embeddings,
+        skills=SkillStore(Path(resolved_settings.skills_dir)),
+        plugin_control=plugin_control,
+        plugin_installer=PluginInstaller(
+            registry_path=Path(resolved_settings.plugin_registry_path),
+            store=plugin_control,
+            client=operator_model_client,
+            max_bytes=resolved_settings.plugin_install_max_bytes,
+        ),
+        pairing=PairingRepository(operator_sessions),
+        moderation_audit=ModerationAuditRepository(operator_sessions),
+        approvals=ToolApprovalRepository(operator_sessions),
+        feedback=FeedbackRepository(operator_sessions),
+        evaluations=EvaluationRepository(operator_sessions),
+        evaluation_cases=EvaluationCaseStore(Path(resolved_settings.evaluation_cases_dir)),
+        conversations=ConversationRepository(operator_sessions),
+        messages=MessageRepository(operator_sessions),
+        sandbox=StreamPublisher(
+            backend=operator_backend,
+            stream=resolved_settings.ingest_stream,
+            maxlen=resolved_settings.stream_maxlen,
+        ),
+        outbound=StreamPublisher(
+            backend=operator_backend,
+            stream=resolved_settings.outbound_stream,
+            maxlen=resolved_settings.stream_maxlen,
+        ),
+        knowledge_tasks=StreamPublisher(
+            backend=operator_backend,
+            stream=resolved_settings.knowledge_stream,
+            maxlen=resolved_settings.stream_maxlen,
+        ),
     )
+    app.include_router(create_operator_router(operator_context))
+
+    if resolved_settings.prometheus_enabled:
+
+        async def prometheus_metrics() -> Response:
+            values = await collect_operator_metrics(operator_context)
+            return Response(
+                render_prometheus(values),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
+        app.add_api_route("/metrics", prometheus_metrics, methods=["GET"], tags=["metrics"])
 
     async def liveness() -> LivenessResponse:
         return LivenessResponse()

@@ -523,6 +523,11 @@ standing tool approvals. Persona edits the agent's system prompt; workers
 pick the change up on their next turn without a restart. Safety & Evaluation
 edits moderation policy, resolves pending per-call approvals, runs shadow
 regression suites, and shows assertion-level diffs.
+The **运维中心** replaces routine Redis CLI work: it lists each dead-letter
+stream, replays one reviewed entry while clearing its ingest dedupe key, sends
+an audited message as the bot to a selected real conversation, and configures
+proactive opt-in through a conversation selector instead of a handwritten
+stable key.
 
 The auth model is deliberately small: every `/operator/*` request requires
 `Authorization: Bearer $MYBOT_OPERATOR_TOKEN`; with the token unset the
@@ -643,12 +648,56 @@ Structured JSON logs and correlation IDs are always on. To export traces,
 point `MYBOT_OTEL_EXPORTER_OTLP_ENDPOINT` at an OTLP/HTTP collector (for
 example `http://otel-collector:4318`); the API bootstraps the OpenTelemetry
 SDK with FastAPI instrumentation, so every request — including operator and
-broker calls — emits spans carrying the correlation ID. Leaving the value
+broker calls — emits spans carrying the correlation ID. Gateway, agent-worker,
+knowledge-worker, maintenance-worker, and plugin-runner also initialize the
+same SDK; stream consumption, model calls, embeddings, tools, agent turns,
+gateway delivery, and maintenance passes emit manual spans. Envelope UUID
+`trace_id` values become the OTel trace id, aligning exported traces with the
+`trace_spans` rows in PostgreSQL. Leaving the value
 empty (the default) creates no exporter and adds no overhead. A minimal
 local pipeline is the `otel/opentelemetry-collector` image with an OTLP
 receiver and a logging or Prometheus exporter; the operator console's
 metrics panel complements this with turn latency, token usage, and queue
 depth without requiring any collector at all.
+
+Set `MYBOT_PROMETHEUS_ENABLED=true` to expose the standard unauthenticated
+`GET /metrics` text endpoint. It renders shared PostgreSQL/Redis operator
+metrics rather than one process's local counters, so queue/dead-letter and turn
+signals remain meaningful when roles have multiple replicas.
+
+## V2-M8: scaling, operations, and portable Agent snapshots
+
+Agent workers no longer use a process-local lock dictionary. Every turn holds
+a renewable Redis lease keyed by a SHA-256 of the conversation stable key;
+token-checked Lua renewal/release prevents one worker from releasing another's
+lease. Run multiple replicas with, for example,
+`docker compose up -d --scale agent-worker=2`. Different conversations remain
+parallel while one conversation stays ordered. Plugin runner manifests are
+stored in Redis with a heartbeat TTL and restored during API startup. Operator
+authentication failure counters also live in Redis, so changing API replicas
+does not reset throttling.
+
+Export a portable, versioned JSON snapshot without credentials:
+
+```console
+uv run mybot export --output backups/agent.json
+uv run mybot export --output backups/agent-with-history.json --include-history
+```
+
+The file contains current profiles/personas, core memory blocks, active
+memories (plus invalidated/revoked history only when requested), Markdown
+skills, and standing tool approvals. It deliberately excludes model keys,
+platform tokens, database URLs, and operator credentials. Import is merge-only
+and idempotent by profile name, memory identity/content boundary, and skill
+name:
+
+```console
+uv run mybot import backups/agent.json
+```
+
+`scripts/backup-agent.sh [output] [rclone-remote]` wraps export and optionally
+uses `rclone copyto` for off-site storage; rclone credentials remain in the
+operator's normal rclone configuration, never in MyBot files.
 
 ## V2-M2: image understanding, sandbox, and reply traces
 
