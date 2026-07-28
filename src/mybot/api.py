@@ -96,6 +96,12 @@ def create_app(
     from mybot.repositories.operator_views import OperatorViews
     from mybot.repositories.participation import WillingnessAuditRepository
     from mybot.repositories.profiles import ProfileRepository
+    from mybot.repositories.safety import (
+        EvaluationRepository,
+        FeedbackRepository,
+        ModerationAuditRepository,
+        ToolApprovalRepository,
+    )
     from mybot.repositories.system_kv import SystemKvRepository
 
     operator_sessions = create_session_factory(create_database_engine(resolved_settings))
@@ -119,9 +125,12 @@ def create_app(
     )
     operator_embeddings = operator_model_router.embeddings()
     operator_memory = MemoryRepository(operator_sessions)
+    from mybot.evaluation import EvaluationCaseStore
     from mybot.plugins.control import PluginControlStore
     from mybot.plugins.services import plugin_services
     from mybot.plugins.tooling import PluginInstaller
+    from mybot.repositories.conversations import ConversationRepository
+    from mybot.repositories.messages import MessageRepository
     from mybot.repositories.pairing import PairingRepository
     from mybot.skills import SkillStore
 
@@ -160,6 +169,15 @@ def create_app(
                     max_bytes=resolved_settings.plugin_install_max_bytes,
                 ),
                 pairing=PairingRepository(operator_sessions),
+                moderation_audit=ModerationAuditRepository(operator_sessions),
+                approvals=ToolApprovalRepository(operator_sessions),
+                feedback=FeedbackRepository(operator_sessions),
+                evaluations=EvaluationRepository(operator_sessions),
+                evaluation_cases=EvaluationCaseStore(
+                    Path(resolved_settings.evaluation_cases_dir)
+                ),
+                conversations=ConversationRepository(operator_sessions),
+                messages=MessageRepository(operator_sessions),
                 sandbox=StreamPublisher(
                     backend=operator_backend,
                     stream=resolved_settings.ingest_stream,

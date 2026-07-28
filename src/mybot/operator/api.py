@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -14,9 +14,13 @@ import httpx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from mybot.adapters import InboundEvent
 from mybot.contracts import (
     AgentProfile,
     AnnotationReply,
+    ChatKind,
+    ConversationKey,
+    EvaluationCase,
     KnowledgeDocument,
     KnowledgeIngestTask,
     KnowledgeScope,
@@ -24,12 +28,18 @@ from mybot.contracts import (
     MemoryItem,
     MemoryPrivacy,
     MemoryScope,
+    MessageEnvelope,
+    MessageFeedbackRating,
+    Platform,
     PluginManifest,
     ProfileMemoryPolicy,
+    ReplyPlan,
     ReplyWillingnessPolicy,
+    TextSegment,
 )
-from mybot.contracts.json import thaw_json_object
+from mybot.contracts.json import FrozenJsonValue, thaw_json_object
 from mybot.engine.knowledge import KnowledgeSearchService
+from mybot.evaluation import EvaluationCaseStore
 from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError
 from mybot.infrastructure.model_routing import (
     MODEL_CHANNELS_KEY,
@@ -46,13 +56,22 @@ from mybot.plugins.config import PluginConfigError, validate_plugin_config
 from mybot.plugins.control import PluginControlStore
 from mybot.plugins.tooling import PluginInstaller
 from mybot.repositories.audit import AuditRepository
+from mybot.repositories.conversations import ConversationRepository
 from mybot.repositories.knowledge import KnowledgeRepository
 from mybot.repositories.memory import MemoryRepository
+from mybot.repositories.messages import MessageRepository
 from mybot.repositories.operator_views import OperatorViews
 from mybot.repositories.pairing import PairingRepository
 from mybot.repositories.participation import WillingnessAuditRepository
 from mybot.repositories.profiles import ProfileRepository, ResolvedProfile
+from mybot.repositories.safety import (
+    EvaluationRepository,
+    FeedbackRepository,
+    ModerationAuditRepository,
+    ToolApprovalRepository,
+)
 from mybot.repositories.system_kv import SystemKvRepository
+from mybot.security.moderation import MODERATION_POLICY_KEY, ModerationPolicy
 from mybot.services.proactive import OPTIN_KEY
 from mybot.settings import Settings
 from mybot.skills import SkillDocument, SkillStore
@@ -65,6 +84,33 @@ class ProactiveUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled_conversations: list[str]
+
+
+class ApprovalDecisionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    note: str = Field(default="", max_length=2_000)
+
+
+class FeedbackInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rating: MessageFeedbackRating
+    note: str = Field(default="", max_length=4_000)
+
+
+class ModerationPolicyInput(ModerationPolicy):
+    model_config = ConfigDict(extra="forbid")
+
+
+class EvaluationRunInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    case_ids: list[str] = Field(default_factory=list)
+    profile_id: UUID | None = None
+    judge_enabled: bool = False
 
 
 class StreamLengths(Protocol):
@@ -225,6 +271,7 @@ class AnnotationFromMessageInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str | None = None
+    answer: str | None = None
     threshold: float = Field(default=0.92, ge=0.0, le=1.0)
 
 
@@ -257,6 +304,13 @@ class OperatorContext:
     plugin_control: PluginControlStore | None = None
     plugin_installer: PluginInstaller | None = None
     pairing: PairingRepository | None = None
+    moderation_audit: ModerationAuditRepository | None = None
+    approvals: ToolApprovalRepository | None = None
+    feedback: FeedbackRepository | None = None
+    evaluations: EvaluationRepository | None = None
+    evaluation_cases: EvaluationCaseStore | None = None
+    conversations: ConversationRepository | None = None
+    messages: MessageRepository | None = None
 
 
 def create_operator_router(context: OperatorContext) -> APIRouter:
@@ -279,6 +333,165 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     ) -> dict[str, JsonValue]:
         rows = await context.views.messages(conversation_id, limit=_bound(limit))
         return {"messages": cast(JsonValue, rows)}
+
+    @router.put("/messages/{message_id}/feedback")
+    async def save_feedback(  # pyright: ignore[reportUnusedFunction]
+        message_id: UUID, update: FeedbackInput
+    ) -> dict[str, JsonValue]:
+        if context.feedback is None:
+            raise HTTPException(status_code=503, detail="feedback store is unavailable")
+        try:
+            saved = await context.feedback.save(
+                message_id, rating=update.rating, note=update.note.strip()
+            )
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"feedback": cast(JsonValue, saved)}
+
+    @router.get("/safety/moderation-audit")
+    async def moderation_audit(  # pyright: ignore[reportUnusedFunction]
+        limit: int = 100,
+    ) -> dict[str, JsonValue]:
+        if context.moderation_audit is None:
+            return {"entries": []}
+        return {
+            "entries": cast(
+                JsonValue, await context.moderation_audit.recent(limit=_bound(limit))
+            )
+        }
+
+    @router.get("/safety/moderation-policy")
+    async def moderation_policy() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        raw = await context.config.get(MODERATION_POLICY_KEY)
+        policy = ModerationPolicy.model_validate(raw) if raw is not None else ModerationPolicy()
+        return {"policy": cast(JsonValue, policy.model_dump(mode="json"))}
+
+    @router.put("/safety/moderation-policy")
+    async def save_moderation_policy(  # pyright: ignore[reportUnusedFunction]
+        update: ModerationPolicyInput,
+    ) -> dict[str, JsonValue]:
+        policy = ModerationPolicy.model_validate(update.model_dump(mode="json"))
+        await context.config.set(
+            MODERATION_POLICY_KEY, cast(JsonValue, policy.model_dump(mode="json"))
+        )
+        await context.audit.record(
+            "moderation.policy.update",
+            {
+                "enabled": policy.enabled,
+                "backends": cast(JsonValue, policy.backends),
+                "keyword_count": len(policy.keywords),
+                "fail_mode": policy.fail_mode,
+            },
+        )
+        return {"policy": cast(JsonValue, policy.model_dump(mode="json"))}
+
+    @router.get("/safety/approvals")
+    async def pending_approvals() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        if context.approvals is None:
+            return {"requests": []}
+        return {"requests": cast(JsonValue, await context.approvals.pending())}
+
+    @router.post("/safety/approvals/{invocation_id}")
+    async def decide_approval(  # pyright: ignore[reportUnusedFunction]
+        invocation_id: UUID, update: ApprovalDecisionInput
+    ) -> dict[str, JsonValue]:
+        if context.approvals is None:
+            raise HTTPException(status_code=503, detail="approval store is unavailable")
+        changed = await context.approvals.decide(
+            invocation_id, approved=update.approved, note=update.note.strip()
+        )
+        if not changed:
+            raise HTTPException(status_code=409, detail="approval is no longer pending")
+        return {"decided": True, "approved": update.approved}
+
+    @router.get("/evaluations/cases")
+    async def evaluation_cases() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        cases = context.evaluation_cases.cases() if context.evaluation_cases else ()
+        return {
+            "cases": cast(
+                JsonValue, [case.model_dump(mode="json") for case in cases]
+            )
+        }
+
+    @router.post("/evaluations/cases")
+    async def save_evaluation_case(  # pyright: ignore[reportUnusedFunction]
+        case: EvaluationCase,
+    ) -> dict[str, JsonValue]:
+        if context.evaluation_cases is None:
+            raise HTTPException(status_code=503, detail="evaluation cases are unavailable")
+        path = context.evaluation_cases.append(case)
+        await context.audit.record(
+            "evaluation.case.save", {"case_id": case.id, "path": path.name}
+        )
+        return {"saved": True, "path": path.name}
+
+    @router.get("/evaluations/runs")
+    async def evaluation_runs() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        if context.evaluations is None:
+            return {"runs": []}
+        return {"runs": cast(JsonValue, await context.evaluations.list_runs())}
+
+    @router.get("/evaluations/runs/{run_id}")
+    async def evaluation_run(run_id: UUID) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        if context.evaluations is None:
+            raise HTTPException(status_code=503, detail="evaluation store is unavailable")
+        detail = await context.evaluations.run_detail(run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="evaluation run not found")
+        return detail
+
+    @router.post("/evaluations/runs")
+    async def start_evaluation_run(  # pyright: ignore[reportUnusedFunction]
+        update: EvaluationRunInput,
+    ) -> dict[str, JsonValue]:
+        if (
+            context.evaluations is None
+            or context.evaluation_cases is None
+            or context.conversations is None
+            or context.messages is None
+            or context.sandbox is None
+        ):
+            raise HTTPException(status_code=503, detail="evaluation runtime is unavailable")
+        available = {case.id: case for case in context.evaluation_cases.cases()}
+        selected = (
+            [available[case_id] for case_id in update.case_ids if case_id in available]
+            if update.case_ids
+            else list(available.values())
+        )
+        if not selected:
+            raise HTTPException(status_code=422, detail="no evaluation cases selected")
+        persona_version_id = None
+        model_channel = None
+        if update.profile_id is not None:
+            resolved = await _profiles(context).get(update.profile_id)
+            if resolved is None:
+                raise HTTPException(status_code=404, detail="profile not found")
+            persona_version_id = resolved.persona.id
+            model_channel = resolved.profile.model_tier
+        run_id, queued = await context.evaluations.create_run(
+            name=update.name.strip(),
+            dataset_path=str(context.evaluation_cases.root),
+            cases=selected,
+            profile_id=update.profile_id,
+            persona_version_id=persona_version_id,
+            model_channel=model_channel,
+            judge_enabled=(
+                update.judge_enabled and context.settings.evaluation_judge_enabled
+            ),
+        )
+        for result_id, case in queued:
+            await _seed_evaluation_case(
+                context,
+                run_id=run_id,
+                result_id=result_id,
+                case=case,
+                profile_id=update.profile_id,
+            )
+        await context.audit.record(
+            "evaluation.run.start",
+            {"run_id": str(run_id), "case_count": len(queued)},
+        )
+        return {"run_id": str(run_id), "queued": len(queued)}
 
     @router.get("/knowledge/documents")
     async def knowledge_documents() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
@@ -445,6 +658,7 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
             conversation_id=conversation_id,
             message_id=message_id,
             question=question,
+            answer=request.answer,
             threshold=request.threshold,
             embedding=batch.vectors[0],
             embedding_model=batch.model,
@@ -1054,11 +1268,20 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
             if context.knowledge is not None
             else {"hit": 0, "miss": 0, "error": 0, "total": 0, "hit_rate": 0.0}
         )
+        feedback_metrics = (
+            await context.feedback.metrics() if context.feedback is not None else {
+                "positive": 0,
+                "negative": 0,
+                "total": 0,
+                "negative_rate": 0.0,
+            }
+        )
         return {
             "turns": cast(JsonValue, await context.views.turn_metrics()),
             "queues": cast(JsonValue, queues),
             "willingness": cast(JsonValue, participation),
             "annotations": cast(JsonValue, annotation_metrics),
+            "feedback": cast(JsonValue, feedback_metrics),
         }
 
     @router.get("/profiles")
@@ -1357,6 +1580,75 @@ def _knowledge(context: OperatorContext) -> KnowledgeRepository:
     if context.knowledge is None:
         raise HTTPException(status_code=503, detail="knowledge store is unavailable")
     return context.knowledge
+
+
+async def _seed_evaluation_case(
+    context: OperatorContext,
+    *,
+    run_id: UUID,
+    result_id: UUID,
+    case: EvaluationCase,
+    profile_id: UUID | None,
+):
+    assert context.conversations is not None
+    assert context.messages is not None
+    assert context.sandbox is not None
+    assert context.evaluations is not None
+    key = ConversationKey(
+        connection_id="evaluation",
+        chat_kind=ChatKind.DIRECT,
+        chat_id=f"{run_id}:{case.id}",
+    )
+    conversation = await context.conversations.get_or_create(
+        key, platform=Platform.SANDBOX, ephemeral=True
+    )
+    if profile_id is not None:
+        await _profiles(context).bind(conversation.id, profile_id)
+    occurred_at = datetime.now(tz=UTC)
+    for index, item in enumerate(case.history):
+        timestamp = occurred_at + timedelta(milliseconds=index)
+        if item.role == "user":
+            await context.messages.record_inbound(
+                conversation.id,
+                MessageEnvelope(
+                    id=f"evaluation:{result_id}:history:{index}",
+                    connection_id="evaluation",
+                    platform=Platform.SANDBOX,
+                    chat_kind=ChatKind.DIRECT,
+                    chat_id=key.chat_id,
+                    sender_identity_id="evaluation:user",
+                    occurred_at=timestamp,
+                    segments=(TextSegment(text=item.content),),
+                    ephemeral=True,
+                ),
+            )
+        else:
+            await context.messages.record_outbound(
+                conversation.id,
+                ReplyPlan(text_segments=(item.content,)),
+                occurred_at=timestamp,
+            )
+    envelope = MessageEnvelope(
+        id=f"evaluation:{result_id}:question",
+        connection_id="evaluation",
+        platform=Platform.SANDBOX,
+        chat_kind=ChatKind.DIRECT,
+        chat_id=key.chat_id,
+        sender_identity_id="evaluation:user",
+        occurred_at=occurred_at + timedelta(milliseconds=len(case.history) + 1),
+        segments=(TextSegment(text=case.question),),
+        raw_ref=cast(
+            FrozenJsonValue,
+            {
+                "evaluation_run_id": str(run_id),
+                "evaluation_result_id": str(result_id),
+            },
+        ),
+        ephemeral=True,
+    )
+    await context.evaluations.attach_conversation(result_id, conversation.id)
+    await context.sandbox.publish(InboundEvent(envelope=envelope).model_dump_json())
+    return conversation
 
 
 def _embeddings(context: OperatorContext) -> Embeddings:

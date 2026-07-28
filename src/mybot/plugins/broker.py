@@ -12,7 +12,7 @@ import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
-from mybot.contracts import PluginManifest, ToolSpec
+from mybot.contracts import ModerationDecision, ModerationRequest, PluginManifest, ToolSpec
 from mybot.contracts.json import thaw_json_object
 from mybot.plugins.config import PluginConfigError, validate_plugin_config
 
@@ -439,6 +439,26 @@ class PluginBroker:
         self.audit_log.append(AuditEntry(plugin_id, "service_invoked", f"{service}@{version}"))
         return result
 
+    async def moderate(self, request: ModerationRequest) -> ModerationDecision:
+        candidates = sorted(
+            (
+                tool
+                for tool in self._tools.values()
+                if "moderation" in tool.spec.capabilities
+            ),
+            key=lambda item: item.spec.id,
+        )
+        if not candidates:
+            raise HTTPException(status_code=503, detail="no moderation plugin is registered")
+        result = await self.invoke(
+            candidates[0].spec.id,
+            request.model_dump(mode="json"),
+            {"system": "moderation"},
+        )
+        if result.get("ok") is not True or not isinstance(result.get("data"), dict):
+            raise HTTPException(status_code=502, detail="moderation plugin returned an error")
+        return ModerationDecision.model_validate(result["data"])
+
     def _consume_service_quota(self, plugin_id: str, service: str) -> None:
         now = self._clock()
         calls = self._service_calls.setdefault((plugin_id, service), deque())
@@ -560,6 +580,11 @@ def create_broker_router(broker: PluginBroker) -> APIRouter:
             arguments=request.arguments,
         )
         return {"result": cast(JsonValue, result)}
+
+    @router.post("/moderate")
+    async def moderate(request: ModerationRequest) -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        result = await broker.moderate(request)
+        return {"result": cast(JsonValue, result.model_dump(mode="json"))}
 
     @router.get("/health")
     def health() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]

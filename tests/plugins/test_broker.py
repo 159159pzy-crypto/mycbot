@@ -19,6 +19,7 @@ def manifest_payload(
     *,
     plugin_id: str = "example.dice",
     requested: list[str] | None = None,
+    tool_capabilities: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "id": plugin_id,
@@ -33,7 +34,7 @@ def manifest_payload(
                 "read_only": True,
                 "idempotent": False,
                 "risk": "NONE",
-                "capabilities": [],
+                "capabilities": tool_capabilities or [],
                 "approval_required": False,
             }
         ],
@@ -193,6 +194,58 @@ async def test_invoke_work_result_round_trip(client: httpx.AsyncClient) -> None:
 
     assert response.status_code == 200
     assert response.json()["result"]["data"] == {"value": 4}
+
+
+@pytest.mark.asyncio
+async def test_moderation_endpoint_uses_registered_moderation_tool(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.post(
+        "/plugin-broker/register",
+        json={
+            "runner_id": "runner-1",
+            "manifests": [manifest_payload(tool_capabilities=["moderation"])],
+        },
+    )
+
+    async def fake_runner() -> None:
+        work = (
+            await client.get(
+                "/plugin-broker/work",
+                params={"runner_id": "runner-1", "wait_seconds": 2.0},
+            )
+        ).json()
+        invocation = work["invocations"][0]
+        assert invocation["arguments"]["point"] == "inbound"
+        assert invocation["context"] == {"system": "moderation"}
+        await client.post(
+            "/plugin-broker/result",
+            json={
+                "invocation_id": invocation["invocation_id"],
+                "result": {
+                    "ok": True,
+                    "data": {
+                        "flagged": True,
+                        "action": "direct_output",
+                        "preset_response": "blocked by plugin",
+                        "backend": "plugin-test",
+                        "reason": "policy",
+                    },
+                    "error": None,
+                },
+            },
+        )
+
+    runner_task = asyncio.create_task(fake_runner())
+    response = await client.post(
+        "/plugin-broker/moderate",
+        json={"point": "inbound", "params": {"text": "unsafe"}},
+    )
+    await runner_task
+
+    assert response.status_code == 200
+    assert response.json()["result"]["flagged"] is True
+    assert response.json()["result"]["preset_response"] == "blocked by plugin"
 
 
 @pytest.mark.asyncio

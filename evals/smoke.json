@@ -1,0 +1,17 @@
+[
+  {
+    "id": "offline-citation-smoke",
+    "name": "离线引用断言冒烟",
+    "question": "根据手册回答并引用来源",
+    "expected": {
+      "must_contain": ["手册"],
+      "must_not_contain": ["不知道"],
+      "must_call_tool": ["kb_search"],
+      "must_cite": true
+    },
+    "tags": ["offline", "ci"],
+    "offline_response": "根据手册，维护窗口为每周日。",
+    "offline_tool_calls": ["kb_search"],
+    "offline_citations": ["kb://handbook/maintenance"]
+  }
+]

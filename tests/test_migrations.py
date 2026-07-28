@@ -310,3 +310,34 @@ def test_knowledge_migration_chains_and_preserves_shared_vector_extension() -> N
         ("drop_table", "kb_document"),
     ]
     assert all("DROP EXTENSION" not in call[1] for call in operations.calls)
+
+
+def test_safety_evaluation_migration_chains_and_downgrades_cleanly() -> None:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260728_0013_safety_evaluation.py"
+    )
+    namespace = runpy.run_path(str(migration_path))
+    assert namespace["revision"] == "20260728_0013"
+    assert namespace["down_revision"] == "20260728_0012"
+
+    downgrade = namespace["downgrade"]
+    operations = RecordingOperations()
+    downgrade.__globals__["op"] = operations
+    downgrade()
+
+    assert operations.calls == [
+        ("drop_index", "ix_message_feedback_updated"),
+        ("drop_table", "message_feedback"),
+        ("drop_index", "ix_evaluation_result_run_status"),
+        ("drop_table", "evaluation_result"),
+        ("drop_index", "ix_evaluation_run_created"),
+        ("drop_table", "evaluation_run"),
+        ("drop_index", "ix_tool_approval_request_pending"),
+        ("drop_table", "tool_approval_request"),
+        ("drop_index", "ix_moderation_audit_conversation_created"),
+        ("drop_index", "ix_moderation_audit_created"),
+        ("drop_table", "moderation_audit"),
+    ]

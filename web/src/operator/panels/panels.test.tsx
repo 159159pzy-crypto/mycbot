@@ -9,6 +9,7 @@ import { OverviewPanel } from './OverviewPanel';
 import { PersonaPanel } from './PersonaPanel';
 import { PluginsPanel } from './PluginsPanel';
 import { SandboxPanel } from './SandboxPanel';
+import { SafetyPanel } from './SafetyPanel';
 
 function stubClient(routes: Record<string, unknown>): OperatorClient & {
   sent: Array<{ method: string; path: string; body: unknown }>;
@@ -76,7 +77,13 @@ describe('ConversationsPanel', () => {
             text: '讲个笑话',
             occurred_at: null,
           },
-          { direction: 'outbound', sender_identity_id: 'self', text: '好的', occurred_at: null },
+          {
+            id: 'msg-out-1',
+            direction: 'outbound',
+            sender_identity_id: 'self',
+            text: '好的',
+            occurred_at: null,
+          },
         ],
       },
       '/operator/conversations/conv-1/turns': {
@@ -112,6 +119,9 @@ describe('ConversationsPanel', () => {
           },
         ],
       },
+      '/operator/messages/msg-out-1/feedback': {
+        feedback: { rating: 'NEGATIVE', note: '太啰嗦' },
+      },
       '/operator/conversations': {
         conversations: [
           {
@@ -141,6 +151,94 @@ describe('ConversationsPanel', () => {
     expect(screen.getByText('memory.retrieval')).toBeInTheDocument();
     fireEvent.click(screen.getByText('查看阶段属性'));
     expect(screen.getByText(/喜欢美式咖啡/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('反馈备注或精修答案'), {
+      target: { value: '太啰嗦' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '差评' }));
+    await waitFor(() =>
+      expect(client.sent).toContainEqual({
+        method: 'PUT',
+        path: '/operator/messages/msg-out-1/feedback',
+        body: { rating: 'NEGATIVE', note: '太啰嗦' },
+      }),
+    );
+  });
+});
+
+describe('SafetyPanel', () => {
+  it('edits moderation policy and renders per-case evaluation diffs', async () => {
+    const policy = {
+      enabled: true,
+      backends: ['local'] as Array<'local' | 'api' | 'plugin'>,
+      fail_mode: 'open' as const,
+      keywords: ['bad'],
+      inbound: { enabled: true, action: 'direct_output' as const, preset_response: 'blocked' },
+      outbound: { enabled: true, action: 'direct_output' as const, preset_response: 'blocked' },
+    };
+    const run = {
+      id: 'run-1',
+      name: 'persona regression',
+      status: 'COMPLETED',
+      total: 1,
+      completed: 1,
+      passed: 0,
+      failed: 1,
+      persona_version_id: 'persona-version-1',
+      model_channel: 'primary',
+      created_at: '2026-07-28T00:00:00Z',
+    };
+    const client = stubClient({
+      '/operator/evaluations/runs/run-1': {
+        run,
+        results: [
+          {
+            id: 'result-1',
+            case_id: 'case-1',
+            case_snapshot: {
+              id: 'case-1',
+              name: 'must greet',
+              question: 'hello',
+              expected: { must_contain: ['hi'] },
+              tags: [],
+            },
+            status: 'COMPLETED',
+            response: 'bye',
+            passed: false,
+            assertions: [
+              { kind: 'must_contain', expected: 'hi', actual: 'bye', passed: false },
+            ],
+            tool_calls: [],
+            citations: [],
+            model_channel: 'primary',
+            model: 'chat-model',
+          },
+        ],
+      },
+      '/operator/safety/moderation-policy': { policy },
+      '/operator/safety/moderation-audit': { entries: [] },
+      '/operator/safety/approvals': { requests: [] },
+      '/operator/evaluations/cases': { cases: [] },
+      '/operator/evaluations/runs': { runs: [run] },
+    });
+
+    render(<SafetyPanel client={client} />);
+
+    await screen.findByText('persona regression');
+    fireEvent.click(screen.getByText('plugin'));
+    fireEvent.click(screen.getByRole('button', { name: '保存策略' }));
+    await waitFor(() =>
+      expect(client.sent[0]).toMatchObject({
+        method: 'PUT',
+        path: '/operator/safety/moderation-policy',
+        body: { backends: ['local', 'plugin'] },
+      }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'persona regression' }));
+    await screen.findByText('bye');
+    expect(screen.getByText('期望 "hi"')).toBeInTheDocument();
+    expect(screen.getByText('实际 "bye"')).toBeInTheDocument();
+    expect(screen.getByText(/primary \/ chat-model/)).toBeInTheDocument();
   });
 });
 
