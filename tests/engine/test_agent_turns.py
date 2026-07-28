@@ -21,6 +21,7 @@ from mybot.engine.agent_turns import (
     BUDGET_FALLBACK,
     LLM_FAILURE_FALLBACK,
     NOT_CONFIGURED_FALLBACK,
+    AgentRuntime,
     AgentTurnEngine,
 )
 from mybot.infrastructure.budget import TokenBudget
@@ -482,8 +483,12 @@ class FakeMemoryHooks:
     fail_retrieval: bool = False
     fail_extraction: bool = False
     extractions: list[str] = field(default_factory=list)
+    retrieval_limits: list[int | None] = field(default_factory=list)
 
-    async def retrieval_block(self, envelope, inbound_text):  # type: ignore[no-untyped-def]
+    async def retrieval_block(  # type: ignore[no-untyped-def]
+        self, envelope, inbound_text, *, limit=None
+    ):
+        self.retrieval_limits.append(limit)
         if self.fail_retrieval:
             raise RuntimeError("retrieval boom")
         return self.block
@@ -600,3 +605,60 @@ async def test_persona_override_and_history_window_shape_the_prompt() -> None:
     assert contents[2] == "之前的回答"
     assert contents[-1] == "讲个笑话"
     assert contents.count("讲个笑话") == 1
+
+
+@pytest.mark.asyncio
+async def test_profile_runtime_overrides_persona_and_can_disable_memory() -> None:
+    llm = FakeLlm(reply=LlmReply(text="回答", model="m", prompt_tokens=1, completion_tokens=1))
+    engine = make_engine(
+        llm=llm,
+        turns=FakeTurns(),
+        persona=FakePersona(values={"agent.system_prompt": "旧的人设"}),
+    )
+    memory = FakeMemoryHooks()
+    engine.memory = memory
+    runtime = AgentRuntime(
+        system_prompt="会话 profile 人设",
+        granted_capabilities=("web.search",),
+        memory_enabled=False,
+    )
+
+    await engine.run_turn(
+        conversation_id=uuid4(),
+        stable_key="group-a",
+        envelope=envelope(),
+        decision=DECISION,
+        inbound_message_id=uuid4(),
+        capabilities=TELEGRAM_CAPABILITIES,
+        runtime=runtime,
+    )
+    await engine.after_reply(
+        envelope=envelope(),
+        stable_key="group-a",
+        reply_text="回答",
+        runtime=runtime,
+    )
+
+    assert "会话 profile 人设" in str(llm.calls[0][0].content)
+    assert all("喜欢美式咖啡" not in str(message.content) for message in llm.calls[0])
+    assert memory.extractions == []
+
+
+@pytest.mark.asyncio
+async def test_profile_runtime_applies_its_memory_retrieval_limit() -> None:
+    llm = FakeLlm(reply=LlmReply(text="回答", model="m", prompt_tokens=1, completion_tokens=1))
+    engine = make_engine(llm=llm, turns=FakeTurns())
+    memory = FakeMemoryHooks()
+    engine.memory = memory
+
+    await engine.run_turn(
+        conversation_id=uuid4(),
+        stable_key="group-a",
+        envelope=envelope(),
+        decision=DECISION,
+        inbound_message_id=uuid4(),
+        capabilities=TELEGRAM_CAPABILITIES,
+        runtime=AgentRuntime(memory_retrieval_limit=2, relationship_enabled=False),
+    )
+
+    assert memory.retrieval_limits == [2]

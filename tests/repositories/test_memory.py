@@ -363,6 +363,58 @@ async def test_forget_in_direct_chat_also_revokes_conversation_memories(
     assert [memory.content for memory in remaining] == ["other conversation fact"]
 
 
+async def test_relationship_successors_and_expression_lookup_keep_m4_boundaries(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = MemoryRepository(sessions)
+    first = MemoryItem(
+        scope=MemoryScope.SUBJECT,
+        subject_identity_id=SUBJECT,
+        kind="RELATIONSHIP",
+        content="初次认识, 交流礼貌",
+        source_message_ids=("m1",),
+        confidence=0.85,
+        relationship_score=10.0,
+        privacy=MemoryPrivacy.PRIVATE,
+    )
+    second = first.model_copy(
+        update={"content": "逐渐熟悉, 喜欢直接沟通", "relationship_score": 25.0}
+    )
+    initial = await repository.upsert_relationship(first, source="test", now=NOW)
+    successor = await repository.upsert_relationship(
+        second, source="test", now=NOW + timedelta(minutes=1)
+    )
+    current = await repository.relationship_for(
+        SUBJECT, now=NOW + timedelta(minutes=2)
+    )
+
+    assert initial.operation is MemoryOperation.ADD
+    assert successor.operation is MemoryOperation.UPDATE
+    assert successor.previous_memory_id == first.id
+    assert current is not None
+    assert current.content == "逐渐熟悉, 喜欢直接沟通"
+    assert current.relationship_score == 25.0
+
+    expression = MemoryItem(
+        scope=MemoryScope.CONVERSATION,
+        conversation=OTHER_CONVERSATION,
+        kind="EXPRESSION",
+        content="短句, 轻松收尾",
+        source_message_ids=("m2",),
+        confidence=0.9,
+        privacy=MemoryPrivacy.SHARED,
+    )
+    await repository.store(expression, embedding=None, embedding_model=None)
+
+    assert await repository.active_expressions(
+        CONVERSATION.stable_key, now=NOW, limit=3
+    ) == ()
+    local = await repository.active_expressions(
+        OTHER_CONVERSATION.stable_key, now=NOW, limit=3
+    )
+    assert [row.content for row in local] == ["短句, 轻松收尾"]
+
+
 async def test_search_with_empty_table_returns_nothing(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:

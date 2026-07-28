@@ -194,10 +194,11 @@ exception text. Enabled embedding channels must use the same model so vector
 spaces are never mixed. The Models panel summarizes the last 30 days by day,
 conversation, and channel, including token totals and price-snapshot cost.
 
-The default persona comes from `MYBOT_AGENT_SYSTEM_PROMPT` and is edited
-at runtime without a restart in the operator console's Persona panel
-(stored as the `agent.system_prompt` key in `system_kv`; direct SQL works
-too):
+The first default profile is seeded from `MYBOT_AGENT_SYSTEM_PROMPT`. During
+upgrade, an existing `agent.system_prompt` value in `system_kv` is preserved
+as that profile's first immutable persona version. The operator console's
+**档位与人设** page is authoritative for subsequent edits; saving or rolling
+back creates a new persona version instead of overwriting history.
 
 ```sql
 INSERT INTO system_kv (key, value)
@@ -279,6 +280,40 @@ active memories; its candidates re-enter the normal merge pipeline. Lifecycle
 expiry/decay uses `invalid_at`, while only privacy-revoked rows older than
 `MYBOT_MEMORY_REVOKED_RETENTION_DAYS` are physically purged. Embeddings remain
 model-tagged, so incompatible vectors are never compared.
+
+## Group personality and profiles
+
+Every conversation resolves one profile before participation is decided. A
+profile binds an immutable persona version, model tier, tool grants, memory
+policy, same-conversation expression example count, relationship switch, and
+group reply-willingness policy. Unbound conversations use the conservative
+default profile; its willingness switch is off, so upgrading cannot make the
+bot start talking in groups unexpectedly.
+
+Unaddressed group messages are scored before any chat-model call. Explicit
+keywords, question/request cues, persona and visible-memory relevance, recent
+group activity, and recent bot presence produce deterministic components that
+are written to `reply_willingness_audit`. Semantic dependency failures fail
+closed. Mentions, replies, commands, existing rate limits, and group cooldowns
+keep their previous behavior. The Overview page reports the last 24 hours of
+allowed and blocked willingness decisions.
+
+Optional background personality learning is group-only and off by default.
+It extracts short style patterns into active
+`CONVERSATION/SHARED/EXPRESSION` memory, so prompt injection can never cross a
+conversation boundary. Relationship summaries are
+`SUBJECT/PRIVATE/RELATIONSHIP` memories with a 0–100 familiarity score; every
+learned or operator edit appends a successor and invalidates the old version,
+so `/forget`, revocation, history, and decay use the same M3 lifecycle.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `MYBOT_PERSONALITY_LEARNING_ENABLED` | false | Global cost/privacy switch for expression and relationship learning |
+| `MYBOT_PERSONALITY_LEARNING_LOOKBACK_HOURS` | 24 | Recent group dialogue window |
+| `MYBOT_PERSONALITY_LEARNING_CONVERSATION_LIMIT` | 10 | Maximum groups per maintenance pass |
+| `MYBOT_PERSONALITY_LEARNING_MESSAGE_LIMIT` | 80 | Maximum inbound messages per group |
+| `MYBOT_PERSONALITY_LEARNING_TOKEN_BUDGET` | 3000 | Hard prompt budget per learned group context |
+| `MYBOT_PERSONALITY_LEARNING_MIN_CONFIDENCE` | 0.7 | Minimum expression confidence |
 
 ## Plugins
 
@@ -440,17 +475,21 @@ Off by default, and triple-gated when on: `MYBOT_PROACTIVE_ENABLED` is
 the global kill switch, only conversations opted in through
 `GET/PUT /operator/config/proactive` (audited) are ever considered, and
 each send must clear UTC quiet hours plus a per-conversation frequency
-cap before the maintenance worker publishes the check-in through the
-normal outbound stream. Every proactive send is recorded as a
-`PROACTIVE`-triggered turn, so the console shows exactly what was sent
-where.
+cap before the maintenance worker runs the bound persona against a bounded
+recent transcript plus durable core memory. The background model must return
+exactly `HEARTBEAT_OK` when there is no concrete reason to interrupt; that
+sentinel is silently suppressed. Sent, suppressed, and failed generations are
+written to `proactive_generation_audit`, including persona version, model, and
+token usage. Actual sends still use the normal outbound stream and are
+recorded as `PROACTIVE` turns.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `MYBOT_PROACTIVE_ENABLED` | false | Global kill switch |
 | `MYBOT_PROACTIVE_MIN_INTERVAL_HOURS` | 24 | Frequency cap per conversation |
 | `MYBOT_PROACTIVE_QUIET_START_HOUR` / `MYBOT_PROACTIVE_QUIET_END_HOUR` | 22 / 8 | UTC quiet window; equal values disable it, and it may wrap midnight |
-| `MYBOT_PROACTIVE_MESSAGE` | built-in template | The check-in text |
+| `MYBOT_PROACTIVE_CONTEXT_MESSAGES` | 12 | Maximum recent messages supplied to heartbeat generation |
+| `MYBOT_PROACTIVE_MESSAGE` | built-in fallback | Used only when no heartbeat LLM is wired |
 
 ## Backups and day-2 operations
 

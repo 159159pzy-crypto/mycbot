@@ -45,6 +45,7 @@ class MemoryItem(FrozenModel):
     content: NonEmptyStr
     source_message_ids: tuple[NonEmptyStr, ...] = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
+    relationship_score: float | None = Field(default=None, ge=0.0, le=100.0)
     privacy: MemoryPrivacy
     valid_from: datetime | None = None
     valid_until: datetime | None = None
@@ -77,6 +78,13 @@ class MemoryItem(FrozenModel):
                 raise ValueError("CONVERSATION scope requires a conversation reference")
             if self.subject_identity_id is not None:
                 raise ValueError("CONVERSATION scope forbids subject_identity_id")
+
+        if self.relationship_score is not None and (
+            self.scope is not MemoryScope.SUBJECT or self.kind.upper() != "RELATIONSHIP"
+        ):
+            raise ValueError(
+                "relationship_score is only valid for SUBJECT RELATIONSHIP memory"
+            )
 
         if (
             self.valid_from is not None

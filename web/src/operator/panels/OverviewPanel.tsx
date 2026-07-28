@@ -109,6 +109,7 @@ export function OverviewPanel({ client }: { client: OperatorClient }) {
   const outcomes = Object.entries(state.metrics.turns.by_outcome);
   const maxOutcome = Math.max(...outcomes.map(([, count]) => count), 1);
   const queues = Object.entries(state.metrics.queues);
+  const willingness = state.metrics.willingness ?? { allowed: 0, blocked: 0 };
 
   return (
     <div className="overview-view view-enter">
@@ -127,6 +128,15 @@ export function OverviewPanel({ client }: { client: OperatorClient }) {
             {state.metrics.turns.avg_latency_ms}
             <span className="stat-unit"> ms</span> / {state.metrics.turns.p95_latency_ms}
             <span className="stat-unit"> ms</span>
+          </strong>
+        </section>
+        <section className="card stat-tile">
+          <small>群聊意愿 · 24 小时</small>
+          <strong>
+            {willingness.allowed}
+            <span className="stat-unit"> 进入 / </span>
+            {willingness.blocked}
+            <span className="stat-unit"> 拦截</span>
           </strong>
         </section>
       </div>

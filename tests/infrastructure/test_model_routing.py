@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -14,6 +15,8 @@ from mybot.infrastructure.model_routing import (
     ModelChannel,
     ModelPurpose,
     ModelRouter,
+    reset_model_profile,
+    set_model_profile,
 )
 
 
@@ -24,6 +27,7 @@ def channel(
     weight: int = 1,
     api_key_env: str = "TEST_MODEL_KEY",
     chat_model: str = "chat-model",
+    tier: str = "default",
 ) -> dict[str, object]:
     return {
         "name": name,
@@ -31,6 +35,7 @@ def channel(
         "api_key_env": api_key_env,
         "priority": priority,
         "weight": weight,
+        "tier": tier,
         "model_map": {
             "chat": {
                 "model": chat_model,
@@ -240,3 +245,27 @@ async def test_success_attempt_snapshots_price_and_computes_microdollar_cost() -
     assert attempt.input_price_per_million == Decimal("0.50")
     assert attempt.output_price_per_million == Decimal("1.50")
     assert attempt.cost_usd_micros == 80
+
+
+@pytest.mark.asyncio
+async def test_profile_context_selects_model_tier_and_attributes_attempt() -> None:
+    router, factory, sink, _, _ = make_router(
+        [channel("quality", tier="quality"), channel("economy", tier="economy")]
+    )
+    profile_id = uuid4()
+    persona_version_id = uuid4()
+    token = set_model_profile(
+        tier="economy",
+        profile_id=str(profile_id),
+        persona_version_id=str(persona_version_id),
+    )
+    try:
+        await router.for_purpose(ModelPurpose.CHAT).complete(
+            [ChatMessage(role="user", content="hello")]
+        )
+    finally:
+        reset_model_profile(token)
+
+    assert [created[0] for created in factory.created] == ["economy"]
+    assert sink.attempts[0].profile_id == str(profile_id)
+    assert sink.attempts[0].persona_version_id == str(persona_version_id)

@@ -6,7 +6,7 @@ export const VIEWS = {
   memories: { title: '记忆', subtitle: '长期记忆的范围、隐私与撤销管理' },
   plugins: { title: '插件', subtitle: '插件注册状态与工具审批' },
   models: { title: '模型', subtitle: '模型路由、连接状态与近 30 天用量' },
-  persona: { title: '人设', subtitle: '智能体的系统提示词' },
+  persona: { title: '档位与人设', subtitle: '会话策略、人格版本、关系与群聊参与度' },
 } as const;
 
 export type ViewId = keyof typeof VIEWS;

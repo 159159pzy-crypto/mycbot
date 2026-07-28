@@ -82,22 +82,29 @@ def create_app(
     from mybot.operator.api import OperatorContext, create_operator_router
     from mybot.repositories.audit import AuditRepository
     from mybot.repositories.llm_calls import LlmCallLogRepository
+    from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.operator_views import OperatorViews
+    from mybot.repositories.participation import WillingnessAuditRepository
+    from mybot.repositories.profiles import ProfileRepository
     from mybot.repositories.system_kv import SystemKvRepository
 
     operator_sessions = create_session_factory(create_database_engine(resolved_settings))
     operator_backend = create_redis_backend(resolved_settings.redis_url.get_secret_value())
+    operator_config = SystemKvRepository(operator_sessions)
     app.include_router(
         create_operator_router(
             OperatorContext(
                 views=OperatorViews(operator_sessions),
                 audit=AuditRepository(operator_sessions),
-                config=SystemKvRepository(operator_sessions),
+                config=operator_config,
                 broker=plugin_broker,
                 streams=operator_backend,
                 settings=resolved_settings,
                 model_client=operator_model_client,
                 model_attempts=LlmCallLogRepository(operator_sessions),
+                profiles=ProfileRepository(operator_sessions, legacy_persona=operator_config),
+                memory=MemoryRepository(operator_sessions),
+                willingness=WillingnessAuditRepository(operator_sessions),
                 sandbox=StreamPublisher(
                     backend=operator_backend,
                     stream=resolved_settings.ingest_stream,

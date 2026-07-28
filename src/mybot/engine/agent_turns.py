@@ -93,7 +93,11 @@ class MemoryHooks(Protocol):
     async def core_block(self, envelope: MessageEnvelope) -> str | None: ...
 
     async def retrieval_block(
-        self, envelope: MessageEnvelope, inbound_text: str
+        self,
+        envelope: MessageEnvelope,
+        inbound_text: str,
+        *,
+        limit: int | None = None,
     ) -> str | None: ...
 
     async def extract_and_store(
@@ -103,6 +107,14 @@ class MemoryHooks(Protocol):
     async def flush_history(
         self, envelope: MessageEnvelope, history: Sequence[HistoryEntry]
     ) -> "ExtractionUsage": ...
+
+    async def personality_block(
+        self,
+        envelope: MessageEnvelope,
+        *,
+        expression_examples: int,
+        relationship_enabled: bool,
+    ) -> str | None: ...
 
 
 class ExtractionUsage(Protocol):
@@ -152,6 +164,16 @@ class _ToolLoopState:
     citations: list[Citation] = field(default_factory=list[Citation])
 
 
+@dataclass(slots=True, frozen=True)
+class AgentRuntime:
+    system_prompt: str | None = None
+    granted_capabilities: tuple[str, ...] | None = None
+    memory_enabled: bool = True
+    memory_retrieval_limit: int | None = None
+    expression_examples: int = 0
+    relationship_enabled: bool = True
+
+
 @dataclass(slots=True)
 class AgentTurnEngine:
     """Runs one AGENT turn end to end; every outcome leaves a turn record."""
@@ -191,6 +213,7 @@ class AgentTurnEngine:
         decision: TurnDecision,
         inbound_message_id: UUID | None,
         capabilities: PlatformCapabilities,
+        runtime: AgentRuntime | None = None,
     ) -> ReplyPlan:
         vision_started = self.clock()
         prepared = await self._prepare_inbound(envelope)
@@ -226,7 +249,9 @@ class AgentTurnEngine:
                 empty_fallback=self.empty_reply_fallback,
             )
 
-        system_prompt = await self._system_prompt()
+        system_prompt = await self._system_prompt(
+            runtime.system_prompt if runtime is not None else None
+        )
         history = await self._history_window(
             conversation_id,
             inbound_text,
@@ -244,18 +269,43 @@ class AgentTurnEngine:
             token_budget=self.history_token_budget,
             inbound_content=prepared.content,
         )
+        memory_enabled = runtime is None or runtime.memory_enabled
         memory_block = (
             None
-            if envelope.ephemeral
-            else await self._memory_block(envelope, inbound_text, conversation_id)
+            if envelope.ephemeral or not memory_enabled
+            else await self._memory_block(
+                envelope,
+                inbound_text,
+                conversation_id,
+                retrieval_limit=(
+                    runtime.memory_retrieval_limit if runtime is not None else None
+                ),
+            )
         )
         core_block = (
             None
-            if envelope.ephemeral
+            if envelope.ephemeral or not memory_enabled
             else await self._core_memory_block(envelope, conversation_id)
+        )
+        personality_block = (
+            None
+            if (
+                envelope.ephemeral
+                or not memory_enabled
+                or runtime is None
+                or (runtime.expression_examples <= 0 and not runtime.relationship_enabled)
+            )
+            else await self._personality_memory_block(
+                envelope,
+                conversation_id,
+                expression_examples=runtime.expression_examples,
+                relationship_enabled=runtime.relationship_enabled,
+            )
         )
         if memory_block is not None:
             messages.insert(1, ChatMessage(role="system", content=memory_block))
+        if personality_block is not None:
+            messages.insert(1, ChatMessage(role="system", content=personality_block))
         if core_block is not None:
             messages.insert(1, ChatMessage(role="system", content=core_block))
         if self.tools is not None:
@@ -266,11 +316,20 @@ class AgentTurnEngine:
             except Exception:
                 logger.exception("tool_catalog_refresh_failed")
         state = _ToolLoopState(model=self.llm_model_name)
+        granted_capabilities = (
+            self.granted_capabilities
+            if runtime is None or runtime.granted_capabilities is None
+            else runtime.granted_capabilities
+        )
         started = self.clock()
         try:
             async with asyncio.timeout(self.turn_deadline_seconds):
                 final_text = await self._tool_loop(
-                    messages, envelope, state, conversation_id
+                    messages,
+                    envelope,
+                    state,
+                    conversation_id,
+                    granted_capabilities,
                 )
         except asyncio.CancelledError:
             raise
@@ -326,6 +385,7 @@ class AgentTurnEngine:
         envelope: MessageEnvelope,
         state: _ToolLoopState,
         conversation_id: UUID,
+        granted_capabilities: tuple[str, ...],
     ) -> str:
         """Offer tools while budget remains; always end on a plain text reply."""
 
@@ -336,7 +396,7 @@ class AgentTurnEngine:
                 and self.executor is not None
                 and state.calls_used < self.max_tool_calls
             ):
-                offer = self.tools.openai_tools(self.granted_capabilities) or None
+                offer = self.tools.openai_tools(granted_capabilities) or None
             call_started = self.clock()
             try:
                 reply = await self.llm.complete(messages, tools=offer)  # type: ignore[union-attr]
@@ -379,7 +439,13 @@ class AgentTurnEngine:
             )
             for call in reply.tool_calls:
                 messages.append(
-                    await self._execute_call(call, envelope, state, conversation_id)
+                    await self._execute_call(
+                        call,
+                        envelope,
+                        state,
+                        conversation_id,
+                        granted_capabilities,
+                    )
                 )
 
     async def _execute_call(
@@ -388,6 +454,7 @@ class AgentTurnEngine:
         envelope: MessageEnvelope,
         state: _ToolLoopState,
         conversation_id: UUID,
+        granted_capabilities: tuple[str, ...],
     ) -> ChatMessage:
         arguments, argument_error = _parse_arguments(call.arguments)
         call_started = self.clock()
@@ -416,7 +483,7 @@ class AgentTurnEngine:
                     thread_id=envelope.thread_id,
                 ),
                 actor_identity_id=envelope.sender_identity_id,
-                granted_capabilities=self.granted_capabilities,
+                granted_capabilities=granted_capabilities,
                 correlation_id=envelope.id,
             )
             result = await self.executor.execute(call.name, context, arguments or {})
@@ -506,6 +573,8 @@ class AgentTurnEngine:
         envelope: MessageEnvelope,
         inbound_text: str,
         conversation_id: UUID,
+        *,
+        retrieval_limit: int | None = None,
     ) -> str | None:
         if self.memory is None:
             await self._trace(
@@ -518,7 +587,13 @@ class AgentTurnEngine:
             return None
         started = self.clock()
         try:
-            block = await self.memory.retrieval_block(envelope, inbound_text)
+            block = (
+                await self.memory.retrieval_block(
+                    envelope, inbound_text, limit=retrieval_limit
+                )
+                if retrieval_limit is not None
+                else await self.memory.retrieval_block(envelope, inbound_text)
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -577,12 +652,64 @@ class AgentTurnEngine:
         )
         return block
 
+    async def _personality_memory_block(
+        self,
+        envelope: MessageEnvelope,
+        conversation_id: UUID,
+        *,
+        expression_examples: int,
+        relationship_enabled: bool,
+    ) -> str | None:
+        if self.memory is None:
+            return None
+        loader = getattr(self.memory, "personality_block", None)
+        if loader is None:
+            return None
+        started = self.clock()
+        try:
+            block = await loader(
+                envelope,
+                expression_examples=expression_examples,
+                relationship_enabled=relationship_enabled,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("personality_memory_lookup_failed")
+            await self._trace(
+                envelope,
+                conversation_id,
+                "memory.personality",
+                status="error",
+                duration_ms=int((self.clock() - started) * 1_000),
+                attributes={"error_code": "personality_memory_lookup_failed"},
+            )
+            return None
+        await self._trace(
+            envelope,
+            conversation_id,
+            "memory.personality",
+            duration_ms=int((self.clock() - started) * 1_000),
+            attributes={"loaded": block is not None},
+        )
+        return block
+
     async def after_reply(
-        self, *, envelope: MessageEnvelope, stable_key: str, reply_text: str
+        self,
+        *,
+        envelope: MessageEnvelope,
+        stable_key: str,
+        reply_text: str,
+        runtime: AgentRuntime | None = None,
     ) -> None:
         """Post-turn memory extraction; failures never affect the delivered reply."""
 
-        if envelope.ephemeral or self.memory is None or self.llm is None:
+        if (
+            envelope.ephemeral
+            or self.memory is None
+            or self.llm is None
+            or (runtime is not None and not runtime.memory_enabled)
+        ):
             return
         try:
             outcome = await self.memory.extract_and_store(envelope, reply_text)
@@ -607,7 +734,9 @@ class AgentTurnEngine:
         except Exception:
             logger.exception("tool_invocation_audit_failed")
 
-    async def _system_prompt(self) -> str:
+    async def _system_prompt(self, runtime_prompt: str | None = None) -> str:
+        if runtime_prompt is not None and runtime_prompt.strip():
+            return runtime_prompt.strip()
         try:
             override = await self.persona.get(PERSONA_KEY)
         except asyncio.CancelledError:

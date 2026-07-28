@@ -22,7 +22,7 @@ function stubClient(routes: Record<string, unknown>): OperatorClient & {
   return {
     sent,
     get: <T,>(path: string) => Promise.resolve(resolve(path) as T),
-    send: <T,>(method: 'POST' | 'PUT', path: string, body?: unknown) => {
+    send: <T,>(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown) => {
       sent.push({ method, path, body });
       return Promise.resolve(resolve(path) as T);
     },
@@ -373,25 +373,133 @@ describe('PluginsPanel', () => {
 });
 
 describe('PersonaPanel', () => {
-  it('loads the persona and saves an edited prompt', async () => {
+  it('loads a profile and saves policy plus a new immutable persona version', async () => {
+    const profile = {
+      profile: {
+        id: 'profile-1',
+        name: '默认',
+        description: '默认档位',
+        active_persona_version_id: 'persona-1',
+        model_tier: 'default',
+        tool_capabilities: ['web.search'],
+        memory: {
+          enabled: true,
+          retrieval_limit: 5,
+          expression_examples: 3,
+          relationship_enabled: true,
+        },
+        willingness: {
+          enabled: false,
+          threshold: 0.78,
+          sensitivity: 1,
+          keywords: [],
+        },
+      },
+      persona: {
+        id: 'persona-1',
+        profile_id: 'profile-1',
+        version: 1,
+        system_prompt: 'You are MyBot.',
+        parent_version_id: null,
+        change_note: 'initial',
+      },
+      created_at: '2026-07-28T00:00:00Z',
+      updated_at: '2026-07-28T00:00:00Z',
+    };
     const client = stubClient({
-      '/operator/config/persona': { override: null, default: 'You are MyBot.' },
+      '/operator/profiles/profile-1/personas': { versions: [profile.persona] },
+      '/operator/profiles/profile-1': { profile },
+      '/operator/profiles': { profiles: [profile], bindings: [] },
+      '/operator/conversations': { conversations: [] },
+      '/operator/relationships': { relationships: [] },
     });
     const sendSpy = vi.spyOn(client, 'send');
 
     render(<PersonaPanel client={client} />);
 
-    const textarea = await screen.findByLabelText('系统提示词');
+    const textarea = await screen.findByLabelText('当前人设');
     expect(textarea).toHaveValue('You are MyBot.');
 
     fireEvent.change(textarea, { target: { value: '你是高冷的猫娘助手。' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存人设' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() =>
-      expect(screen.getByText('已保存，下一轮对话生效。')).toBeInTheDocument(),
+      expect(screen.getByText('已保存，后续回合自动使用新配置。')).toBeInTheDocument(),
     );
-    expect(sendSpy).toHaveBeenCalledWith('PUT', '/operator/config/persona', {
-      system_prompt: '你是高冷的猫娘助手。',
+    expect(sendSpy).toHaveBeenCalledWith(
+      'POST',
+      '/operator/profiles/profile-1/personas',
+      expect.objectContaining({ system_prompt: '你是高冷的猫娘助手。' }),
+    );
+  });
+  it('selects a remaining profile after deleting the active profile', async () => {
+    const makeProfile = (id: string, name: string, prompt: string) => ({
+      profile: {
+        id,
+        name,
+        description: '',
+        active_persona_version_id: `persona-${id}`,
+        model_tier: 'default',
+        tool_capabilities: [],
+        memory: {
+          enabled: true,
+          retrieval_limit: 5,
+          expression_examples: 3,
+          relationship_enabled: true,
+        },
+        willingness: {
+          enabled: false,
+          threshold: 0.78,
+          sensitivity: 1,
+          keywords: [],
+        },
+      },
+      persona: {
+        id: `persona-${id}`,
+        profile_id: id,
+        version: 1,
+        system_prompt: prompt,
+        parent_version_id: null,
+        change_note: 'initial',
+      },
+      created_at: '2026-07-28T00:00:00Z',
+      updated_at: '2026-07-28T00:00:00Z',
+    });
+    const defaultProfile = makeProfile('profile-1', 'Default', 'Default prompt');
+    const groupProfile = makeProfile('profile-2', 'Group', 'Group prompt');
+    let deleted = false;
+    const client = stubClient({
+      '/operator/profiles/profile-1/personas': { versions: [defaultProfile.persona] },
+      '/operator/profiles/profile-2/personas': { versions: [groupProfile.persona] },
+      '/operator/profiles/profile-2': () => {
+        deleted = true;
+        return { deleted: true };
+      },
+      '/operator/profiles': () => ({
+        profiles: deleted ? [defaultProfile] : [defaultProfile, groupProfile],
+        bindings: [],
+      }),
+      '/operator/conversations': { conversations: [] },
+      '/operator/relationships': { relationships: [] },
+    });
+
+    render(<PersonaPanel client={client} />);
+
+    fireEvent.click(await screen.findByText('Group'));
+    await waitFor(() =>
+      expect(document.querySelector('.persona-prompt-label textarea')).toHaveValue('Group prompt'),
+    );
+    const deleteButton = document.querySelector<HTMLButtonElement>('.pill-button--danger');
+    expect(deleteButton).not.toBeNull();
+    fireEvent.click(deleteButton!);
+
+    await waitFor(() =>
+      expect(document.querySelector('.persona-prompt-label textarea')).toHaveValue('Default prompt'),
+    );
+    expect(client.sent).toContainEqual({
+      method: 'DELETE',
+      path: '/operator/profiles/profile-2',
+      body: undefined,
     });
   });
 });

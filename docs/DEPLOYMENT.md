@@ -32,6 +32,11 @@ production:
   to run without memory.
 - Review `MYBOT_MEMORY_CONSOLIDATION_*` and `MYBOT_MEMORY_FLUSH_*` budgets.
   Defaults are bounded and enabled; both can be disabled independently.
+- Keep `MYBOT_PERSONALITY_LEARNING_ENABLED=false` until you have reviewed the
+  target groups, background-model cost, and expression/relationship output in
+  the console. Learning is group-only, but it still consumes recent dialogue.
+- Keep `MYBOT_PROACTIVE_ENABLED=false` until conversations are explicitly
+  opted in and UTC quiet hours are correct for your users.
 - Keep core-memory tools approval-required in production. Grant
   `memory_append`/`memory_replace` only after reviewing the persona/profile
   blocks in the Memories panel.
@@ -76,7 +81,10 @@ curl -s http://127.0.0.1:8000/health/ready
 ```
 
 Migration `20260728_0009` enables `pg_trgm`, adds temporal invalidation and
-memory audit tables, and creates core blocks. PostgreSQL therefore needs
+memory audit tables, and creates core blocks. Migration `20260728_0010` adds
+profiles, immutable persona versions, conversation bindings, willingness and
+heartbeat audit, relationship familiarity, and model-call attribution.
+PostgreSQL therefore needs
 permission to create the extension on first upgrade. The shared `vector` and
 `pg_trgm` extensions are intentionally retained on downgrade.
 
@@ -88,6 +96,11 @@ send text, optionally add an HTTP(S) image URL, wait for the persisted reply,
 then open its conversation and expand **追踪**. A sandbox session is ephemeral:
 it is intentionally visible for debugging but never participates in memory or
 proactive messaging.
+
+After the smoke test, open **档位与人设**. Confirm the default profile contains
+the expected legacy persona, create one non-default profile, bind only a test
+conversation, and leave its group willingness switch off until tuning. Persona
+rollback creates a new version; it never mutates the selected historical row.
 
 ## 5. TLS reverse proxy
 

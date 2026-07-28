@@ -159,12 +159,80 @@ llm_call_log_table = sa.Table(
     sa.Column("output_price_per_million", sa.Numeric(18, 8), nullable=True),
     sa.Column("cost_usd_micros", sa.BigInteger(), nullable=True),
     sa.Column("error_code", sa.Text(), nullable=True),
+    sa.Column("profile_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("persona_version_id", postgresql.UUID(as_uuid=True), nullable=True),
     sa.Column(
         "created_at",
         sa.DateTime(timezone=True),
         server_default=sa.text("CURRENT_TIMESTAMP"),
         nullable=False,
     ),
+)
+
+agent_profiles_table = sa.Table(
+    "agent_profiles",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("name", sa.Text(), nullable=False, unique=True),
+    sa.Column("description", sa.Text(), nullable=False),
+    sa.Column("model_tier", sa.Text(), nullable=False),
+    sa.Column("tool_capabilities", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column("memory_policy", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column("willingness_policy", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column("active_persona_version_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+persona_versions_table = sa.Table(
+    "persona_versions",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("profile_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("version", sa.Integer(), nullable=False),
+    sa.Column("system_prompt", sa.Text(), nullable=False),
+    sa.Column("parent_version_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("change_note", sa.Text(), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+conversation_profile_bindings_table = sa.Table(
+    "conversation_profile_bindings",
+    metadata,
+    sa.Column("conversation_id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("profile_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+reply_willingness_audit_table = sa.Table(
+    "reply_willingness_audit",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("conversation_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("message_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("profile_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("score", sa.Numeric(5, 4), nullable=False),
+    sa.Column("threshold", sa.Numeric(5, 4), nullable=False),
+    sa.Column("allowed", sa.Boolean(), nullable=False),
+    sa.Column("components", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column("reason", sa.Text(), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+proactive_generation_audit_table = sa.Table(
+    "proactive_generation_audit",
+    metadata,
+    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+    sa.Column("conversation_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("profile_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("persona_version_id", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("outcome", sa.Text(), nullable=False),
+    sa.Column("response_text", sa.Text(), nullable=True),
+    sa.Column("model", sa.Text(), nullable=True),
+    sa.Column("prompt_tokens", sa.Integer(), nullable=False),
+    sa.Column("completion_tokens", sa.Integer(), nullable=False),
+    sa.Column("error_code", sa.Text(), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
 )
 
 operator_audit_table = sa.Table(
@@ -205,11 +273,16 @@ system_kv_table = sa.Table(
 )
 
 __all__ = [
+    "agent_profiles_table",
+    "conversation_profile_bindings_table",
     "conversations_table",
     "llm_call_log_table",
     "messages_table",
     "metadata",
     "operator_audit_table",
+    "persona_versions_table",
+    "proactive_generation_audit_table",
+    "reply_willingness_audit_table",
     "system_kv_table",
     "tool_invocations_table",
     "trace_spans_table",
