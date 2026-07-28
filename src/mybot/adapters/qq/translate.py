@@ -142,6 +142,7 @@ def encode_qq_reply(
     *,
     capabilities: PlatformCapabilities,
     reply_to_message_id: str | None = None,
+    meme_intents: Mapping[str, str] | None = None,
 ) -> tuple[tuple[dict[str, object], ...], ...]:
     """Purely encode a reply plan into OneBot v11 message arrays."""
 
@@ -162,6 +163,17 @@ def encode_qq_reply(
             target.append({"type": "record", "data": {"file": media.url}})
         else:
             target.append({"type": "text", "data": {"text": _media_fallback(media)}})
+    if plan.meme_intent is not None:
+        sticker_id = (meme_intents or {}).get(plan.meme_intent)
+        if sticker_id is not None and capabilities.stickers:
+            target.append({"type": "face", "data": {"id": sticker_id}})
+        else:
+            target.append(
+                {
+                    "type": "text",
+                    "data": {"text": f"[表情意图: {plan.meme_intent}]"},
+                }
+            )
     return tuple(tuple(message) for message in messages)
 
 

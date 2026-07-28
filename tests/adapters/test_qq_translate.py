@@ -175,6 +175,22 @@ def test_qq_capabilities_reflect_onebot_v11() -> None:
     assert QQ_CAPABILITIES.voice_messages is True
 
 
+def test_qq_meme_intent_maps_to_face_and_unmapped_intent_is_visible() -> None:
+    mapped = encode_qq_reply(
+        ReplyPlan(text_segments=("ok",), meme_intent="acknowledge"),
+        capabilities=QQ_CAPABILITIES,
+        meme_intents={"acknowledge": "14"},
+    )
+    fallback = encode_qq_reply(
+        ReplyPlan(text_segments=("ok",), meme_intent="unknown"),
+        capabilities=QQ_CAPABILITIES,
+        meme_intents={"acknowledge": "14"},
+    )
+
+    assert mapped[0][-1] == {"type": "face", "data": {"id": "14"}}
+    assert fallback[0][-1]["data"]["text"] == "[表情意图: unknown]"
+
+
 def test_qq_outbound_encoder_renders_media_and_readable_fallbacks() -> None:
     plan = ReplyPlan(
         text_segments=("hello",),

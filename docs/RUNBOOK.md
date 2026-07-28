@@ -40,7 +40,7 @@ production traffic. The drill was rehearsed for real against PostgreSQL 16
 as part of this milestone's verification.
 
 1. Stop writers so nothing races the restore:
-   `docker compose stop gateway agent-worker maintenance-worker api`.
+   `docker compose stop gateway agent-worker knowledge-worker maintenance-worker api`.
 2. Take a fresh backup: `scripts/backup.sh --mode compose`.
 3. Destroy something on purpose (scratch host only) — e.g.
    `docker compose exec postgres psql -U mybot -d mybot -c "DELETE FROM messages;"`.
@@ -64,12 +64,17 @@ docker compose exec redis redis-cli XLEN mybot:ingest
 docker compose exec redis redis-cli XPENDING mybot:ingest agent-workers
 docker compose exec redis redis-cli XLEN mybot:outbound
 docker compose exec redis redis-cli XPENDING mybot:outbound gateway
+docker compose exec redis redis-cli XLEN mybot:knowledge
+docker compose exec redis redis-cli XPENDING mybot:knowledge knowledge-workers
+docker compose exec redis redis-cli XLEN mybot:knowledge:dead
 ```
 
 Healthy is near zero. Sustained growth means the consumer side is down or
 slow: `mybot:ingest` growing → check `agent-worker` (crashed? LLM endpoint
 timing out? token ceiling logging refusals?); `mybot:outbound` growing →
-check `gateway` (platform API down? NapCat disconnected?). Start with
+check `gateway` (platform API down? NapCat disconnected?);
+`mybot:knowledge` growing → check `knowledge-worker`, the embedding channel,
+and document `error_code`. Start with
 `docker compose ps` and `docker compose logs --tail=100 <service>`. A
 large `XPENDING` count with live consumers means entries are being
 retried; they either succeed, or cross five delivery attempts and move to

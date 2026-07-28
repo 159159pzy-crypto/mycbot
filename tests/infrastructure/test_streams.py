@@ -94,6 +94,29 @@ async def test_crashing_handler_leaves_entry_pending_for_reclaim() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_delivery_does_not_mark_dedupe_key_before_reclaim() -> None:
+    clock = Clock()
+    backend = MemoryStreamBackend(clock=clock)
+    publisher = StreamPublisher(backend=backend, stream="mybot:ingest", maxlen=100)
+    consumer = make_consumer(backend)
+    calls = 0
+
+    def fail_once(payload: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient")
+
+    await publisher.publish("same-envelope")
+    await consumer.process_available(fail_once, dedupe_key=lambda payload: payload)
+    clock.now += 10.0
+    await consumer.process_available(fail_once, dedupe_key=lambda payload: payload)
+
+    assert calls == 2
+    assert await backend.pending_count("mybot:ingest", "agent-workers") == 0
+
+
+@pytest.mark.asyncio
 async def test_entry_exceeding_max_attempts_moves_to_dead_letter_stream() -> None:
     clock = Clock()
     backend = MemoryStreamBackend(clock=clock)

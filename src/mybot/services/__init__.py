@@ -19,6 +19,10 @@ def create_service(mode: ProcessMode, settings: Settings) -> LifecycleService | 
         from mybot.services.maintenance import create_maintenance_service
 
         return create_maintenance_service(settings)
+    if mode is ProcessMode.KNOWLEDGE_WORKER:
+        from mybot.services.knowledge import create_knowledge_worker_service
+
+        return create_knowledge_worker_service(settings)
     if mode is ProcessMode.PLUGIN_RUNNER:
         from mybot.plugins.runner import create_plugin_runner_service
 

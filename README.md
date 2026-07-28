@@ -6,7 +6,8 @@ OneBot v11, Telegram long polling, an at-least-once Redis Streams
 pipeline), an LLM agent with persona and bounded history behind any
 OpenAI-compatible endpoint, policy-gated tools (SearXNG search and safe
 URL fetch with citations), scoped pgvector long-term memory with privacy
-enforced in code, an isolated plugin system, an authenticated operator
+enforced in code, a hierarchical pgvector knowledge base with annotation
+replies, an isolated plugin system, an authenticated operator
 console, and production polish: abuse guards, opt-in proactive check-ins,
 rehearsed backups, resource-limited containers, and a dependency-audited
 CI. NapCat is intentionally not bundled. The full milestone sequence and
@@ -102,6 +103,7 @@ same image:
 | API | `uv run python -m mybot api` | FastAPI lifecycle, health endpoints, operator API, plugin broker |
 | Gateway | `uv run python -m mybot gateway` | Owns the NapCat WebSocket and Telegram long polling, translates inbound events, delivers replies |
 | Agent worker | `uv run python -m mybot agent-worker` | Consumes the ingest stream, persists conversations/messages, applies guards, runs agent turns with tools and memory |
+| Knowledge worker | `uv run python -m mybot knowledge-worker` | Parses Markdown/TXT/PDF tasks, builds parent/child chunks, and embeds child chunks |
 | Maintenance worker | `uv run python -m mybot maintenance-worker` | Memory lifecycle (expiry, decay, purge) and the proactive messaging pass |
 | Plugin runner | `uv run python -m mybot plugin-runner` | Loads manifested plugins and executes their tools in isolation |
 
@@ -116,6 +118,30 @@ The gateway and agent worker communicate only through Redis Streams
 per-envelope dedupe keys, and capped dead-letter streams, so either process
 can restart without losing or double-answering a message. Replies are
 delivered at-least-once by design.
+
+Knowledge ingestion uses a separate `mybot:knowledge` stream and the
+`knowledge-workers` consumer group. Upload requests only validate, persist,
+and enqueue; `document_id + generation` is the idempotency boundary.
+
+## Knowledge base and annotation replies
+
+The operator console's **知识库** page accepts Markdown, TXT, and PDF. A
+document is global or bound to one conversation. Only smaller child chunks are
+ranked by pgvector; the matching parent chunk is returned as model context.
+SQL filters embedding model and scope before distance ordering, and ephemeral
+sandbox sessions can only see global knowledge.
+
+`kb_search` is a built-in read-only `knowledge.read` tool. Its `sources` use
+`kb://<document>/<parent>` URIs, so hits enter the existing
+`ReplyPlan.citations` and reference-footer renderer. The console exposes the
+same retrieval path as a query/top-k/threshold/scope hit-testing panel.
+
+Operator-reviewed question/answer pairs live in `annotation`. Before a normal
+agent turn, top-1 must exceed its threshold and beat top-2 by the configured
+margin to bypass the chat model. MISS or embedding failure falls back to the
+ordinary agent, while a HIT still passes through outbound moderation. Attempts
+are recorded in `annotation_match_audit`; Bot replies in the conversation view
+can be saved as conversation-scoped annotations.
 
 The turn policy answers every direct chat, and answers group or channel
 messages only when the message mentions the bot, replies to one of the

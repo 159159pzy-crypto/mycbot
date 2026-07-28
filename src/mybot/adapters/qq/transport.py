@@ -27,6 +27,10 @@ logger = structlog.get_logger("mybot.gateway.qq")
 _ACTION_TIMEOUT_SECONDS = 10.0
 
 
+def _empty_meme_intents() -> dict[str, str]:
+    return {}
+
+
 class DeliveryError(RuntimeError):
     """A platform rejected or failed an outbound send action."""
 
@@ -43,6 +47,7 @@ class QQTransport:
     access_token: str | None
     connection_id: str
     publisher: Publisher
+    meme_intents: dict[str, str] = field(default_factory=_empty_meme_intents)
     reconnect_initial_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
     _connection: ClientConnection | None = field(default=None, init=False, repr=False)
@@ -92,6 +97,7 @@ class QQTransport:
             message.reply_plan,
             capabilities=QQ_CAPABILITIES,
             reply_to_message_id=message.reply_to_platform_message_id,
+            meme_intents=self.meme_intents,
         )
         for segments in encoded_messages:
             params: dict[str, object] = {"message": segments}

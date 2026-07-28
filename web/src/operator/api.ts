@@ -12,6 +12,7 @@ export type ConversationSummary = {
 };
 
 export type MessageView = {
+  id?: string;
   direction: string;
   sender_identity_id: string;
   text: string;
@@ -110,6 +111,44 @@ export type MetricsView = {
   };
   queues: Record<string, number>;
   willingness: { allowed: number; blocked: number };
+  annotations?: { hit: number; miss: number; error: number; total: number; hit_rate: number };
+};
+
+export type KnowledgeDocumentView = {
+  id: string;
+  title: string;
+  source_type: 'md' | 'txt' | 'pdf';
+  scope: 'GLOBAL' | 'CONVERSATION';
+  conversation_id: string | null;
+  conversation_stable_key: string | null;
+  status: 'QUEUED' | 'PROCESSING' | 'READY' | 'FAILED';
+  original_filename: string;
+  child_count: number;
+  error_code: string | null;
+  updated_at: string;
+};
+
+export type KnowledgeSearchResult = {
+  child_id: string;
+  parent_id: string;
+  document_id: string;
+  document_title: string;
+  child_content: string;
+  parent_content: string;
+  score: number;
+  scope: 'GLOBAL' | 'CONVERSATION';
+};
+
+export type AnnotationView = {
+  id: string;
+  scope: 'GLOBAL' | 'CONVERSATION';
+  conversation_stable_key: string | null;
+  question: string;
+  answer: string;
+  threshold: number;
+  enabled: boolean;
+  hit_count: number;
+  updated_at: string;
 };
 
 export type PluginView = {
@@ -233,6 +272,7 @@ export type ModelsView = {
 export type OperatorClient = {
   get: <T>(path: string) => Promise<T>;
   send: <T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown) => Promise<T>;
+  upload: <T>(path: string, body: FormData) => Promise<T>;
 };
 
 export function createOperatorClient(
@@ -266,5 +306,18 @@ export function createOperatorClient(
     get: <T>(path: string) => request<T>('GET', path),
     send: <T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown) =>
       request<T>(method, path, body),
+    upload: async <T>(path: string, body: FormData) => {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body,
+      });
+      if (response.status === 401) {
+        onAuthError();
+        throw new OperatorAuthError('the operator token was rejected');
+      }
+      if (!response.ok) throw new Error(`operator API returned HTTP ${response.status}`);
+      return (await response.json()) as T;
+    },
   };
 }

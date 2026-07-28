@@ -196,6 +196,7 @@ class AgentTurnEngine:
     invocations: InvocationStore | None = None
     memory: MemoryHooks | None = None
     vision: VisionPreparer | None = None
+    vision_llm: LlmCompleter | None = None
     traces: TraceSink | None = None
     not_configured_fallback: str = NOT_CONFIGURED_FALLBACK
     llm_failure_fallback: str = LLM_FAILURE_FALLBACK
@@ -217,6 +218,11 @@ class AgentTurnEngine:
     ) -> ReplyPlan:
         vision_started = self.clock()
         prepared = await self._prepare_inbound(envelope)
+        turn_llm = (
+            self.vision_llm
+            if not isinstance(prepared.content, str) and self.vision_llm is not None
+            else self.llm
+        )
         await self._trace(
             envelope,
             conversation_id,
@@ -226,7 +232,7 @@ class AgentTurnEngine:
         )
         inbound_text = prepared.summary
 
-        if self.llm is None:
+        if turn_llm is None:
             await self._record(
                 conversation_id, decision, "fallback", inbound_message_id
             )
@@ -330,6 +336,7 @@ class AgentTurnEngine:
                     state,
                     conversation_id,
                     granted_capabilities,
+                    turn_llm,
                 )
         except asyncio.CancelledError:
             raise
@@ -386,6 +393,7 @@ class AgentTurnEngine:
         state: _ToolLoopState,
         conversation_id: UUID,
         granted_capabilities: tuple[str, ...],
+        llm: LlmCompleter,
     ) -> str:
         """Offer tools while budget remains; always end on a plain text reply."""
 
@@ -399,7 +407,7 @@ class AgentTurnEngine:
                 offer = self.tools.openai_tools(granted_capabilities) or None
             call_started = self.clock()
             try:
-                reply = await self.llm.complete(messages, tools=offer)  # type: ignore[union-attr]
+                reply = await llm.complete(messages, tools=offer)
             except LlmError as error:
                 await self._trace(
                     envelope,

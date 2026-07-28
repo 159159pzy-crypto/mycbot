@@ -18,6 +18,10 @@ from mybot.adapters.telegram.translate import (
 logger = structlog.get_logger("mybot.gateway.telegram")
 
 
+def _empty_meme_intents() -> dict[str, str]:
+    return {}
+
+
 class DeliveryError(RuntimeError):
     """Telegram rejected or failed an outbound send."""
 
@@ -34,6 +38,7 @@ class TelegramTransport:
     connection_id: str
     publisher: Publisher
     client: httpx.AsyncClient
+    meme_intents: dict[str, str] = field(default_factory=_empty_meme_intents)
     api_base_url: str = "https://api.telegram.org"
     poll_timeout_seconds: float = 50.0
     reconnect_initial_seconds: float = 1.0
@@ -87,6 +92,7 @@ class TelegramTransport:
             message.reply_plan,
             capabilities=TELEGRAM_CAPABILITIES,
             reply_to_message_id=message.reply_to_platform_message_id,
+            meme_intents=self.meme_intents,
         )
         for action in actions:
             method = str(action["method"])

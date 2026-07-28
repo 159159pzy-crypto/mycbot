@@ -22,6 +22,7 @@ from mybot.engine.memory_service import MemoryService
 from mybot.engine.prompt import HistoryEntry
 from mybot.infrastructure.embeddings import EmbeddingError
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply
+from mybot.infrastructure.model_routing import EmbeddingBatch
 from mybot.repositories.core_memory import CoreBlockRecord
 from mybot.repositories.memory import (
     MemoryRecord,
@@ -37,11 +38,13 @@ class FakeEmbeddings:
     fail: bool = False
     requests: list[list[str]] = field(default_factory=list)
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed_with_model(self, texts: list[str]) -> EmbeddingBatch:
         self.requests.append(list(texts))
         if self.fail:
             raise EmbeddingError("down", retryable=True)
-        return [[0.1, 0.2] for _ in texts]
+        return EmbeddingBatch(
+            vectors=[[0.1, 0.2] for _ in texts], model="routed-embed"
+        )
 
 
 @dataclass
@@ -245,7 +248,6 @@ async def test_personality_block_uses_only_current_group_expressions_and_sender_
         embeddings=FakeEmbeddings(),
         store=store,
         llm=None,
-        embedding_model="embed",
         now=lambda: NOW,
     )
 
@@ -274,7 +276,6 @@ def make_service(
         embeddings=resolved_embeddings,  # type: ignore[arg-type]
         store=resolved_store,
         llm=llm,
-        embedding_model="test-embed",
         min_confidence=0.6,
         retrieval_limit=5,
         token_budget=token_budget,
@@ -297,6 +298,7 @@ async def test_retrieval_block_renders_provenance_and_scope_flags() -> None:
     search = store.searches[0]
     assert search["include_private"] is True
     assert search["subject_identity_id"] == "telegram:777"
+    assert search["embedding_model"] == "routed-embed"
 
 
 @pytest.mark.asyncio
@@ -361,6 +363,57 @@ async def test_core_memory_is_always_rendered_for_non_ephemeral_turns() -> None:
     assert block is not None
     assert "[user_profile]" in block
     assert "用户偏好无糖美式" in block
+
+
+@pytest.mark.asyncio
+async def test_group_blocks_hide_private_profile_and_relationship_text() -> None:
+    persona = CoreBlockRecord(
+        block=CoreBlock(
+            label=CoreBlockLabel.PERSONA,
+            subject_identity_id=None,
+            content="public persona",
+            token_budget=600,
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    profile = CoreBlockRecord(
+        block=CoreBlock(
+            label=CoreBlockLabel.USER_PROFILE,
+            subject_identity_id="telegram:777",
+            content="private profile note",
+            token_budget=600,
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    relation = MemoryRecord(
+        id=uuid4(),
+        scope=MemoryScope.SUBJECT,
+        subject_identity_id="telegram:777",
+        conversation_stable_key=None,
+        privacy=MemoryPrivacy.PRIVATE,
+        kind="RELATIONSHIP",
+        content="secret nickname boss",
+        confidence=0.9,
+        source_message_ids=("m1",),
+        created_at=NOW,
+        relationship_score=55.0,
+    )
+    service, store, _ = make_service()
+    service.core_store = FakeCoreStore((persona, profile))
+    store.relationship = relation
+    group = envelope(chat_kind=ChatKind.GROUP)
+
+    core = await service.core_block(group)
+    personality = await service.personality_block(
+        group, expression_examples=0, relationship_enabled=True
+    )
+
+    assert core is not None and "public persona" in core
+    assert "private profile note" not in core
+    assert personality is not None and "55.0/100" in personality
+    assert "secret nickname boss" not in personality
 
 
 @pytest.mark.asyncio

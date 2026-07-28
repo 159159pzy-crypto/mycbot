@@ -31,6 +31,7 @@ const NAV_GROUPS: Array<{
       { id: 'conversations', icon: <ChatIcon /> },
       { id: 'sandbox', icon: <FlaskIcon /> },
       { id: 'memories', icon: <DatabaseIcon /> },
+      { id: 'knowledge', icon: <DatabaseIcon /> },
     ],
   },
   {

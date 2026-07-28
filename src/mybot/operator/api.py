@@ -1,27 +1,37 @@
 """The authenticated operator console API."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
 from time import monotonic
-from typing import Literal, Protocol, cast
+from typing import Annotated, Literal, Protocol, cast
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from mybot.contracts import (
     AgentProfile,
+    AnnotationReply,
+    KnowledgeDocument,
+    KnowledgeIngestTask,
+    KnowledgeScope,
+    KnowledgeSourceType,
     MemoryItem,
     MemoryPrivacy,
     MemoryScope,
     ProfileMemoryPolicy,
     ReplyWillingnessPolicy,
 )
+from mybot.engine.knowledge import KnowledgeSearchService
 from mybot.infrastructure.llm import ChatMessage, LlmClient, LlmError
 from mybot.infrastructure.model_routing import (
     MODEL_CHANNELS_KEY,
+    EmbeddingBatch,
     ModelAttemptSink,
     ModelCallAttempt,
     ModelChannel,
@@ -31,6 +41,7 @@ from mybot.infrastructure.model_routing import (
 )
 from mybot.plugins.broker import PluginBroker
 from mybot.repositories.audit import AuditRepository
+from mybot.repositories.knowledge import KnowledgeRepository
 from mybot.repositories.memory import MemoryRepository
 from mybot.repositories.operator_views import OperatorViews
 from mybot.repositories.participation import WillingnessAuditRepository
@@ -136,8 +147,40 @@ class RelationshipUpdate(BaseModel):
     familiarity: float = Field(ge=0.0, le=100.0)
 
 
+class KnowledgeSearchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    top_k: int = Field(default=5, ge=1, le=20)
+    threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    scope: Literal["ALL", "GLOBAL", "CONVERSATION"] = "ALL"
+    conversation_stable_key: str | None = None
+
+
+class AnnotationCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: KnowledgeScope = KnowledgeScope.GLOBAL
+    conversation_id: UUID | None = None
+    question: str
+    answer: str
+    threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+    enabled: bool = True
+
+
+class AnnotationFromMessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str | None = None
+    threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+
+
 class SandboxPublisher(Protocol):
     async def publish(self, payload: str) -> str: ...
+
+
+class Embeddings(Protocol):
+    async def embed_with_model(self, texts: Sequence[str]) -> EmbeddingBatch: ...
 
 
 @dataclass(slots=True)
@@ -154,6 +197,9 @@ class OperatorContext:
     profiles: ProfileRepository | None = None
     memory: MemoryRepository | None = None
     willingness: WillingnessAuditRepository | None = None
+    knowledge: KnowledgeRepository | None = None
+    knowledge_tasks: SandboxPublisher | None = None
+    embeddings: Embeddings | None = None
 
 
 def create_operator_router(context: OperatorContext) -> APIRouter:
@@ -176,6 +222,189 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
     ) -> dict[str, JsonValue]:
         rows = await context.views.messages(conversation_id, limit=_bound(limit))
         return {"messages": cast(JsonValue, rows)}
+
+    @router.get("/knowledge/documents")
+    async def knowledge_documents() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        repository = _knowledge(context)
+        return {"documents": cast(JsonValue, await repository.list_documents())}
+
+    @router.post("/knowledge/documents")
+    async def upload_knowledge_document(  # pyright: ignore[reportUnusedFunction]
+        file: Annotated[UploadFile, File()],
+        scope: Annotated[KnowledgeScope, Form()] = KnowledgeScope.GLOBAL,
+        conversation_id: Annotated[UUID | None, Form()] = None,
+        title: Annotated[str | None, Form()] = None,
+    ) -> dict[str, JsonValue]:
+        repository = _knowledge(context)
+        if context.knowledge_tasks is None:
+            raise HTTPException(status_code=503, detail="knowledge stream is unavailable")
+        filename = Path(file.filename or "document").name
+        suffix = Path(filename).suffix.lower()
+        source_types = {
+            ".md": KnowledgeSourceType.MARKDOWN,
+            ".markdown": KnowledgeSourceType.MARKDOWN,
+            ".txt": KnowledgeSourceType.TEXT,
+            ".pdf": KnowledgeSourceType.PDF,
+        }
+        source_type = source_types.get(suffix)
+        if source_type is None:
+            raise HTTPException(status_code=415, detail="only Markdown, TXT, and PDF are supported")
+        content = await file.read(context.settings.knowledge_max_upload_bytes + 1)
+        if not content:
+            raise HTTPException(status_code=422, detail="document is empty")
+        if len(content) > context.settings.knowledge_max_upload_bytes:
+            raise HTTPException(status_code=413, detail="document exceeds upload size limit")
+        try:
+            document = KnowledgeDocument(
+                title=(title or Path(filename).stem).strip(),
+                source_type=source_type,
+                scope=scope,
+                conversation_id=conversation_id,
+                original_filename=filename,
+                content_hash=sha256(content).hexdigest(),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        stored, created = await repository.create_document(document, content=content)
+        published = await _flush_knowledge_outbox(context, document_id=stored.id)
+        await context.audit.record(
+            "knowledge.document.upload",
+            {"document_id": str(stored.id), "created": created, "scope": stored.scope.value},
+        )
+        return {
+            "created": created,
+            "published": published,
+            "document": cast(JsonValue, stored.model_dump(mode="json")),
+        }
+
+    @router.delete("/knowledge/documents/{document_id}")
+    async def delete_knowledge_document(  # pyright: ignore[reportUnusedFunction]
+        document_id: UUID,
+    ) -> dict[str, JsonValue]:
+        deleted = await _knowledge(context).delete_document(document_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="knowledge document not found")
+        await context.audit.record("knowledge.document.delete", {"document_id": str(document_id)})
+        return {"deleted": True}
+
+    @router.post("/knowledge/documents/{document_id}/reingest")
+    async def reingest_knowledge_document(  # pyright: ignore[reportUnusedFunction]
+        document_id: UUID,
+    ) -> dict[str, JsonValue]:
+        if context.knowledge_tasks is None:
+            raise HTTPException(status_code=503, detail="knowledge stream is unavailable")
+        document = await _knowledge(context).requeue_document(document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="knowledge document not found")
+        published = await _flush_knowledge_outbox(context, document_id=document.id)
+        return {
+            "queued": True,
+            "published": published,
+            "generation": document.generation,
+        }
+
+    @router.post("/knowledge/search")
+    async def test_knowledge_search(  # pyright: ignore[reportUnusedFunction]
+        request: KnowledgeSearchInput,
+    ) -> dict[str, JsonValue]:
+        embeddings = _embeddings(context)
+        query = request.query.strip()
+        if not query:
+            raise HTTPException(status_code=422, detail="query is required")
+        if request.scope != "GLOBAL" and not request.conversation_stable_key:
+            if request.scope == "CONVERSATION":
+                raise HTTPException(
+                    status_code=422,
+                    detail="conversation_stable_key is required for conversation scope",
+                )
+        hits = await KnowledgeSearchService(
+            store=_knowledge(context),
+            embeddings=embeddings,
+        ).search(
+            query,
+            conversation_stable_key=request.conversation_stable_key,
+            allow_conversation=request.scope != "GLOBAL" and bool(request.conversation_stable_key),
+            include_global=request.scope != "CONVERSATION",
+            top_k=request.top_k,
+            threshold=request.threshold,
+        )
+        await context.audit.record(
+            "knowledge.search.test",
+            {"top_k": request.top_k, "threshold": request.threshold, "scope": request.scope},
+        )
+        return {
+            "query": query,
+            "results": cast(JsonValue, [hit.model_dump(mode="json") for hit in hits]),
+        }
+
+    @router.get("/knowledge/annotations")
+    async def annotations() -> dict[str, JsonValue]:  # pyright: ignore[reportUnusedFunction]
+        return {"annotations": cast(JsonValue, await _knowledge(context).list_annotations())}
+
+    @router.post("/knowledge/annotations")
+    async def create_annotation(  # pyright: ignore[reportUnusedFunction]
+        request: AnnotationCreateInput,
+    ) -> dict[str, JsonValue]:
+        question = request.question.strip()
+        answer = request.answer.strip()
+        if not question or not answer:
+            raise HTTPException(status_code=422, detail="question and answer are required")
+        annotation = AnnotationReply(
+            scope=request.scope,
+            conversation_id=request.conversation_id,
+            question=question,
+            answer=answer,
+            threshold=request.threshold,
+            enabled=request.enabled,
+        )
+        batch = await _embeddings(context).embed_with_model([question])
+        saved = await _knowledge(context).create_annotation(
+            annotation,
+            embedding=batch.vectors[0],
+            embedding_model=batch.model,
+        )
+        await context.audit.record("annotation.create", {"annotation_id": str(saved.id)})
+        return {"annotation": cast(JsonValue, saved.model_dump(mode="json"))}
+
+    @router.post("/conversations/{conversation_id}/messages/{message_id}/annotation")
+    async def annotation_from_message(  # pyright: ignore[reportUnusedFunction]
+        conversation_id: UUID,
+        message_id: UUID,
+        request: AnnotationFromMessageInput,
+    ) -> dict[str, JsonValue]:
+        repository = _knowledge(context)
+        # The repository resolves the previous inbound question. Embed that exact
+        # question by first using an explicit one, or querying it through a
+        # lightweight placeholder and replacing it inside the transaction.
+        if request.question is None or not request.question.strip():
+            pair = await repository.message_annotation_pair(conversation_id, message_id)
+            if pair is None:
+                raise HTTPException(status_code=422, detail="no question/answer pair found")
+            question, _answer = pair
+        else:
+            question = request.question.strip()
+        batch = await _embeddings(context).embed_with_model([question])
+        saved = await repository.annotation_from_message(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            question=question,
+            threshold=request.threshold,
+            embedding=batch.vectors[0],
+            embedding_model=batch.model,
+        )
+        if saved is None:
+            raise HTTPException(status_code=422, detail="no question/answer pair found")
+        await context.audit.record("annotation.from_message", {"annotation_id": str(saved.id)})
+        return {"annotation": cast(JsonValue, saved.model_dump(mode="json"))}
+
+    @router.delete("/knowledge/annotations/{annotation_id}")
+    async def delete_annotation(  # pyright: ignore[reportUnusedFunction]
+        annotation_id: UUID,
+    ) -> dict[str, JsonValue]:
+        if not await _knowledge(context).delete_annotation(annotation_id):
+            raise HTTPException(status_code=404, detail="annotation not found")
+        await context.audit.record("annotation.delete", {"annotation_id": str(annotation_id)})
+        return {"deleted": True}
 
     @router.get("/conversations/{conversation_id}/turns")
     async def turns(  # pyright: ignore[reportUnusedFunction]
@@ -488,11 +717,15 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
         queues: dict[str, JsonValue] = {
             "ingest": await context.streams.stream_len(settings.ingest_stream),
             "outbound": await context.streams.stream_len(settings.outbound_stream),
+            "knowledge": await context.streams.stream_len(settings.knowledge_stream),
             "ingest_dead_letter": await context.streams.stream_len(
                 f"{settings.ingest_stream}:dead"
             ),
             "outbound_dead_letter": await context.streams.stream_len(
                 f"{settings.outbound_stream}:dead"
+            ),
+            "knowledge_dead_letter": await context.streams.stream_len(
+                f"{settings.knowledge_stream}:dead"
             ),
         }
         participation = (
@@ -500,10 +733,16 @@ def create_operator_router(context: OperatorContext) -> APIRouter:
             if context.willingness is not None
             else {"allowed": 0, "blocked": 0}
         )
+        annotation_metrics = (
+            await context.knowledge.annotation_metrics(hours=24)
+            if context.knowledge is not None
+            else {"hit": 0, "miss": 0, "error": 0, "total": 0, "hit_rate": 0.0}
+        )
         return {
             "turns": cast(JsonValue, await context.views.turn_metrics()),
             "queues": cast(JsonValue, queues),
             "willingness": cast(JsonValue, participation),
+            "annotations": cast(JsonValue, annotation_metrics),
         }
 
     @router.get("/profiles")
@@ -796,6 +1035,45 @@ def _profiles(context: OperatorContext) -> ProfileRepository:
     if context.profiles is None:
         raise HTTPException(status_code=503, detail="profile store is unavailable")
     return context.profiles
+
+
+def _knowledge(context: OperatorContext) -> KnowledgeRepository:
+    if context.knowledge is None:
+        raise HTTPException(status_code=503, detail="knowledge store is unavailable")
+    return context.knowledge
+
+
+def _embeddings(context: OperatorContext) -> Embeddings:
+    if context.embeddings is None:
+        raise HTTPException(status_code=503, detail="embedding service is unavailable")
+    return context.embeddings
+
+
+async def _flush_knowledge_outbox(
+    context: OperatorContext, *, document_id: UUID
+) -> bool:
+    repository = _knowledge(context)
+    publisher = context.knowledge_tasks
+    if publisher is None:
+        return False
+    published = False
+    for queued_id, generation in await repository.pending_ingest_tasks(
+        document_id=document_id
+    ):
+        try:
+            await publisher.publish(
+                KnowledgeIngestTask(
+                    document_id=queued_id, generation=generation
+                ).model_dump_json()
+            )
+        except Exception as error:
+            await repository.mark_ingest_task_failed(
+                queued_id, generation, error_code=type(error).__name__
+            )
+            continue
+        await repository.mark_ingest_task_published(queued_id, generation)
+        published = True
+    return published
 
 
 def _profile_json(resolved: ResolvedProfile) -> dict[str, JsonValue]:

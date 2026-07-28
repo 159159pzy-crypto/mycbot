@@ -1,8 +1,8 @@
 """Environment-backed settings with secret-safe diagnostics."""
 
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,8 +28,10 @@ class Settings(BaseSettings):
     redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
     ingest_stream: str = "mybot:ingest"
     outbound_stream: str = "mybot:outbound"
+    knowledge_stream: str = "mybot:knowledge"
     ingest_group: str = "agent-workers"
     outbound_group: str = "gateway"
+    knowledge_group: str = "knowledge-workers"
     sandbox_connection_id: str = "sandbox"
     stream_maxlen: int = Field(default=10_000, ge=100, le=1_000_000)
     stream_delivery_max_attempts: int = Field(default=5, ge=1, le=100)
@@ -38,7 +40,9 @@ class Settings(BaseSettings):
     stream_claim_min_idle_ms: int = Field(default=30_000, ge=100, le=3_600_000)
     otel_exporter_otlp_endpoint: SecretStr | None = None
     telegram_bot_token: SecretStr | None = None
+    telegram_meme_intent_map: dict[str, str] = Field(default_factory=dict)
     qq_access_token: SecretStr | None = None
+    qq_meme_intent_map: dict[str, str] = Field(default_factory=dict)
     napcat_ws_url: SecretStr | None = Field(default=None, validation_alias="NAPCAT_WS_URL")
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None
@@ -70,6 +74,18 @@ class Settings(BaseSettings):
     embedding_base_url: str | None = None
     embedding_api_key: SecretStr | None = None
     embedding_model: str = "text-embedding-3-small"
+    knowledge_enabled: bool = True
+    knowledge_parent_chunk_chars: int = Field(default=2_400, ge=400, le=20_000)
+    knowledge_child_chunk_chars: int = Field(default=700, ge=100, le=5_000)
+    knowledge_child_chunk_overlap: int = Field(default=100, ge=0, le=2_000)
+    knowledge_search_top_k: int = Field(default=5, ge=1, le=20)
+    knowledge_search_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    knowledge_max_upload_bytes: int = Field(default=20_000_000, ge=1_024, le=100_000_000)
+    knowledge_ingestion_lease_seconds: int = Field(default=300, ge=30, le=3_600)
+    knowledge_outbox_poll_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    annotation_enabled: bool = True
+    annotation_default_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+    annotation_minimum_margin: float = Field(default=0.03, ge=0.0, le=1.0)
     memory_enabled: bool = True
     memory_min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     memory_retrieval_limit: int = Field(default=5, ge=1, le=20)
@@ -127,7 +143,7 @@ class Settings(BaseSettings):
     plugin_catalog_ttl_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
     plugin_result_max_chars: int = Field(default=16_000, ge=1_000, le=200_000)
     searxng_url: str = "http://127.0.0.1:8080"
-    agent_granted_capabilities: str = "web.search,web.fetch,memory.write"
+    agent_granted_capabilities: str = "web.search,web.fetch,memory.write,knowledge.read"
     tool_max_calls_per_turn: int = Field(default=5, ge=1, le=20)
     tool_timeout_seconds: float = Field(default=15.0, gt=0.0, le=120.0)
     turn_deadline_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
@@ -160,6 +176,14 @@ class Settings(BaseSettings):
                     str(capability) for capability in cast(list[object], capabilities)
                 )
         return grants
+
+    @model_validator(mode="after")
+    def validate_knowledge_chunks(self) -> Self:
+        if self.knowledge_child_chunk_overlap >= self.knowledge_child_chunk_chars:
+            raise ValueError(
+                "knowledge_child_chunk_overlap must be smaller than child chunk size"
+            )
+        return self
 
     def model_secret(self, name: str) -> str | None:
         """Resolve a channel key from env-backed secret settings only."""

@@ -26,6 +26,7 @@ from mybot.contracts import (
 from mybot.engine.prompt import HistoryEntry, estimate_tokens
 from mybot.infrastructure.embeddings import EmbeddingError
 from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply
+from mybot.infrastructure.model_routing import EmbeddingBatch
 from mybot.repositories.core_memory import CoreBlockRecord
 from mybot.repositories.memory import MemoryRecord, MergeApplication, ScoredMemory
 
@@ -119,7 +120,7 @@ class MemoryStore(Protocol):
 
 
 class Embeddings(Protocol):
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    async def embed_with_model(self, texts: Sequence[str]) -> EmbeddingBatch: ...
 
 
 class CoreMemoryStore(Protocol):
@@ -174,7 +175,6 @@ class MemoryService:
     embeddings: Embeddings
     store: MemoryStore
     llm: ExtractionLlm | None
-    embedding_model: str
     core_store: CoreMemoryStore | None = None
     flush_once: AcquireOnce | None = None
     flush_enabled: bool = True
@@ -196,6 +196,10 @@ class MemoryService:
             f"[{record.block.label.value}]\n{record.block.content.strip()}"
             for record in records
             if record.block.content.strip()
+            and (
+                envelope.chat_kind is ChatKind.DIRECT
+                or record.block.label.value != "user_profile"
+            )
         ]
         if not sections:
             return None
@@ -208,12 +212,12 @@ class MemoryService:
     ) -> tuple[float, float]:
         """Return persona and visible-memory relevance for willingness scoring."""
 
-        vectors = await self.embeddings.embed([text, persona])
-        persona_score = _cosine_similarity(vectors[0], vectors[1])
+        batch = await self.embeddings.embed_with_model([text, persona])
+        persona_score = _cosine_similarity(batch.vectors[0], batch.vectors[1])
         memories = await self.store.search(
-            query_embedding=vectors[0],
+            query_embedding=batch.vectors[0],
             query_text=text,
-            embedding_model=self.embedding_model,
+            embedding_model=batch.model,
             subject_identity_id=envelope.sender_identity_id,
             conversation_stable_key=_conversation_key(envelope).stable_key,
             include_private=envelope.chat_kind is ChatKind.DIRECT,
@@ -259,11 +263,18 @@ class MemoryService:
         sections: list[str] = []
         if relationship is not None:
             score = relationship.relationship_score or 0.0
-            sections.append(
-                "Your relationship with the current sender "
-                f"(familiarity {score:.1f}/100): {relationship.content} "
-                "Let this affect warmth and form of address, but never reveal the stored note."
-            )
+            if envelope.chat_kind is ChatKind.DIRECT:
+                sections.append(
+                    "Your relationship with the current sender "
+                    f"(familiarity {score:.1f}/100): {relationship.content} "
+                    "Let this affect warmth and form of address, but never reveal the stored note."
+                )
+            else:
+                sections.append(
+                    "Familiarity with the current sender is "
+                    f"{score:.1f}/100. Use only this numeric signal to tune warmth; "
+                    "do not infer or reveal any private relationship notes."
+                )
         if expressions:
             examples = "\n".join(f"- {item.content}" for item in expressions)
             sections.append(
@@ -356,7 +367,7 @@ class MemoryService:
             return None
 
         try:
-            vectors = await self.embeddings.embed([inbound_text])
+            batch = await self.embeddings.embed_with_model([inbound_text])
         except asyncio.CancelledError:
             raise
         except EmbeddingError as error:
@@ -364,9 +375,9 @@ class MemoryService:
             return None
         include_private = envelope.chat_kind is ChatKind.DIRECT
         memories = await self.store.search(
-            query_embedding=vectors[0],
+            query_embedding=batch.vectors[0],
             query_text=inbound_text,
-            embedding_model=self.embedding_model,
+            embedding_model=batch.model,
             subject_identity_id=envelope.sender_identity_id,
             conversation_stable_key=_conversation_key(envelope).stable_key,
             include_private=include_private,
@@ -444,7 +455,7 @@ class MemoryService:
         """Embed, compare, decide, and atomically apply one candidate memory."""
 
         try:
-            vectors = await self.embeddings.embed([item.content])
+            batch = await self.embeddings.embed_with_model([item.content])
         except asyncio.CancelledError:
             raise
         except EmbeddingError as error:
@@ -455,8 +466,8 @@ class MemoryService:
             )
         similar = await self.store.similar_for_merge(
             item,
-            query_embedding=vectors[0],
-            embedding_model=self.embedding_model,
+            query_embedding=batch.vectors[0],
+            embedding_model=batch.model,
             now=self.now(),
         )
         decision = MemoryMergeDecision(
@@ -509,8 +520,8 @@ class MemoryService:
         applied = await self.store.apply_merge(
             item,
             decision,
-            embedding=vectors[0],
-            embedding_model=self.embedding_model,
+            embedding=batch.vectors[0],
+            embedding_model=batch.model,
             source=source,
             now=self.now(),
         )

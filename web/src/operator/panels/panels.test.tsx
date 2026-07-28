@@ -26,6 +26,10 @@ function stubClient(routes: Record<string, unknown>): OperatorClient & {
       sent.push({ method, path, body });
       return Promise.resolve(resolve(path) as T);
     },
+    upload: <T,>(path: string, body: FormData) => {
+      sent.push({ method: 'POST', path, body });
+      return Promise.resolve(resolve(path) as T);
+    },
   };
 }
 

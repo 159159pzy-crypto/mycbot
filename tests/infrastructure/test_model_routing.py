@@ -166,6 +166,18 @@ async def test_router_selects_the_purpose_model_and_resolves_secret_at_call_time
 
 
 @pytest.mark.asyncio
+async def test_embedding_batch_reports_the_model_selected_by_runtime_routing() -> None:
+    router, factory, sink, _, _ = make_router([channel("primary")])
+
+    batch = await router.embeddings().embed_with_model(["hello"])
+
+    assert batch.model == "primary-embedding"
+    assert batch.vectors == [[0.0, 1.0]]
+    assert factory.created == [("primary", "primary-embedding", "secret-value")]
+    assert sink.attempts[0].model == "primary-embedding"
+
+
+@pytest.mark.asyncio
 async def test_retryable_failure_cools_channel_and_fails_over() -> None:
     router, factory, sink, _, cooldowns = make_router(
         [channel("primary"), channel("backup", priority=1)],

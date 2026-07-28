@@ -78,9 +78,16 @@ def create_app(
     app.include_router(create_broker_router(plugin_broker))
 
     from mybot.infrastructure.database import create_database_engine, create_session_factory
+    from mybot.infrastructure.model_routing import (
+        MemoryModelCooldowns,
+        ModelRouter,
+        legacy_model_channels,
+        openai_client_factory,
+    )
     from mybot.infrastructure.streams import StreamPublisher, create_redis_backend
     from mybot.operator.api import OperatorContext, create_operator_router
     from mybot.repositories.audit import AuditRepository
+    from mybot.repositories.knowledge import KnowledgeRepository
     from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.operator_views import OperatorViews
@@ -91,6 +98,22 @@ def create_app(
     operator_sessions = create_session_factory(create_database_engine(resolved_settings))
     operator_backend = create_redis_backend(resolved_settings.redis_url.get_secret_value())
     operator_config = SystemKvRepository(operator_sessions)
+    operator_attempts = LlmCallLogRepository(operator_sessions)
+    operator_embeddings = ModelRouter(
+        config=operator_config,
+        fallback_channels=legacy_model_channels(resolved_settings),
+        cooldowns=MemoryModelCooldowns(),
+        attempts=operator_attempts,
+        client_factory=openai_client_factory(
+            operator_model_client,
+            temperature=resolved_settings.llm_temperature,
+            max_output_tokens=resolved_settings.llm_max_output_tokens,
+            timeout_seconds=resolved_settings.llm_timeout_seconds,
+        ),
+        secret_lookup=resolved_settings.model_secret,
+        cache_ttl_seconds=resolved_settings.model_channels_cache_ttl_seconds,
+        cooldown_seconds=resolved_settings.model_channel_cooldown_seconds,
+    ).embeddings()
     app.include_router(
         create_operator_router(
             OperatorContext(
@@ -101,13 +124,20 @@ def create_app(
                 streams=operator_backend,
                 settings=resolved_settings,
                 model_client=operator_model_client,
-                model_attempts=LlmCallLogRepository(operator_sessions),
+                model_attempts=operator_attempts,
                 profiles=ProfileRepository(operator_sessions, legacy_persona=operator_config),
                 memory=MemoryRepository(operator_sessions),
                 willingness=WillingnessAuditRepository(operator_sessions),
+                knowledge=KnowledgeRepository(operator_sessions),
+                embeddings=operator_embeddings,
                 sandbox=StreamPublisher(
                     backend=operator_backend,
                     stream=resolved_settings.ingest_stream,
+                    maxlen=resolved_settings.stream_maxlen,
+                ),
+                knowledge_tasks=StreamPublisher(
+                    backend=operator_backend,
+                    stream=resolved_settings.knowledge_stream,
                     maxlen=resolved_settings.stream_maxlen,
                 ),
             )
