@@ -231,6 +231,27 @@ def test_telegram_capabilities() -> None:
     assert TELEGRAM_CAPABILITIES.voice_messages is True
 
 
+def test_telegram_meme_intent_maps_to_sticker_and_has_text_fallback() -> None:
+    mapped = encode_telegram_reply(
+        ReplyPlan(text_segments=("ok",), meme_intent="acknowledge"),
+        capabilities=TELEGRAM_CAPABILITIES,
+        meme_intents={"acknowledge": "sticker-file-id"},
+    )
+    fallback = encode_telegram_reply(
+        ReplyPlan(text_segments=("ok",), meme_intent="unknown"),
+        capabilities=TELEGRAM_CAPABILITIES,
+    )
+
+    assert mapped[-1] == {
+        "method": "sendSticker",
+        "body": {"sticker": "sticker-file-id"},
+    }
+    assert fallback[-1] == {
+        "method": "sendMessage",
+        "body": {"text": "[表情意图: unknown]"},
+    }
+
+
 def test_telegram_outbound_encoder_selects_bot_api_methods() -> None:
     plan = ReplyPlan(
         text_segments=("hello",),

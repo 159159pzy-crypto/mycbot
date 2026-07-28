@@ -8,6 +8,7 @@ import pytest
 from mybot.adapters import InboundEvent, OutboundMessage
 from mybot.contracts import (
     AgentProfile,
+    AnnotationMatch,
     ChatKind,
     ConversationKey,
     MessageEnvelope,
@@ -132,6 +133,28 @@ class FakeAgentEngine:
 
 
 @dataclass
+class FailOnceAgent(FakeAgentEngine):
+    async def run_turn(self, **kwargs):  # type: ignore[no-untyped-def]
+        if not self.calls:
+            self.calls.append(kwargs["envelope"].id)
+            raise RuntimeError("transient model failure")
+        return await super().run_turn(**kwargs)
+
+
+@dataclass
+class RetryMessages(FakeMessages):
+    stored_id: UUID = field(default_factory=uuid4)
+    inbound_calls: int = 0
+
+    async def record_inbound(
+        self, conversation_id: UUID, envelope: MessageEnvelope
+    ) -> StoredMessage:
+        self.inbound_calls += 1
+        self.inbound.append(envelope)
+        return StoredMessage(id=self.stored_id, duplicate=self.inbound_calls > 1)
+
+
+@dataclass
 class FakeProfiles:
     resolved: ResolvedProfile
 
@@ -176,6 +199,18 @@ class FakeMemoryCommands:
         return self.revoked_count
 
 
+@dataclass
+class FakeAnnotations:
+    answer: str
+    calls: int = 0
+
+    async def match(self, query: str, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return AnnotationMatch(
+            annotation_id=uuid4(), answer=self.answer, score=0.98, threshold=0.92
+        )
+
+
 def envelope(
     *,
     text: str = "hello",
@@ -203,6 +238,7 @@ def build_service(
     events: FakeEventSink | None = None,
     profiles: FakeProfiles | None = None,
     willingness: FakeWillingness | None = None,
+    annotations: FakeAnnotations | None = None,
 ) -> tuple[AgentWorkerService, FakeMessages, FakeAgentEngine]:
     conversations = FakeConversations(
         record=ConversationRecord(id=uuid4(), stable_key="v1:qq-main:DIRECT:10001:0")
@@ -233,6 +269,7 @@ def build_service(
         events=events,
         profiles=profiles,
         willingness=willingness,
+        annotations=annotations,
     )
     return service, messages, engine
 
@@ -555,6 +592,23 @@ async def test_moderation_hook_withholds_rejected_replies() -> None:
 
 
 @pytest.mark.asyncio
+async def test_annotation_reply_skips_chat_model_but_still_runs_moderation() -> None:
+    from mybot.services.agent_worker import MODERATION_NOTICE
+
+    backend = MemoryStreamBackend()
+    annotations = FakeAnnotations(answer="这里有禁词")
+    service, messages, engine = build_service(backend, annotations=annotations)
+    service.moderation = RejectingModeration()
+
+    await service.handle_payload(InboundEvent(envelope=envelope()).model_dump_json())
+
+    assert annotations.calls == 1
+    assert engine.calls == []
+    assert engine.after_replies == []
+    assert messages.outbound[0].text_segments == (MODERATION_NOTICE,)
+
+
+@pytest.mark.asyncio
 async def test_turns_serialize_per_conversation_but_not_across_conversations() -> None:
     backend = MemoryStreamBackend()
     engine = FakeAgentEngine(delay_seconds=0.05)
@@ -624,4 +678,33 @@ async def test_lifecycle_processes_stream_and_stops_cleanly() -> None:
     await asyncio.wait_for(task, timeout=2.0)
 
     assert len(messages.outbound) == 1
+    assert await backend.pending_count("mybot:ingest", "agent-workers") == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_redelivery_resumes_after_inbound_was_already_persisted() -> None:
+    class Clock:
+        now = 1_000.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    backend = MemoryStreamBackend(clock=clock)
+    service, _, _ = build_service(backend, agent=FailOnceAgent())
+    consumer = service.consumer
+    messages = RetryMessages()
+    service.messages = messages
+    payload = InboundEvent(envelope=envelope()).model_dump_json()
+    await StreamPublisher(backend, "mybot:ingest", 100).publish(payload)
+
+    await consumer.process_available(service.handle_payload, dedupe_key=lambda _: "envelope")
+    assert await backend.pending_count("mybot:ingest", "agent-workers") == 1
+
+    clock.now += 10.0
+    await consumer.process_available(service.handle_payload, dedupe_key=lambda _: "envelope")
+
+    assert messages.inbound_calls == 2
+    assert len(messages.outbound) == 1
+    assert len(await outbound_messages(backend)) == 1
     assert await backend.pending_count("mybot:ingest", "agent-workers") == 0

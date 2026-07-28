@@ -6,6 +6,17 @@ from mybot.contracts.conversation import (
     TurnDecision,
     TurnTrigger,
 )
+from mybot.contracts.knowledge import (
+    AnnotationMatch,
+    AnnotationReply,
+    KnowledgeChunkLevel,
+    KnowledgeDocument,
+    KnowledgeDocumentStatus,
+    KnowledgeIngestTask,
+    KnowledgeScope,
+    KnowledgeSearchHit,
+    KnowledgeSourceType,
+)
 from mybot.contracts.memory import (
     CoreBlock,
     CoreBlockLabel,
@@ -43,6 +54,8 @@ from mybot.contracts.tools import ToolContext, ToolError, ToolResult, ToolRisk, 
 
 __all__ = [
     "AgentProfile",
+    "AnnotationMatch",
+    "AnnotationReply",
     "AtSegment",
     "ChatKind",
     "Citation",
@@ -51,6 +64,13 @@ __all__ = [
     "CoreBlockLabel",
     "FileSegment",
     "ImageSegment",
+    "KnowledgeChunkLevel",
+    "KnowledgeDocument",
+    "KnowledgeDocumentStatus",
+    "KnowledgeIngestTask",
+    "KnowledgeScope",
+    "KnowledgeSearchHit",
+    "KnowledgeSourceType",
     "MemoryItem",
     "MemoryMergeDecision",
     "MemoryOperation",

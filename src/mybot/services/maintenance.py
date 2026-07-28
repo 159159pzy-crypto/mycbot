@@ -180,7 +180,6 @@ def create_maintenance_service(settings: Settings) -> MaintenanceWorkerService:
                 embeddings=model_router.embeddings(),
                 store=memory_repository,
                 llm=memory_llm,
-                embedding_model=settings.embedding_model,
                 min_confidence=settings.memory_min_confidence,
                 retrieval_limit=settings.memory_retrieval_limit,
                 token_budget=settings.memory_token_budget,

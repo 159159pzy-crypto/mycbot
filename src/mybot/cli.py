@@ -56,5 +56,9 @@ def maintenance_worker_main() -> None:
     main([ProcessMode.MAINTENANCE_WORKER.value])
 
 
+def knowledge_worker_main() -> None:
+    main([ProcessMode.KNOWLEDGE_WORKER.value])
+
+
 def plugin_runner_main() -> None:
     main([ProcessMode.PLUGIN_RUNNER.value])

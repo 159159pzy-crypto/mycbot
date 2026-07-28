@@ -215,6 +215,7 @@ def create_gateway_service(settings: Settings) -> GatewayService:
             ),
             connection_id=settings.qq_connection_id,
             publisher=ingest_publisher,
+            meme_intents=settings.qq_meme_intent_map,
             reconnect_initial_seconds=settings.gateway_reconnect_initial_seconds,
             reconnect_max_seconds=settings.gateway_reconnect_max_seconds,
         )
@@ -225,6 +226,7 @@ def create_gateway_service(settings: Settings) -> GatewayService:
             connection_id=settings.telegram_connection_id,
             publisher=ingest_publisher,
             client=httpx.AsyncClient(),
+            meme_intents=settings.telegram_meme_intent_map,
             api_base_url=settings.telegram_api_base_url,
             poll_timeout_seconds=settings.telegram_poll_timeout_seconds,
             reconnect_initial_seconds=settings.gateway_reconnect_initial_seconds,

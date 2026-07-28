@@ -61,7 +61,7 @@ class OperatorViews:
                     await session.execute(
                         sa.text(
                             """
-                        SELECT direction, sender_identity_id, segments, occurred_at, trace_id
+                        SELECT id, direction, sender_identity_id, segments, occurred_at, trace_id
                         FROM messages
                         WHERE conversation_id = :conversation_id
                         ORDER BY occurred_at ASC
@@ -76,6 +76,7 @@ class OperatorViews:
             )
             return [
                 {
+                    "id": str(row["id"]),
                     "direction": row["direction"],
                     "sender_identity_id": row["sender_identity_id"],
                     "text": _texts(row["segments"]),

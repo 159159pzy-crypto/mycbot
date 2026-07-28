@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Protocol, cast
@@ -15,6 +16,13 @@ logger = structlog.get_logger("mybot.streams")
 type StreamEntry = tuple[str, str]
 type Handler = Callable[[str], Awaitable[None] | None]
 type DedupeKey = Callable[[str], str | None]
+_delivery_attempt: ContextVar[int] = ContextVar("mybot_stream_delivery_attempt", default=1)
+
+
+def current_delivery_attempt() -> int:
+    """Return the delivery count for the stream handler currently running."""
+
+    return _delivery_attempt.get()
 
 
 class StreamBackend(Protocol):
@@ -37,6 +45,8 @@ class StreamBackend(Protocol):
     async def ack(self, stream: str, group: str, entry_id: str) -> None: ...
 
     async def acquire_once(self, key: str, *, ttl_seconds: int) -> bool: ...
+
+    async def has_once(self, key: str) -> bool: ...
 
 
 @dataclass(slots=True)
@@ -105,7 +115,9 @@ class StreamConsumer:
             if attempts > self._max_attempts:
                 await self._dead_letter(entry_id, payload, reason="max_attempts_exceeded")
                 continue
-            handled += await self._handle(entry_id, payload, handler, dedupe_key)
+            handled += await self._handle(
+                entry_id, payload, handler, dedupe_key, attempts=attempts
+            )
         fresh = await self._backend.read_new(
             self._stream,
             self._group,
@@ -114,7 +126,7 @@ class StreamConsumer:
             block_ms=self._block_ms if block_ms is None else block_ms,
         )
         for entry_id, payload in fresh:
-            handled += await self._handle(entry_id, payload, handler, dedupe_key)
+            handled += await self._handle(entry_id, payload, handler, dedupe_key, attempts=1)
         return handled
 
     async def run(
@@ -147,7 +159,10 @@ class StreamConsumer:
         payload: str,
         handler: Handler,
         dedupe_key: DedupeKey | None,
+        *,
+        attempts: int,
     ) -> int:
+        completed_key: str | None = None
         if dedupe_key is not None:
             try:
                 key = dedupe_key(payload)
@@ -157,13 +172,11 @@ class StreamConsumer:
                 await self._dead_letter(entry_id, payload, reason=type(error).__name__)
                 return 0
             if key is not None:
-                first_delivery = await self._backend.acquire_once(
-                    f"{self._dedupe_prefix}:{key}",
-                    ttl_seconds=self._dedupe_ttl_seconds,
-                )
-                if not first_delivery:
+                completed_key = f"{self._dedupe_prefix}:{key}"
+                if await self._backend.has_once(completed_key):
                     await self._backend.ack(self._stream, self._group, entry_id)
                     return 0
+        token: Token[int] = _delivery_attempt.set(attempts)
         try:
             result = handler(payload)
             if inspect.isawaitable(result):
@@ -175,6 +188,12 @@ class StreamConsumer:
                 "stream_entry_handler_failed", stream=self._stream, entry_id=entry_id
             )
             return 0
+        finally:
+            _delivery_attempt.reset(token)
+        if completed_key is not None:
+            await self._backend.acquire_once(
+                completed_key, ttl_seconds=self._dedupe_ttl_seconds
+            )
         await self._backend.ack(self._stream, self._group, entry_id)
         return 1
 
@@ -286,6 +305,10 @@ class MemoryStreamBackend:
         self._once[key] = now + ttl_seconds
         return True
 
+    async def has_once(self, key: str) -> bool:
+        expiry = self._once.get(key)
+        return expiry is not None and expiry > self._clock()
+
     async def increment(self, key: str, amount: int, *, ttl_seconds: int) -> int:
         now = self._clock()
         value, expiry = self._counters.get(key, (0, 0.0))
@@ -392,6 +415,9 @@ class RedisStreamBackend:
     async def acquire_once(self, key: str, *, ttl_seconds: int) -> bool:
         acquired = await self._client.set(key, "1", nx=True, ex=ttl_seconds)
         return bool(acquired)
+
+    async def has_once(self, key: str) -> bool:
+        return bool(await self._client.exists(key))
 
     async def increment(self, key: str, amount: int, *, ttl_seconds: int) -> int:
         value = await self._client.incrby(  # pyright: ignore[reportUnknownMemberType]

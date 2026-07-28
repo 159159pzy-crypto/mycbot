@@ -95,6 +95,14 @@ class ModelCallAttempt:
     error_code: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class EmbeddingBatch:
+    """Embedding vectors together with the model that actually produced them."""
+
+    vectors: list[list[float]]
+    model: str
+
+
 class ModelConfigSource(Protocol):
     async def get(self, key: str) -> JsonValue | None: ...
 
@@ -223,7 +231,7 @@ class ModelRouter:
             raise last_error
         raise LlmError(f"no available model channel for {purpose.value}", retryable=True)
 
-    async def embed(
+    async def embed_with_model(
         self,
         texts: Sequence[str],
         *,
@@ -231,7 +239,7 @@ class ModelRouter:
         tier: str = "default",
         profile_id: str | None = None,
         persona_version_id: str | None = None,
-    ) -> list[list[float]]:
+    ) -> EmbeddingBatch:
         purpose = ModelPurpose.EMBEDDING
         candidates = await self._candidates(purpose, tier=tier)
         last_error: EmbeddingError | None = None
@@ -272,10 +280,28 @@ class ModelRouter:
                     cost_usd_micros=calculate_cost_micros(target, input_tokens, 0),
                 )
             )
-            return vectors
+            return EmbeddingBatch(vectors=vectors, model=target.model)
         if last_error is not None:
             raise last_error
         raise EmbeddingError("no available embedding channel", retryable=True)
+
+    async def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        conversation_id: str | None = None,
+        tier: str = "default",
+        profile_id: str | None = None,
+        persona_version_id: str | None = None,
+    ) -> list[list[float]]:
+        batch = await self.embed_with_model(
+            texts,
+            conversation_id=conversation_id,
+            tier=tier,
+            profile_id=profile_id,
+            persona_version_id=persona_version_id,
+        )
+        return batch.vectors
 
     def for_purpose(self, purpose: ModelPurpose) -> RoutedLlmClient:
         return RoutedLlmClient(router=self, purpose=purpose)
@@ -455,7 +481,11 @@ class RoutedEmbeddingClient:
     router: ModelRouter
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return await self.router.embed(
+        batch = await self.embed_with_model(texts)
+        return batch.vectors
+
+    async def embed_with_model(self, texts: Sequence[str]) -> EmbeddingBatch:
+        return await self.router.embed_with_model(
             texts,
             conversation_id=_conversation_context.get(),
             tier=_tier_context.get(),

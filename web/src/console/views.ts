@@ -4,6 +4,7 @@ export const VIEWS = {
   conversations: { title: '会话', subtitle: '各平台会话的消息记录与轮次明细' },
   sandbox: { title: '沙盒', subtitle: '通过真实消息链路验证文本、图片与追踪数据' },
   memories: { title: '记忆', subtitle: '长期记忆的范围、隐私与撤销管理' },
+  knowledge: { title: '知识库', subtitle: '文档摄取、父子分块检索与标注回复' },
   plugins: { title: '插件', subtitle: '插件注册状态与工具审批' },
   models: { title: '模型', subtitle: '模型路由、连接状态与近 30 天用量' },
   persona: { title: '档位与人设', subtitle: '会话策略、人格版本、关系与群聊参与度' },

@@ -24,8 +24,17 @@ from mybot.engine.agent_turns import (
     AgentRuntime,
     AgentTurnEngine,
 )
+from mybot.engine.prompt import EnvelopePrompt
 from mybot.infrastructure.budget import TokenBudget
-from mybot.infrastructure.llm import ChatMessage, LlmError, LlmReply, ToolCall
+from mybot.infrastructure.llm import (
+    ChatMessage,
+    ImageContentPart,
+    ImageUrl,
+    LlmError,
+    LlmReply,
+    TextContentPart,
+    ToolCall,
+)
 from mybot.infrastructure.streams import MemoryStreamBackend
 from mybot.repositories.messages import MessageText
 from mybot.repositories.tool_invocations import ToolInvocationRecord
@@ -119,6 +128,17 @@ class FakeTraces:
         return uuid4()
 
 
+class DirectVision:
+    async def prepare(self, envelope: MessageEnvelope) -> EnvelopePrompt:
+        return EnvelopePrompt(
+            summary="an image",
+            content=(
+                TextContentPart(text="what is this?"),
+                ImageContentPart(image_url=ImageUrl(url="https://example.test/image.png")),
+            ),
+        )
+
+
 def envelope(text: str = "讲个笑话") -> MessageEnvelope:
     return MessageEnvelope(
         id="telegram:telegram-main:777:66",
@@ -147,6 +167,8 @@ def make_engine(
     budget: TokenBudget | None = None,
     persona: FakePersona | None = None,
     history: FakeHistory | None = None,
+    vision: DirectVision | None = None,
+    vision_llm: FakeLlm | None = None,
 ) -> AgentTurnEngine:
     return AgentTurnEngine(
         llm=llm,
@@ -156,6 +178,8 @@ def make_engine(
         budget=budget,
         default_system_prompt="You are MyBot.",
         llm_model_name="deepseek-chat",
+        vision=vision,
+        vision_llm=vision_llm,
     )
 
 
@@ -205,6 +229,29 @@ async def test_successful_turn_returns_shaped_reply_and_records_audit_and_spend(
     assert (
         await budget.allows("v1:telegram-main:DIRECT:777:0", today=today) is False
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_multimodal_turn_uses_vision_route_not_chat_route() -> None:
+    chat = FakeLlm(
+        reply=LlmReply(text="wrong route", model="chat", prompt_tokens=1, completion_tokens=1)
+    )
+    vision = FakeLlm(
+        reply=LlmReply(text="vision answer", model="vision", prompt_tokens=2, completion_tokens=2)
+    )
+    engine = make_engine(
+        llm=chat,
+        turns=FakeTurns(),
+        vision=DirectVision(),
+        vision_llm=vision,
+    )
+
+    plan = await run(engine)
+
+    assert plan.text_segments == ("vision answer",)
+    assert chat.calls == []
+    assert len(vision.calls) == 1
+    assert not isinstance(vision.calls[0][-1].content, str)
 
 
 @pytest.mark.asyncio

@@ -198,6 +198,7 @@ def encode_telegram_reply(
     *,
     capabilities: PlatformCapabilities,
     reply_to_message_id: str | None = None,
+    meme_intents: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Purely encode a reply plan into Telegram Bot API method/body pairs."""
 
@@ -226,6 +227,17 @@ def encode_telegram_reply(
                 else "[语音消息]"
             )
             actions.append({"method": "sendMessage", "body": {"text": fallback}})
+    if plan.meme_intent is not None:
+        sticker_id = (meme_intents or {}).get(plan.meme_intent)
+        if sticker_id is not None and capabilities.stickers:
+            actions.append({"method": "sendSticker", "body": {"sticker": sticker_id}})
+        else:
+            actions.append(
+                {
+                    "method": "sendMessage",
+                    "body": {"text": f"[表情意图: {plan.meme_intent}]"},
+                }
+            )
     return tuple(actions)
 
 

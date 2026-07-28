@@ -11,9 +11,11 @@ dependencies = [
   "opentelemetry-exporter-otlp-proto-http>=1.27.0,<2",
   "opentelemetry-instrumentation-fastapi>=0.48b0,<1",
   "opentelemetry-sdk>=1.27.0,<2",
+  "pypdf>=5.0.0,<7",
   "psycopg[binary]>=3.2.3,<4",
   "pydantic>=2.9.2,<3",
   "pydantic-settings>=2.5.2,<3",
+  "python-multipart>=0.0.9,<1",
   "redis>=5.1.1,<6",
   "sqlalchemy[asyncio]>=2.0.35,<3",
   "structlog>=24.4.0,<26",
@@ -27,6 +29,7 @@ mybot-api = "mybot.cli:api_main"
 mybot-gateway = "mybot.cli:gateway_main"
 mybot-agent-worker = "mybot.cli:agent_worker_main"
 mybot-maintenance-worker = "mybot.cli:maintenance_worker_main"
+mybot-knowledge-worker = "mybot.cli:knowledge_worker_main"
 mybot-plugin-runner = "mybot.cli:plugin_runner_main"
 
 [build-system]

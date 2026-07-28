@@ -35,6 +35,7 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
   const [conversations, setConversations] = useState<ConversationSummary[] | null>(null);
   const [detail, setDetail] = useState<DetailState>({ kind: 'idle' });
   const [error, setError] = useState<string | null>(null);
+  const [annotationNotice, setAnnotationNotice] = useState<string | null>(null);
   const openSeq = useRef(0);
 
   const open = async (conversation: ConversationSummary) => {
@@ -112,6 +113,20 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
 
   const selectedId = detail.kind === 'idle' ? null : detail.conversation.id;
 
+  const saveAnnotation = async (conversationId: string, messageId: string) => {
+    setAnnotationNotice(null);
+    try {
+      await client.send(
+        'POST',
+        `/operator/conversations/${conversationId}/messages/${messageId}/annotation`,
+        { threshold: 0.92 },
+      );
+      setAnnotationNotice('已将这条 Bot 回复与上一条用户问题保存为会话标注。');
+    } catch (cause) {
+      setAnnotationNotice(`保存标注失败：${String(cause)}`);
+    }
+  };
+
   return (
     <div className="conv-view view-enter">
       <section className="card conv-list" aria-label="会话列表">
@@ -164,6 +179,7 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
                   {detail.conversation.chat_id}
                 </small>
               </div>
+              {annotationNotice && <p className="panel-saved" role="status">{annotationNotice}</p>}
               {detail.messages.length === 0 ? (
                 <p className="panel-empty">此会话暂无消息。</p>
               ) : (
@@ -179,6 +195,15 @@ export function ConversationsPanel({ client }: { client: OperatorClient }) {
                         <div className="transcript-group">
                           <small>{outbound ? 'bot' : message.sender_identity_id}</small>
                           <div className="bubble">{message.text || '[非文本]'}</div>
+                          {outbound && message.id && (
+                            <button
+                              className="annotation-save"
+                              type="button"
+                              onClick={() => void saveAnnotation(detail.conversation.id, message.id!)}
+                            >
+                              存为标注
+                            </button>
+                          )}
                         </div>
                       </div>
                     );

@@ -111,6 +111,7 @@ def test_tool_settings_have_bounded_defaults_and_parsed_capabilities(
         "web.search",
         "web.fetch",
         "memory.write",
+        "knowledge.read",
     )
     assert 1 <= settings.tool_max_calls_per_turn <= 20
     assert settings.tool_timeout_seconds <= settings.turn_deadline_seconds

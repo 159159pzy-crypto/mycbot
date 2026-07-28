@@ -4,6 +4,7 @@ import type { HealthState } from '../health/types';
 import { createOperatorClient } from '../operator/api';
 import { ConversationsPanel } from '../operator/panels/ConversationsPanel';
 import { MemoriesPanel } from '../operator/panels/MemoriesPanel';
+import { KnowledgePanel } from '../operator/panels/KnowledgePanel';
 import { ModelsPanel } from '../operator/panels/ModelsPanel';
 import { OverviewPanel } from '../operator/panels/OverviewPanel';
 import { PersonaPanel } from '../operator/panels/PersonaPanel';
@@ -82,6 +83,7 @@ export function Console({ health }: { health: HealthState }) {
           {view === 'conversations' && <ConversationsPanel client={client} />}
           {view === 'sandbox' && <SandboxPanel client={client} />}
           {view === 'memories' && <MemoriesPanel client={client} />}
+          {view === 'knowledge' && <KnowledgePanel client={client} />}
           {view === 'plugins' && <PluginsPanel client={client} />}
           {view === 'models' && <ModelsPanel client={client} />}
           {view === 'persona' && <PersonaPanel client={client} />}

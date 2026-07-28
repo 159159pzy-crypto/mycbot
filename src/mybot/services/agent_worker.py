@@ -16,6 +16,7 @@ from mybot.adapters import InboundEvent, OutboundMessage
 from mybot.adapters.qq.translate import QQ_CAPABILITIES
 from mybot.adapters.telegram.translate import TELEGRAM_CAPABILITIES
 from mybot.contracts import (
+    AnnotationMatch,
     ChatKind,
     ConversationKey,
     MessageEnvelope,
@@ -36,6 +37,7 @@ from mybot.infrastructure.streams import (
     StreamConsumer,
     StreamPublisher,
     create_redis_backend,
+    current_delivery_attempt,
 )
 from mybot.repositories.conversations import ConversationRecord
 from mybot.repositories.messages import (
@@ -179,6 +181,16 @@ class ModerationHook(Protocol):
     async def allows(self, text: str) -> bool: ...
 
 
+class AnnotationEngine(Protocol):
+    async def match(
+        self,
+        query: str,
+        *,
+        conversation_id: UUID,
+        allow_conversation: bool,
+    ) -> AnnotationMatch | None: ...
+
+
 class TraceSink(Protocol):
     async def record(
         self,
@@ -215,6 +227,7 @@ class AgentWorkerService:
     events: EventSink | None = None
     guards: Guards | None = None
     moderation: ModerationHook | None = None
+    annotations: AnnotationEngine | None = None
     moderation_notice: str = MODERATION_NOTICE
     traces: TraceSink | None = None
     _conversation_locks: dict[str, asyncio.Lock] = field(default_factory=dict[str, asyncio.Lock])
@@ -249,9 +262,15 @@ class AgentWorkerService:
             key, platform=envelope.platform, ephemeral=envelope.ephemeral
         )
         stored = await self.messages.record_inbound(conversation.id, envelope)
-        if stored.duplicate:
+        if stored.duplicate and current_delivery_attempt() <= 1:
             logger.info("inbound_duplicate_skipped", envelope_id=envelope.id)
             return
+        if stored.duplicate:
+            logger.warning(
+                "inbound_retry_resumed",
+                envelope_id=envelope.id,
+                delivery_attempt=current_delivery_attempt(),
+            )
         await self._trace(
             envelope,
             conversation.id,
@@ -315,6 +334,8 @@ class AgentWorkerService:
         if refusal_text == "":
             return  # guard says ignore silently
         is_agent_turn = decision.action is TurnAction.AGENT and refusal_text is None
+        annotation_hit = False
+        plan: ReplyPlan | None = None
         if refusal_text is not None:
             from mybot.contracts import TypingProfile
 
@@ -323,6 +344,38 @@ class AgentWorkerService:
                 typing=TypingProfile(enabled=capabilities.typing),
             )
         elif is_agent_turn:
+            from mybot.engine.prompt import envelope_text
+            from mybot.engine.reply_shaping import shape_reply
+
+            matched = None
+            query = envelope_text(envelope)
+            if self.annotations is not None and query:
+                matched = await self.annotations.match(
+                    query,
+                    conversation_id=conversation.id,
+                    allow_conversation=not envelope.ephemeral,
+                )
+            if matched is not None:
+                annotation_hit = True
+                plan = shape_reply(matched.answer, capabilities=capabilities)
+                await self._trace(
+                    envelope,
+                    conversation.id,
+                    "annotation.match",
+                    attributes={
+                        "annotation_id": str(matched.annotation_id),
+                        "score": matched.score,
+                        "threshold": matched.threshold,
+                    },
+                )
+            else:
+                await self._trace(
+                    envelope,
+                    conversation.id,
+                    "annotation.match",
+                    status="skipped",
+                    attributes={"reason": "no_high_confidence_match"},
+                )
             from mybot.infrastructure.model_routing import (
                 reset_model_conversation,
                 reset_model_profile,
@@ -330,30 +383,34 @@ class AgentWorkerService:
                 set_model_profile,
             )
 
-            model_context = set_model_conversation(str(conversation.id))
+            model_context = (
+                set_model_conversation(str(conversation.id)) if not annotation_hit else None
+            )
             profile_context = (
                 set_model_profile(
                     tier=resolved_profile.profile.model_tier,
                     profile_id=str(resolved_profile.profile.id),
                     persona_version_id=str(resolved_profile.persona.id),
                 )
-                if resolved_profile is not None
+                if resolved_profile is not None and not annotation_hit
                 else None
             )
             try:
-                plan = await self.agent.run_turn(
-                    conversation_id=conversation.id,
-                    stable_key=key.stable_key,
-                    envelope=envelope,
-                    decision=decision,
-                    inbound_message_id=stored.id,
-                    capabilities=capabilities,
-                    runtime=runtime,
-                )
+                if not annotation_hit:
+                    plan = await self.agent.run_turn(
+                        conversation_id=conversation.id,
+                        stable_key=key.stable_key,
+                        envelope=envelope,
+                        decision=decision,
+                        inbound_message_id=stored.id,
+                        capabilities=capabilities,
+                        runtime=runtime,
+                    )
             finally:
                 if profile_context is not None:
                     reset_model_profile(profile_context)
-                reset_model_conversation(model_context)
+                if model_context is not None:
+                    reset_model_conversation(model_context)
         else:
             command = extract_command(envelope)
             if command == "forget":
@@ -366,6 +423,7 @@ class AgentWorkerService:
                     readiness=readiness,
                     capabilities=capabilities,
                 )
+        assert plan is not None
         plan = await self._moderated(plan, capabilities, envelope, conversation.id)
         outbound_id = await self.messages.record_outbound(
             conversation.id, plan, trace_id=envelope.trace_id
@@ -395,7 +453,7 @@ class AgentWorkerService:
                 "media_segments": len(plan.media_segments),
             },
         )
-        if is_agent_turn:
+        if is_agent_turn and not annotation_hit:
             from mybot.infrastructure.model_routing import (
                 reset_model_conversation,
                 reset_model_profile,
@@ -682,6 +740,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     import httpx
 
     from mybot.engine.agent_turns import AgentTurnEngine
+    from mybot.engine.knowledge import AnnotationMatcher, KnowledgeSearchService
     from mybot.engine.memory_service import MemoryService
     from mybot.engine.vision import VisionMode, VisionService
     from mybot.engine.willingness import ReplyWillingnessScorer
@@ -696,6 +755,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     )
     from mybot.repositories.conversations import ConversationRepository
     from mybot.repositories.core_memory import CoreBlockRepository
+    from mybot.repositories.knowledge import KnowledgeRepository
     from mybot.repositories.llm_calls import LlmCallLogRepository
     from mybot.repositories.memory import MemoryRepository
     from mybot.repositories.messages import MessageRepository
@@ -708,6 +768,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     from mybot.tools import Tool, ToolExecutor, ToolRegistry
     from mybot.tools.approvals import SystemKvApprovals
     from mybot.tools.fetch import UrlFetchTool
+    from mybot.tools.knowledge import KnowledgeSearchTool
     from mybot.tools.memory import MemoryAppendTool, MemoryReplaceTool
     from mybot.tools.plugins import BrokerEventSink, BrokerToolCatalog
     from mybot.tools.search import SearxngSearchTool
@@ -769,12 +830,12 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
     llm = model_router.for_purpose(ModelPurpose.CHAT)
     memory: MemoryService | None = None
     core_memory = CoreBlockRepository(sessions)
+    knowledge = KnowledgeRepository(sessions)
     if settings.memory_enabled:
         memory = MemoryService(
             embeddings=model_router.embeddings(),
             store=MemoryRepository(sessions),
             llm=model_router.for_purpose(ModelPurpose.MEMORY),
-            embedding_model=settings.embedding_model,
             core_store=core_memory,
             flush_once=backend,
             flush_enabled=settings.memory_flush_enabled,
@@ -797,6 +858,16 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             max_bytes=settings.tool_fetch_max_bytes,
         ),
     ]
+    if settings.knowledge_enabled:
+        builtin_tools.append(
+            KnowledgeSearchTool(
+                service=KnowledgeSearchService(
+                    store=knowledge,
+                    embeddings=model_router.embeddings(),
+                ),
+                sandbox_connection_id=settings.sandbox_connection_id,
+            )
+        )
     if settings.memory_enabled:
         builtin_tools.extend(
             [
@@ -868,6 +939,7 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             max_description_chars=settings.vision_max_description_chars,
             image_resolver=telegram_image_resolver,
         ),
+        vision_llm=model_router.for_purpose(ModelPurpose.VISION),
         not_configured_fallback=settings.fallback_not_configured,
         llm_failure_fallback=settings.fallback_llm_failure,
         budget_fallback=settings.fallback_budget_exceeded,
@@ -912,5 +984,14 @@ def create_agent_worker_service(settings: Settings) -> AgentWorkerService:
             loop_guard_enabled=settings.loop_guard_enabled,
         ),
         moderation_notice=settings.fallback_moderation,
+        annotations=(
+            AnnotationMatcher(
+                store=knowledge,
+                embeddings=model_router.embeddings(),
+                minimum_margin=settings.annotation_minimum_margin,
+            )
+            if settings.annotation_enabled
+            else None
+        ),
         traces=traces,
     )

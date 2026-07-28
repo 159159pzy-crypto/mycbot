@@ -276,3 +276,37 @@ def test_group_personality_migration_chains_and_downgrades_cleanly() -> None:
         ("drop_constraint", "memory_items.ck_memory_items_relationship_score"),
         ("drop_column", "memory_items.relationship_score"),
     ]
+
+
+def test_knowledge_migration_chains_and_preserves_shared_vector_extension() -> None:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260728_0011_knowledge_base.py"
+    )
+    namespace = runpy.run_path(str(migration_path))
+    assert namespace["revision"] == "20260728_0011"
+    assert namespace["down_revision"] == "20260728_0010"
+
+    downgrade = namespace["downgrade"]
+    operations = RecordingOperations()
+    downgrade.__globals__["op"] = operations
+    downgrade()
+
+    assert operations.calls == [
+        ("drop_index", "ix_annotation_match_audit_created"),
+        ("drop_table", "annotation_match_audit"),
+        ("drop_index", "ix_annotation_scope"),
+        ("drop_table", "annotation"),
+        ("drop_index", "ix_kb_chunk_parent"),
+        ("drop_index", "ix_kb_chunk_document"),
+        ("drop_table", "kb_chunk"),
+        ("drop_index", "ix_kb_ingest_outbox_pending"),
+        ("drop_table", "kb_ingest_outbox"),
+        ("drop_index", "uq_kb_document_content_scope"),
+        ("drop_index", "ix_kb_document_status"),
+        ("drop_index", "ix_kb_document_scope"),
+        ("drop_table", "kb_document"),
+    ]
+    assert all("DROP EXTENSION" not in call[1] for call in operations.calls)

@@ -14,6 +14,7 @@ class ProcessMode(StrEnum):
     GATEWAY = "gateway"
     AGENT_WORKER = "agent-worker"
     MAINTENANCE_WORKER = "maintenance-worker"
+    KNOWLEDGE_WORKER = "knowledge-worker"
     PLUGIN_RUNNER = "plugin-runner"
 
 

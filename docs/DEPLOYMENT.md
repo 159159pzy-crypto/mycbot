@@ -28,8 +28,9 @@ production:
   without it.
 - `MYBOT_LLM_BASE_URL` / `MYBOT_LLM_API_KEY` / `MYBOT_LLM_MODEL` — your
   OpenAI-compatible endpoint.
-- `MYBOT_EMBEDDING_*` — an embeddings-capable endpoint, or leave both empty
-  to run without memory.
+- `MYBOT_EMBEDDING_*` — an embeddings-capable endpoint used by memory,
+  knowledge ingestion/retrieval, and annotation matching. Disable both memory
+  and knowledge when no embedding channel is configured.
 - Review `MYBOT_MEMORY_CONSOLIDATION_*` and `MYBOT_MEMORY_FLUSH_*` budgets.
   Defaults are bounded and enabled; both can be disabled independently.
 - Keep `MYBOT_PERSONALITY_LEARNING_ENABLED=false` until you have reviewed the
@@ -44,6 +45,9 @@ production:
   the Models panel. Channel configuration stores only reference names.
 - Platform credentials: `MYBOT_TELEGRAM_BOT_TOKEN` and/or `NAPCAT_WS_URL` +
   `MYBOT_QQ_ACCESS_TOKEN`.
+- Optional meme intent maps: `MYBOT_TELEGRAM_MEME_INTENT_MAP` and
+  `MYBOT_QQ_MEME_INTENT_MAP`, each a JSON object from intent name to the
+  platform sticker/file identifier. Unmapped intents degrade to visible text.
 - `SEARXNG_IMAGE_TAG` — pin to a reviewed digest (see §6).
 
 For image understanding, keep `MYBOT_VISION_MODE=describe` unless the selected
@@ -84,9 +88,16 @@ Migration `20260728_0009` enables `pg_trgm`, adds temporal invalidation and
 memory audit tables, and creates core blocks. Migration `20260728_0010` adds
 profiles, immutable persona versions, conversation bindings, willingness and
 heartbeat audit, relationship familiarity, and model-call attribution.
+Migration `20260728_0011` adds `kb_document`, hierarchical `kb_chunk`,
+`annotation`, and `annotation_match_audit`.
 PostgreSQL therefore needs
 permission to create the extension on first upgrade. The shared `vector` and
 `pg_trgm` extensions are intentionally retained on downgrade.
+
+Run the dedicated `knowledge-worker` alongside the other roles. It needs the
+same PostgreSQL, Redis, model-channel, and embedding settings as the agent
+worker. Its queue is `mybot:knowledge`, consumer group `knowledge-workers`, and
+dead-letter stream `mybot:knowledge:dead`.
 
 Expect `{"status": "ready", ...}`. The web console is on
 `http://127.0.0.1:4173` until the proxy from §5 fronts it.

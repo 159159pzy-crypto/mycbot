@@ -114,7 +114,18 @@ class MessageRepository:
                 )
             await session.commit()
         if inserted is None:
-            return StoredMessage(id=message_id, duplicate=True)
+            async with self.sessions() as session:
+                existing = (
+                    await session.execute(
+                        sa.select(messages_table.c.id).where(
+                            messages_table.c.conversation_id == conversation_id,
+                            messages_table.c.direction == INBOUND,
+                            messages_table.c.platform_message_id
+                            == platform_message_id_from_envelope(envelope),
+                        )
+                    )
+                ).scalar_one()
+            return StoredMessage(id=existing, duplicate=True)
         return StoredMessage(id=inserted, duplicate=False)
 
     async def recent_activity(
